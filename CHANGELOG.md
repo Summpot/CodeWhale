@@ -68,10 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expandable transcript row by default, while running, failed, shell, patch,
   review, diff, and other risky tool cells remain visible. The setting
   `tool_collapse = "compact" | "expanded" | "calm"` controls the behavior.
+- Pending-input preview rows now label delivery mode explicitly as steer
+  pending, rejected steer, or queued follow-up, with wrapped continuation rows
+  aligned under the label so busy-turn input state is easier to read (#2054).
 
 ### Community
 
-Thanks to **@cyq1017** for the restore-listing implementation (#2513),
+Thanks to **@cyq1017** for the restore-listing implementation (#2513) and
+pending-input delivery-mode label work (#2532, #2054),
 **@wywsoor** for the broader macOS/iTerm rollback UX report (#2494),
 **@HUQIANTAO** for the `web_run` lock-splitting work (#2502) and turn-metadata
 prefix-cache stability work (#2517), **@xyuai** for canonical CodeWhale

@@ -24,6 +24,9 @@ use crate::tui::widgets::Renderable;
 
 /// Per-item line cap before we collapse the rest into a `…` overflow row.
 const PREVIEW_LINE_LIMIT: usize = 3;
+const PENDING_STEER_PREFIX: &str = "  ↳ Steer pending: ";
+const REJECTED_STEER_PREFIX: &str = "  ↳ Rejected steer: ";
+const QUEUED_MESSAGE_PREFIX: &str = "  ↳ Queued follow-up: ";
 
 /// Description of the keybinding the hint line at the bottom should advertise
 /// for the "edit last queued message" action.
@@ -109,14 +112,38 @@ impl PendingInputPreview {
                 &mut lines,
                 Line::from(vec![Span::raw("• "), Span::raw("Pending inputs")]),
             );
+            let pending_steer_indent = continuation_indent(PENDING_STEER_PREFIX);
             for steer in &self.pending_steers {
-                push_truncated_item(&mut lines, steer, width, dim, "  ↳ ", "    ");
+                push_truncated_item(
+                    &mut lines,
+                    steer,
+                    width,
+                    dim,
+                    PENDING_STEER_PREFIX,
+                    &pending_steer_indent,
+                );
             }
+            let rejected_steer_indent = continuation_indent(REJECTED_STEER_PREFIX);
             for steer in &self.rejected_steers {
-                push_truncated_item(&mut lines, steer, width, dim, "  ↳ ", "    ");
+                push_truncated_item(
+                    &mut lines,
+                    steer,
+                    width,
+                    dim,
+                    REJECTED_STEER_PREFIX,
+                    &rejected_steer_indent,
+                );
             }
+            let queued_message_indent = continuation_indent(QUEUED_MESSAGE_PREFIX);
             for message in &self.queued_messages {
-                push_truncated_item(&mut lines, message, width, dim_italic, "  ↳ ", "    ");
+                push_truncated_item(
+                    &mut lines,
+                    message,
+                    width,
+                    dim_italic,
+                    QUEUED_MESSAGE_PREFIX,
+                    &queued_message_indent,
+                );
             }
             if !self.queued_messages.is_empty() {
                 lines.push(Line::from(vec![Span::styled(
@@ -152,6 +179,10 @@ impl Renderable for PendingInputPreview {
         let lines = self.lines(width);
         u16::try_from(lines.len()).unwrap_or(u16::MAX)
     }
+}
+
+fn continuation_indent(prefix: &str) -> String {
+    " ".repeat(display_width(prefix))
 }
 
 fn push_section_header(lines: &mut Vec<Line<'static>>, header: Line<'static>) {
@@ -421,6 +452,51 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("rejected")));
         assert!(rows.iter().any(|r| r.contains("queued")));
         assert!(rows.iter().any(|r| r.contains("↑")));
+    }
+
+    #[test]
+    fn pending_input_rows_label_each_delivery_mode() {
+        let mut preview = PendingInputPreview::new();
+        preview.pending_steers.push("steer".to_string());
+        preview.rejected_steers.push("rejected".to_string());
+        preview.queued_messages.push("queued".to_string());
+
+        let rows = render_to_string(&preview, 80);
+
+        assert!(
+            rows.iter().any(|row| row.contains("Steer pending: steer")),
+            "missing pending-steer label: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Rejected steer: rejected")),
+            "missing rejected-steer label: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Queued follow-up: queued")),
+            "missing queued-follow-up label: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn wrapped_pending_input_aligns_continuation_under_label() {
+        let mut preview = PendingInputPreview::new();
+        preview
+            .queued_messages
+            .push("alpha beta gamma delta epsilon zeta".to_string());
+
+        let rows = render_to_string(&preview, 34);
+
+        assert!(rows[1].contains("Queued follow-up: alpha"));
+        assert!(
+            rows[2].starts_with(&continuation_indent(QUEUED_MESSAGE_PREFIX)),
+            "continuation should align under label: {rows:?}"
+        );
+        assert!(
+            !rows[2].trim().is_empty(),
+            "continuation should keep wrapped text: {rows:?}"
+        );
     }
 
     #[test]

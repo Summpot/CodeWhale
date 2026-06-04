@@ -6491,7 +6491,8 @@ async fn handle_plan_choice(
 /// - `pending_steers` — typed during a running turn + Esc; held until the
 ///   abort lands and gets resubmitted as a fresh merged turn.
 /// - `rejected_steers` — engine declined a mid-turn steer (scaffolding;
-///   no engine path produces these yet but the bucket renders identically).
+///   no engine path produces these yet but the bucket renders with a distinct
+///   rejected-steer label).
 /// - `queued_messages` — Enter while busy (offline-mode FIFO); drained at
 ///   end-of-turn.
 fn build_pending_input_preview(app: &App) -> PendingInputPreview {
