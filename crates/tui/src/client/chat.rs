@@ -167,7 +167,10 @@ impl DeepSeekClient {
             anyhow::bail!("Failed to call DeepSeek Chat API: HTTP {status}: {error_text}");
         }
 
-        let response_text = response.text().await.unwrap_or_default();
+        let response_text = response
+            .text()
+            .await
+            .context("Failed to read Chat API response body")?;
         let value: Value =
             serde_json::from_str(&response_text).context("Failed to parse Chat API JSON")?;
         parse_chat_message(&value)
@@ -431,12 +434,13 @@ impl DeepSeekClient {
                 }
             }
 
-            // Close any open blocks
-            if thinking_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: content_index.saturating_sub(1) });
-            }
-            if text_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: content_index.saturating_sub(1) });
+            // Close any open blocks — use the current content_index
+            // (which points to the next unused slot, so -1 gives the
+            // last-opened block) but guard against underflow when no
+            // content block was ever opened.
+            if thinking_started || text_started {
+                let idx = content_index.saturating_sub(1);
+                yield Ok(StreamEvent::ContentBlockStop { index: idx });
             }
 
             release_stream_buffer(byte_buf);
@@ -1974,6 +1978,8 @@ fn provider_accepts_reasoning_content(provider: ApiProvider) -> bool {
             | ApiProvider::Novita
             | ApiProvider::Fireworks
             | ApiProvider::Siliconflow
+            | ApiProvider::SiliconflowCn
+            | ApiProvider::Volcengine
             | ApiProvider::Arcee
             | ApiProvider::Sglang
     )
