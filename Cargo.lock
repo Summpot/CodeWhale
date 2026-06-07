@@ -890,6 +890,7 @@ dependencies = [
  "codewhale-state",
  "codewhale-tools",
  "serde_json",
+ "tracing",
  "uuid",
 ]
 
