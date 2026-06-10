@@ -61,10 +61,10 @@ if [[ -n "${internal_dep_drift}" ]]; then
   fail=1
 fi
 
-# 4) Packaged TUI changelog copy.
-if ! cmp -s CHANGELOG.md crates/tui/CHANGELOG.md; then
-  echo "::error::crates/tui/CHANGELOG.md must match root CHANGELOG.md for crates.io packaging." >&2
-  echo "Run: cp CHANGELOG.md crates/tui/CHANGELOG.md" >&2
+# 4) Packaged TUI changelog slice (recent releases embedded in the binary).
+if ! ./scripts/sync-changelog.sh --check >/dev/null 2>&1; then
+  echo "::error::crates/tui/CHANGELOG.md is out of date with the root CHANGELOG.md slice." >&2
+  echo "Run: ./scripts/sync-changelog.sh" >&2
   fail=1
 fi
 

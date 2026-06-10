@@ -1104,7 +1104,7 @@ mod tests {
             SafetyLevel::Dangerous
         );
         assert_ne!(
-            analyze_command("cargo run --bin deepseek -- eval").level,
+            analyze_command("cargo run --bin codewhale -- eval").level,
             SafetyLevel::Dangerous
         );
     }
@@ -1128,7 +1128,7 @@ mod tests {
         // contain the substring "eval" but are not eval invocations.
         // Guard against the naive `command.contains("eval")` regression
         // — these should stay safe / workspace-safe, never Dangerous.
-        let evaluate_safe = analyze_command("cargo run --bin deepseek -- eval").level;
+        let evaluate_safe = analyze_command("cargo run --bin codewhale -- eval").level;
         assert_ne!(
             evaluate_safe,
             SafetyLevel::Dangerous,
