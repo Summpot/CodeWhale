@@ -57,6 +57,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Self-update download timeout (#3006).** `codewhale update` now applies a
   five-minute HTTP client timeout so blocked or very slow GitHub release
   downloads fail instead of hanging indefinitely. Thanks @New2Niu for the PR.
+- **Legacy `deepseek` update migration (#2960/#3013/#3053).** Running
+  `deepseek update` or `deepseek-tui update` from a pre-rebrand install now
+  returns copy-pasteable npm, Cargo, Homebrew, and manual-binary migration
+  steps instead of trying to spawn a missing `codewhale` binary. README and
+  rebrand docs now cover the same upgrade path. Thanks @jazzi and
+  @tiangangQiu for the reports, @cyq1017 for the update-path PR, and
+  @angus-guo for the README PR.
 - **Constitution trust wording (#2950/#3008).** The base prompt now explains
   that "begins with an A" means a baseline of trust, not a literal output
   formatting rule. Thanks @cyq1017 for the PR.
