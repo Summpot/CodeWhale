@@ -561,6 +561,12 @@ mod tests {
     }
 
     #[test]
+    fn tool_error_missing_field_constructor() {
+        let err = ToolError::missing_field("my_field");
+        assert!(matches!(err, ToolError::MissingField { field } if field == "my_field"));
+    }
+
+    #[test]
     fn tool_error_invalid_input_creates_correct_variant() {
         let err = ToolError::invalid_input("test invalid message");
         match err {
