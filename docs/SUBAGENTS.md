@@ -254,11 +254,13 @@ workspace/branch, lifecycle events, artifact refs, follow-up target, takeover
 target, usage provenance, and verification provenance.
 
 `agent_eval` returns these fields at the top level of the session projection and
-inside `worker_record`. A running or continuable interrupted child should be
-continued through the returned `follow_up` target (`agent_eval` with the same
-agent id or session name). A local takeover should use the returned `takeover`
-instructions; unsupported future cases must say why instead of leaving the
-operator to guess.
+inside `worker_record`. It is nonblocking by default: use it to poll status or
+deliver follow-up input while the parent keeps coordinating. Pass `block:true`
+only when deliberately waiting for a terminal child result. A running or
+continuable interrupted child should be continued through the returned
+`follow_up` target (`agent_eval` with the same agent id or session name). A
+local takeover should use the returned `takeover` instructions; unsupported
+future cases must say why instead of leaving the operator to guess.
 
 Follow-up delivery is explicit. If a message was delivered, the worker record
 stores a bounded preview and timestamp. If the child had already terminated,

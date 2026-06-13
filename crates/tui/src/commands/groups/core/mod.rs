@@ -364,7 +364,7 @@ pub fn agent(_app: &mut App, arg: Option<&str>) -> CommandResult {
         }
     };
     let message = format!(
-        "Open a persistent sub-agent session for this task. Call `agent_open` with name `slash_agent`, `prompt: {task:?}`, and `max_depth: {max_depth}`. Use `agent_eval` to wait for the next terminal/current projection and `handle_read` on the returned transcript_handle if you need more detail. Verify any claimed side effects before reporting success."
+        "Open a persistent sub-agent session for this task. Call `agent_open` with name `slash_agent`, `prompt: {task:?}`, and `max_depth: {max_depth}`. Use nonblocking `agent_eval` to poll the current projection or send follow-up input while you keep working; pass `block:true` only when you deliberately want to wait for a terminal result. Use `handle_read` on the returned transcript_handle if you need more detail. Verify any claimed side effects before reporting success."
     );
     CommandResult::with_message_and_action(
         format!("Opening persistent sub-agent at depth {max_depth}..."),
@@ -393,7 +393,7 @@ pub fn swarm(_app: &mut App, arg: Option<&str>) -> CommandResult {
         }
     };
     let message = format!(
-        "Run a multi-agent swarm for this task: {task:?}. Decompose it into independent, parallelizable subtasks and open one headless sub-agent per subtask with `agent_open` (pass `max_depth: {max_depth}` for nested delegation, and an `agent_type`/role that fits each subtask — explore for research, review for verification, implementer for edits). Run them concurrently; collect each worker's result summary with `agent_eval` (summaries, not full transcripts) and synthesize a single answer. Keep the fanout proportional to the task, and verify any claimed side effects before reporting success."
+        "Run a multi-agent swarm for this task: {task:?}. Decompose it into independent, parallelizable subtasks and open one headless sub-agent per subtask with `agent_open` (pass `max_depth: {max_depth}` for nested delegation, and an `agent_type`/role that fits each subtask — explore for research, review for verification, implementer for edits). Run them concurrently; poll each worker with nonblocking `agent_eval`, synthesize results as they arrive, and pass `block:true` only for a deliberate final wait. Keep the fanout proportional to the task, and verify any claimed side effects before reporting success."
     );
     CommandResult::with_message_and_action(
         format!("Dispatching a swarm at depth {max_depth}..."),

@@ -42,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Sub-agent eval no longer blocks by default.** `agent_eval` now returns the
+  current projection immediately and delivers follow-up input without waiting
+  for a running child to finish its provider call. Pass `block:true` for an
+  intentional terminal wait.
 - **Z.ai GLM thinking traces.** Direct Z.ai requests now use the documented
   `thinking` shape, preserve and replay `reasoning_content`, classify GLM
   reasoning streams as thinking output, and accept `ultracode` as a max-effort

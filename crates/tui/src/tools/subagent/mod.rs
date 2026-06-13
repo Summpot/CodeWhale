@@ -3520,7 +3520,7 @@ impl ToolSpec for AgentEvalTool {
     }
 
     fn description(&self) -> &'static str {
-        "Fetch or wait on a child sub-agent session. Optionally deliver a message/items to a running session, then return the latest session projection. With continue=true, resume only a checkpointed interrupted session. With block=true (default), waits for the session to reach a terminal boundary; block=false is a non-blocking status fetch. Terminal projections expose a handle_read-compatible transcript_handle for the full child transcript."
+        "Fetch the current projection for a child sub-agent session. Optionally deliver a message/items to a running session, then return immediately with the latest status. Set block=true only when you intentionally want to wait for a terminal boundary. With continue=true, resume only a checkpointed interrupted session; that resume waits by default unless block=false is explicit. Terminal projections expose a handle_read-compatible transcript_handle for the full child transcript."
     }
 
     fn input_schema(&self) -> Value {
@@ -3570,7 +3570,7 @@ impl ToolSpec for AgentEvalTool {
                 },
                 "block": {
                     "type": "boolean",
-                    "description": "Wait for a terminal boundary before returning (default true)"
+                    "description": "Wait for a terminal boundary before returning (default: false; default true only with continue=true/resume=true)"
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -3598,7 +3598,10 @@ impl ToolSpec for AgentEvalTool {
         let interrupt = optional_bool(&input, "interrupt", false);
         let continue_from_checkpoint =
             optional_bool(&input, "continue", false) || optional_bool(&input, "resume", false);
-        let block = optional_bool(&input, "block", true);
+        let block = input
+            .get("block")
+            .and_then(Value::as_bool)
+            .unwrap_or(continue_from_checkpoint);
         let timeout_ms = optional_u64(&input, "timeout_ms", DEFAULT_RESULT_TIMEOUT_MS)
             .clamp(1000, MAX_RESULT_TIMEOUT_MS);
 

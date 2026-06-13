@@ -4433,20 +4433,25 @@ async fn run_event_loop(
                     app.delete_word_backward();
                 }
                 KeyCode::Char('s') | KeyCode::Char('S')
-                    if key.modifiers == KeyModifiers::CONTROL && !app.input.is_empty() =>
+                    if key.modifiers == KeyModifiers::CONTROL =>
                 {
+                    if send_ctrl_s_queued_message_now(app, config, &engine_handle).await? {
+                        continue;
+                    }
                     // #440: park the current draft to the persistent
                     // stash and clear the composer. Empty composers
                     // are a no-op so a stray Ctrl+S can't pollute the
                     // file. Surface a toast so the user sees the
                     // confirmation (no-op feels broken otherwise).
-                    crate::composer_stash::push_stash(&app.input);
-                    app.clear_input_recoverable();
-                    app.push_status_toast(
-                        "Draft stashed — `/stash pop` to restore",
-                        StatusToastLevel::Info,
-                        Some(3_000),
-                    );
+                    if !app.input.is_empty() {
+                        crate::composer_stash::push_stash(&app.input);
+                        app.clear_input_recoverable();
+                        app.push_status_toast(
+                            "Draft stashed — `/stash pop` to restore",
+                            StatusToastLevel::Info,
+                            Some(3_000),
+                        );
+                    }
                 }
                 KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     // #379: context-sensitive Ctrl+Y.
@@ -5357,6 +5362,65 @@ fn queue_current_draft_for_next_turn(app: &mut App) -> bool {
         app.queued_message_count()
     ));
     true
+}
+
+fn take_ctrl_s_queued_message(app: &mut App) -> Option<QueuedMessage> {
+    if let Some(mut draft) = app.queued_draft.take() {
+        if let Some(input) = app.submit_input() {
+            draft.display = input;
+        }
+        return Some(draft);
+    }
+    if app.input.is_empty() {
+        return app.pop_queued_message();
+    }
+    None
+}
+
+async fn send_ctrl_s_queued_message_now(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+) -> Result<bool> {
+    let Some(message) = take_ctrl_s_queued_message(app) else {
+        return Ok(false);
+    };
+    if app.offline_mode {
+        app.queue_message(message);
+        app.status_message = Some(format!(
+            "Offline: {} queued — ↑ to edit, /queue list",
+            app.queued_message_count()
+        ));
+        return Ok(true);
+    }
+
+    let display = message.display.clone();
+    if app.is_loading {
+        if let Err(err) = steer_user_message(app, engine_handle, message.clone()).await {
+            app.queue_message(message);
+            app.status_message = Some(format!(
+                "Steer failed ({err}); {} queued — ↑ to edit, /queue list",
+                app.queued_message_count()
+            ));
+        } else {
+            app.push_status_toast(
+                "Sent queued message into current turn",
+                StatusToastLevel::Info,
+                Some(1_500),
+            );
+        }
+    } else if let Err(err) =
+        dispatch_user_message(app, config, engine_handle, message.clone()).await
+    {
+        app.queue_message(message);
+        app.status_message = Some(format!(
+            "Dispatch failed ({err}); kept {} queued message(s)",
+            app.queued_message_count()
+        ));
+    } else {
+        app.status_message = Some(format!("Sent queued message: {display}"));
+    }
+    Ok(true)
 }
 
 fn queued_message_content_for_app(

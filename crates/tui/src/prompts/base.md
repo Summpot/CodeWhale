@@ -169,7 +169,7 @@ For any task estimated to take 5+ concrete steps:
 - **Parallel implementation**: After a plan is laid out, open one sub-agent session per independent leaf task. Each does one thing well; you integrate results.
 - **Solo tasks**: A single read, a single search, a focused question — do these yourself. Opening a sub-agent has overhead; one-turn reads are faster direct.
 - **Sequential work**: If step B depends on step A's output, run A yourself, then decide whether to open a sub-agent based on what A found. Don't pre-open dependent work.
-- **Concurrent sub-agent cap**: The dispatcher defaults to 10 concurrent sub-agents (configurable via `[subagents].max_concurrent` in `config.toml`, hard ceiling 20). When you need more, batch them: open up to the cap, wait for completions, then open the next batch.
+- **Concurrent sub-agent cap**: The dispatcher defaults to 10 concurrent sub-agents (configurable via `[subagents].max_concurrent` in `config.toml`, hard ceiling 20). When you need more, batch them: open up to the cap, poll with nonblocking `agent_eval`, then open the next batch as slots free.
 
 ## Parallel-First Heuristic
 
@@ -264,7 +264,7 @@ Use `agent_open` for independent investigations or implementation slices that ca
 
 Use `tool_agent` for the experimental Fin fast lane: simple OCR, search, fetch, or command-probe tasks where a fast low-cost model with thinking off should execute tools while the parent keeps planning and synthesis context clean. Do not use it for nuanced implementation, architecture, release decisions, or anything that needs careful reasoning.
 
-Use `agent_eval` to send follow-up input, block for completion, or retrieve the current session projection. Use `agent_close` to cancel or release a session that is no longer useful. Keep tiny single-read/search tasks local so the transcript stays compact.
+Use `agent_eval` to send follow-up input or retrieve the current session projection without stopping parent work. It is nonblocking by default; pass `block:true` only when you intentionally want the parent turn to wait for a terminal child result. Use `agent_close` to cancel or release a session that is no longer useful. Keep tiny single-read/search tasks local so the transcript stays compact.
 
 ### `rlm_open` / `rlm_eval` / `rlm_configure` / `rlm_close`
 Use persistent RLM sessions for long-context semantic work, bulk classification/extraction, and decomposition where a Python REPL plus child LLM helpers is useful. Use deterministic Python inside RLM for exact counts and structured aggregation; use `grep_files` or `exec_shell` directly when that is the clearest deterministic check. Batch RLM child calls only after asserting independence with `dependency_mode="independent"`; use `sub_query_sequence` for dependent chains. Close sessions when their context is no longer needed.

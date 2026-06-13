@@ -5716,6 +5716,57 @@ async fn steer_user_message_records_prompt_for_cancel_restore() {
 }
 
 #[tokio::test]
+async fn ctrl_s_sends_next_queued_message_into_running_turn() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.queue_message(crate::tui::app::QueuedMessage::new(
+        "please attend to your sub agents".to_string(),
+        None,
+    ));
+    let config = Config::default();
+    let mut engine = crate::core::engine::mock_engine_handle();
+
+    assert!(
+        send_ctrl_s_queued_message_now(&mut app, &config, &engine.handle)
+            .await
+            .expect("ctrl+s send succeeds")
+    );
+
+    assert_eq!(app.queued_message_count(), 0);
+    assert_eq!(
+        engine.rx_steer.recv().await.as_deref(),
+        Some("please attend to your sub agents")
+    );
+}
+
+#[tokio::test]
+async fn ctrl_s_sends_edited_queued_draft_into_running_turn() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.queued_draft = Some(crate::tui::app::QueuedMessage::new(
+        "original queued follow-up".to_string(),
+        Some("skill body".to_string()),
+    ));
+    app.input = "edited queued follow-up".to_string();
+    app.cursor_position = app.input.chars().count();
+    let config = Config::default();
+    let mut engine = crate::core::engine::mock_engine_handle();
+
+    assert!(
+        send_ctrl_s_queued_message_now(&mut app, &config, &engine.handle)
+            .await
+            .expect("ctrl+s draft send succeeds")
+    );
+
+    assert!(app.queued_draft.is_none());
+    assert!(app.input.is_empty());
+    assert_eq!(app.queued_message_count(), 0);
+    let content = engine.rx_steer.recv().await.expect("steer content");
+    assert!(content.contains("edited queued follow-up"));
+    assert!(content.contains("skill body"));
+}
+
+#[tokio::test]
 async fn numeric_plan_choice_still_queues_follow_up_when_busy() {
     let mut app = create_test_app();
     app.mode = AppMode::Plan;

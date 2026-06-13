@@ -1466,6 +1466,62 @@ async fn agent_eval_resolves_session_via_agent_name_alias() {
 }
 
 #[tokio::test]
+async fn agent_eval_follow_up_defaults_to_nonblocking_projection() {
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(PathBuf::from("."), 1)));
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+    let agent = SubAgent::new(
+        "test_agent_running_eval".to_string(),
+        SubAgentType::Explore,
+        "map docs".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some("Blue".to_string()),
+        Some(vec!["read_file".to_string()]),
+        input_tx,
+        PathBuf::from("."),
+        "boot_test".to_string(),
+    );
+    let agent_id = agent.id.clone();
+    {
+        let mut guard = manager.write().await;
+        guard.agents.insert(agent_id.clone(), agent);
+    }
+
+    let ctx = ToolContext::new(".");
+    let tool = AgentEvalTool::new(manager.clone());
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        tool.execute(
+            json!({
+                "agent_id": agent_id,
+                "message": "please prioritize the newest user input"
+            }),
+            &ctx,
+        ),
+    )
+    .await
+    .expect("agent_eval should not wait for a running child by default")
+    .expect("agent_eval should return a projection");
+
+    let meta = result.metadata.expect("metadata present");
+    assert_eq!(meta["terminal"], json!(false));
+    assert_eq!(meta["timed_out"], json!(false));
+    assert_eq!(meta["message_delivery"]["delivered"], json!(true));
+
+    let delivered = tokio::time::timeout(Duration::from_millis(100), input_rx.recv())
+        .await
+        .expect("follow-up should be delivered without waiting")
+        .expect("follow-up message should exist");
+    assert_eq!(delivered.text, "please prioritize the newest user input");
+    assert!(!delivered.interrupt);
+
+    let projection: SubAgentSessionProjection =
+        serde_json::from_str(&result.content).expect("projection deserializes");
+    assert_eq!(projection.status, "running");
+    assert!(!projection.terminal);
+}
+
+#[tokio::test]
 async fn api_timeout_preserves_checkpoint_and_agent_eval_continues_from_it() {
     let tmp = tempdir().expect("tempdir");
     let manager = Arc::new(RwLock::new(SubAgentManager::new(

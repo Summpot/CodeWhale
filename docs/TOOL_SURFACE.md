@@ -190,7 +190,7 @@ The active model-facing sub-agent surface is persistent and intentionally small:
 | Tool | Niche |
 |---|---|
 | `agent_open` | Open a named sub-agent session for independent work. Returns a session projection immediately so the parent can keep coordinating. |
-| `agent_eval` | Send follow-up input, block for completion, or fetch the current projection/transcript handle for an existing session. |
+| `agent_eval` | Send follow-up input or fetch the current projection/transcript handle for an existing session. Nonblocking by default; pass `block:true` only for a deliberate wait. |
 | `agent_close` | Cancel or release a sub-agent session by name or id. |
 
 See `agent.txt` for the delegation protocol and
