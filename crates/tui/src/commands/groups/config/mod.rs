@@ -31,7 +31,9 @@ impl CommandGroup for ConfigCommands {
 
 static CONFIG_INFO: CommandInfo = CommandInfo {
     name: "config",
-    aliases: &[],
+    // /experiments is a discoverable entry to the same view: the Experimental
+    // section exposes the WhaleFlow, goal, and sub-agent opt-ins (#3182).
+    aliases: &["experiments", "experimental"],
     usage: "/config",
     description_id: MessageId::CmdConfigDescription,
 };
@@ -140,7 +142,7 @@ pub(in crate::commands) fn dispatch(
     arg: Option<&str>,
 ) -> Option<CommandResult> {
     let result = match command {
-        "config" => config::config_command(app, arg),
+        "config" | "experiments" | "experimental" => config::config_command(app, arg),
         "sidebar" => config::sidebar(app, arg),
         "settings" => config::show_settings(app),
         "status" => status::status(app),
