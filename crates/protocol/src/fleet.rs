@@ -444,11 +444,25 @@ fn default_retry_backoff_multiplier() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FleetAlertPolicy {
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<FleetAlertEventClass>,
+    #[serde(default)]
     pub channels: Vec<FleetAlertChannel>,
     #[serde(default)]
     pub after_attempts: Option<u32>,
     #[serde(default)]
     pub after_minutes_stale: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetAlertEventClass {
+    Stale,
+    RestartExhausted,
+    NeedsHuman,
+    BudgetExceeded,
+    VerifierFailed,
+    RunCompleted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -632,6 +646,7 @@ mod tests {
     #[test]
     fn alert_policy_round_trip() {
         let policy = FleetAlertPolicy {
+            events: vec![FleetAlertEventClass::Stale],
             channels: vec![FleetAlertChannel::Slack {
                 webhook_url: "https://hooks.slack.com/test".to_string(),
             }],
@@ -639,8 +654,10 @@ mod tests {
             after_minutes_stale: Some(10),
         };
         let json = serde_json::to_string(&policy).unwrap();
+        assert!(json.contains("\"events\":[\"stale\"]"));
         assert!(json.contains("\"kind\":\"slack\""));
         let back: FleetAlertPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.events, vec![FleetAlertEventClass::Stale]);
         assert_eq!(back.after_attempts, Some(2));
     }
 

@@ -224,7 +224,13 @@ impl FleetScheduler {
             },
         )?;
         report.failed += 1;
-        report.alerts += self.record_alerts(&task.entry.run_id, &task.entry.task_id, task_spec)?;
+        report.alerts += self.record_alerts(
+            &task.entry.run_id,
+            &task.entry.task_id,
+            worker_id,
+            task_spec,
+            FleetAlertEventClass::RestartExhausted,
+        )?;
         Ok(())
     }
 
@@ -358,18 +364,29 @@ impl FleetScheduler {
         &self,
         run_id: &FleetRunId,
         task_id: &str,
+        worker_id: &str,
         task_spec: &FleetTaskSpec,
+        event_class: FleetAlertEventClass,
     ) -> Result<usize> {
         let Some(policy) = &task_spec.alert_policy else {
             return Ok(0);
         };
+        if !alert_policy_matches(policy, event_class) {
+            return Ok(0);
+        }
         let mut count = 0;
         for channel in &policy.channels {
-            self.ledger.record_alert(
+            let label = alert_channel_label(channel);
+            self.ledger
+                .record_alert(run_id, task_id, label, &self.timestamp())?;
+            self.append_worker_event(
                 run_id,
+                worker_id,
                 task_id,
-                alert_channel_label(channel),
-                &self.timestamp(),
+                FleetWorkerEventPayload::Escalated {
+                    channel: label.to_string(),
+                    alert_id: None,
+                },
             )?;
             count += 1;
         }
@@ -514,6 +531,10 @@ fn alert_channel_label(channel: &FleetAlertChannel) -> &'static str {
         FleetAlertChannel::Webhook { .. } => "webhook",
         FleetAlertChannel::PagerDuty { .. } => "pagerduty",
     }
+}
+
+fn alert_policy_matches(policy: &FleetAlertPolicy, class: FleetAlertEventClass) -> bool {
+    policy.events.is_empty() || policy.events.contains(&class)
 }
 
 fn event_key(worker_id: &str, run_id: &str, task_id: &str) -> String {
@@ -681,6 +702,7 @@ mod tests {
         let mut scheduler = scheduler(&tmp, 1);
         let mut failing = task("task-a", 1);
         failing.alert_policy = Some(FleetAlertPolicy {
+            events: vec![FleetAlertEventClass::RestartExhausted],
             channels: vec![FleetAlertChannel::Slack {
                 webhook_url: "https://hooks.slack.invalid/secret".to_string(),
             }],
@@ -704,6 +726,7 @@ mod tests {
         );
         let ledger = ledger_text(&scheduler);
         assert!(ledger.contains("\"state\":\"failed\""));
+        assert!(ledger.contains("\"state\":\"escalated\""));
         assert!(ledger.contains("\"record\":\"alert_sent\""));
         assert!(!ledger.contains("hooks.slack.invalid/secret"));
     }

@@ -410,6 +410,8 @@ enum FleetCommand {
         #[arg(long, required = true)]
         all: bool,
     },
+    /// Render a redacted fleet alert payload without sending it
+    AlertDryRun(FleetAlertDryRunArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -426,6 +428,63 @@ struct FleetRunArgs {
     /// Schedule once and return instead of staying in the manager loop
     #[arg(long, hide = true, default_value_t = false)]
     once: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct FleetAlertDryRunArgs {
+    /// Alert event class to render
+    #[arg(long, value_enum)]
+    event: FleetAlertEventArg,
+    /// Fleet run id
+    #[arg(long)]
+    run_id: String,
+    /// Worker id, when the event belongs to one worker
+    #[arg(long)]
+    worker_id: Option<String>,
+    /// Task id, when the event belongs to one task
+    #[arg(long)]
+    task_id: Option<String>,
+    /// Short human-readable reason for the alert
+    #[arg(long, default_value = "manual fleet alert dry-run")]
+    reason: String,
+    /// Status label to include in the payload
+    #[arg(long)]
+    status: Option<String>,
+    /// Adapter payload shape to render
+    #[arg(long, value_enum, default_value_t = FleetAlertAdapterArg::Slack)]
+    adapter: FleetAlertAdapterArg,
+    /// Environment variable containing the Slack webhook URL
+    #[arg(long, default_value = "CODEWHALE_FLEET_SLACK_WEBHOOK")]
+    slack_webhook_env: String,
+    /// Environment variable containing the generic webhook URL
+    #[arg(long, default_value = "CODEWHALE_FLEET_WEBHOOK_URL")]
+    webhook_url_env: String,
+    /// Optional environment variable containing the generic webhook secret
+    #[arg(long)]
+    webhook_secret_env: Option<String>,
+    /// Environment variable containing the PagerDuty routing key
+    #[arg(long, default_value = "CODEWHALE_FLEET_PAGERDUTY_ROUTING_KEY")]
+    pagerduty_routing_key_env: String,
+    /// PagerDuty severity to render
+    #[arg(long, default_value = "error")]
+    pagerduty_severity: String,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum FleetAlertEventArg {
+    Stale,
+    RestartExhausted,
+    NeedsHuman,
+    BudgetExceeded,
+    VerifierFailed,
+    RunCompleted,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum FleetAlertAdapterArg {
+    Slack,
+    Webhook,
+    PagerDuty,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1390,9 +1449,14 @@ async fn run_swebench_command(
 }
 
 async fn run_fleet_command(workspace: &Path, args: FleetArgs) -> Result<()> {
+    use crate::fleet::alerts::{
+        FleetAlertAdapterConfig, FleetAlertConfig, FleetAlertDispatcher, FleetAlertEvent,
+        FleetEnvSecretResolver,
+    };
     use crate::fleet::manager::{FleetManager, FleetStatusSnapshot, FleetWorkerInspection};
     use codewhale_protocol::fleet::{
-        FleetArtifactKind, FleetWorkerEventPayload, FleetWorkerStatus,
+        FleetAlertEventClass, FleetArtifactKind, FleetRunId, FleetWorkerEventPayload,
+        FleetWorkerStatus,
     };
 
     fn worker_status_label(status: &FleetWorkerStatus) -> &'static str {
@@ -1529,6 +1593,49 @@ async fn run_fleet_command(workspace: &Path, args: FleetArgs) -> Result<()> {
         }
     }
 
+    fn alert_event_class(arg: FleetAlertEventArg) -> FleetAlertEventClass {
+        match arg {
+            FleetAlertEventArg::Stale => FleetAlertEventClass::Stale,
+            FleetAlertEventArg::RestartExhausted => FleetAlertEventClass::RestartExhausted,
+            FleetAlertEventArg::NeedsHuman => FleetAlertEventClass::NeedsHuman,
+            FleetAlertEventArg::BudgetExceeded => FleetAlertEventClass::BudgetExceeded,
+            FleetAlertEventArg::VerifierFailed => FleetAlertEventClass::VerifierFailed,
+            FleetAlertEventArg::RunCompleted => FleetAlertEventClass::RunCompleted,
+        }
+    }
+
+    fn alert_status(class: FleetAlertEventClass, override_status: Option<String>) -> String {
+        if let Some(status) = override_status {
+            return status;
+        }
+        match class {
+            FleetAlertEventClass::Stale => "stale",
+            FleetAlertEventClass::RestartExhausted => "failed",
+            FleetAlertEventClass::NeedsHuman => "needs_human",
+            FleetAlertEventClass::BudgetExceeded => "budget_exceeded",
+            FleetAlertEventClass::VerifierFailed => "verifier_failed",
+            FleetAlertEventClass::RunCompleted => "completed",
+        }
+        .to_string()
+    }
+
+    fn alert_adapter(args: &FleetAlertDryRunArgs) -> FleetAlertAdapterConfig {
+        match args.adapter {
+            FleetAlertAdapterArg::Slack => FleetAlertAdapterConfig::Slack {
+                webhook_env: args.slack_webhook_env.clone(),
+                channel: None,
+            },
+            FleetAlertAdapterArg::Webhook => FleetAlertAdapterConfig::Webhook {
+                url_env: args.webhook_url_env.clone(),
+                secret_env: args.webhook_secret_env.clone(),
+            },
+            FleetAlertAdapterArg::PagerDuty => FleetAlertAdapterConfig::PagerDuty {
+                routing_key_env: args.pagerduty_routing_key_env.clone(),
+                severity: args.pagerduty_severity.clone(),
+            },
+        }
+    }
+
     let manager = FleetManager::open(workspace)?;
     match args.command {
         FleetCommand::Init => {
@@ -1589,6 +1696,30 @@ async fn run_fleet_command(workspace: &Path, args: FleetArgs) -> Result<()> {
             }
             let stopped = manager.stop_all()?;
             println!("stopped: {stopped}");
+            Ok(())
+        }
+        FleetCommand::AlertDryRun(args) => {
+            let class = alert_event_class(args.event);
+            let adapter = alert_adapter(&args);
+            let event = FleetAlertEvent {
+                class,
+                run_id: FleetRunId::from(args.run_id.clone()),
+                worker_id: args.worker_id.clone(),
+                task_id: args.task_id.clone(),
+                status: alert_status(class, args.status.clone()),
+                reason: args.reason.clone(),
+            };
+            let dispatcher = FleetAlertDispatcher::new(
+                FleetAlertConfig::dry_run_for_adapter(adapter),
+                FleetEnvSecretResolver,
+            );
+            let deliveries = dispatcher.dispatch(&event)?;
+            for delivery in deliveries {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&delivery.redacted_payload)?
+                );
+            }
             Ok(())
         }
     }

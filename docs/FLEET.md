@@ -175,6 +175,73 @@ an explicit verifier pass completes.
 }
 ```
 
+## Alerts
+
+Fleet alerting is disabled by default. A caller must supply an enabled alert
+config before anything is sent. Routes match typed fleet event classes, not log
+strings:
+
+- `stale`
+- `restart_exhausted`
+- `needs_human`
+- `budget_exceeded`
+- `verifier_failed`
+- `run_completed`
+
+Adapter config stores environment variable names, not secret values. Send-time
+code resolves those names from the environment or a future secrets provider.
+Ledger records store only audit labels such as `slack`, `webhook`, or
+`pagerduty`; task specs persisted in the ledger redact webhook URLs and routing
+keys.
+
+Example alert config shape:
+
+```json
+{
+  "enabled": true,
+  "dry_run": true,
+  "routes": [
+    {
+      "events": ["stale", "restart_exhausted", "verifier_failed"],
+      "adapter": "ops-slack"
+    },
+    {
+      "events": ["restart_exhausted"],
+      "adapter": "pager"
+    }
+  ],
+  "adapters": {
+    "ops-slack": {
+      "kind": "slack",
+      "webhook_env": "CODEWHALE_FLEET_SLACK_WEBHOOK",
+      "channel": "#codewhale-fleet"
+    },
+    "pager": {
+      "kind": "pager_duty",
+      "routing_key_env": "CODEWHALE_FLEET_PAGERDUTY_ROUTING_KEY",
+      "severity": "critical"
+    }
+  }
+}
+```
+
+Use dry-run to inspect a redacted adapter payload without sending:
+
+```sh
+codewhale fleet alert-dry-run \
+  --event stale \
+  --run-id fleet-demo \
+  --worker-id fleet-demo-local-1 \
+  --task-id release-triage \
+  --reason "worker heartbeat stale since 2026-06-13T02:00:00Z" \
+  --adapter slack
+```
+
+The payload includes the run id, worker id, task id, status, short reason, and
+safe inspection commands such as `codewhale fleet status` and
+`codewhale fleet inspect <worker-id>`. Endpoints, webhook secrets, and
+PagerDuty routing keys are shown as `<redacted:env:...>`.
+
 ## Host Adapters
 
 The host adapter boundary supports local child processes and explicit SSH
