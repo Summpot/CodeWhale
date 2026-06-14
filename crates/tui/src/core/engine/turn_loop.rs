@@ -1685,6 +1685,41 @@ impl Engine {
                     ToolExecutionBatch::Serial(plan) => (false, vec![*plan]),
                 };
 
+                // #3216 / #2211: once the turn is cancelled, do not start any
+                // further tool batches. Cancellation arrives out-of-band (the
+                // TUI cancels the shared token directly), so we can observe it
+                // here even while a long serial fan-out — e.g. six `agent_open`
+                // calls each resolving a model route under the global tool lock
+                // — is mid-flight. Without this check the batch loop ran to
+                // completion (~6×4s) with no way to interrupt, which read as a
+                // hard TUI freeze. We record an interrupted result for every
+                // remaining plan so each `tool_use` keeps a matching
+                // `tool_result` (well-formed transcript), then fall through to
+                // the post-loop cancellation check which ends the turn as
+                // Interrupted. This branch is a no-op on the normal path.
+                if self.cancel_token.is_cancelled() {
+                    for plan in plans {
+                        let result = Ok(interrupted_tool_result());
+                        let _ = self
+                            .tx_event
+                            .send(Event::ToolCallComplete {
+                                id: plan.id.clone(),
+                                name: plan.name.clone(),
+                                result: result.clone(),
+                            })
+                            .await;
+                        outcomes[plan.index] = Some(ToolExecOutcome {
+                            index: plan.index,
+                            id: plan.id,
+                            name: plan.name,
+                            input: plan.input,
+                            started_at: Instant::now(),
+                            result,
+                        });
+                    }
+                    continue;
+                }
+
                 if parallel_allowed {
                     let mut tool_tasks = FuturesUnordered::new();
                     let shell_permits =
@@ -2456,6 +2491,40 @@ fn should_skip_runtime_prompt_only_dispatch(
 fn stream_chunk_timeout_budget(config: &EngineConfig) -> (u64, Duration) {
     let secs = config.stream_chunk_timeout.as_secs();
     (secs, Duration::from_secs(secs))
+}
+
+/// Synthesize the tool result recorded for a tool call that never executed
+/// because the turn was cancelled mid-batch (#3216 / #2211).
+///
+/// Esc/Ctrl+C cancels the shared cancellation token out-of-band (see
+/// `EngineHandle::cancel_with_reason`), so the `for batch in batches` loop can
+/// observe the cancellation between batches and stop launching further tools —
+/// turning a wedged "six sub-agents, ~24s, can't cancel" turn into a prompt
+/// interrupt. We still record a result for every un-run `tool_use` so each
+/// keeps a matching `tool_result` and the transcript stays well-formed on
+/// resume. It is an `Ok(ToolResult { success: false })` rather than an `Err`
+/// so it routes through the benign outcome branch and does not inflate the
+/// step's error counters or trip error-escalation.
+fn interrupted_tool_result() -> ToolResult {
+    ToolResult::error("Tool not executed: the request was cancelled before this tool ran.")
+}
+
+#[cfg(test)]
+mod cancel_batch_tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_tool_result_is_a_non_error_unexecuted_marker() {
+        let result = interrupted_tool_result();
+        // Must not be marked successful (the tool never ran)...
+        assert!(!result.success, "interrupted tool must not report success");
+        // ...and must clearly explain why, for the resumed transcript.
+        assert!(
+            result.content.to_lowercase().contains("cancel"),
+            "interrupted result should explain the cancellation: {:?}",
+            result.content
+        );
+    }
 }
 
 #[cfg(test)]
