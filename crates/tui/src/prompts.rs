@@ -28,11 +28,11 @@ pub struct PromptSessionContext<'a> {
     /// to the system prompt instructing the model to respond in
     /// the resolved session locale.
     pub translation_enabled: bool,
-    /// Active model identifier injected into the Constitutional
-    /// preamble ("You are {model_id}, running inside CodeWhale").
-    /// Defaults to `"codewhale"` when the caller doesn't supply one,
-    /// preserving backward compatibility with existing call sites
-    /// that predate dynamic model injection.
+    /// Active model identifier used to resolve the model-fact templates
+    /// ({context_window_note} and friends). v4's constitution is
+    /// model-agnostic and no longer prints the id in its preamble, but the
+    /// id still selects model-accurate context-window / pricing / thinking
+    /// facts. Defaults to `"codewhale"` when the caller doesn't supply one.
     pub model_id: &'a str,
     /// Route-effective context window, when known. This can differ from the
     /// model-family maximum when a provider wrapper exposes a smaller envelope.
@@ -895,11 +895,14 @@ fn neutral_review_gate_body(text: &str) -> String {
 ///
 /// Each layer is separated by a blank line for readability in the
 /// rendered prompt (the model sees them as contiguous sections).
-/// Substitute the `{model_id}` template in the Constitutional preamble
-/// with the active model identifier. The base prompt is a compile-time
-/// constant; this function produces a per-session variant so the prompt
-/// says "You are deepseek-v4-pro" or "You are deepseek-v4-flash" instead
-/// of a static placeholder.
+/// Substitute the model-fact templates (`{context_window_note}`,
+/// `{subagent_economics}`, `{model_thinking_note}`, `{model_characteristics}`)
+/// with values for the active model. The base prompt is a compile-time
+/// constant; this produces a per-session variant.
+///
+/// `{model_id}` is also substituted, but v4's bundled constitution is
+/// model-agnostic and no longer carries that placeholder — the replacement
+/// is retained only for embedder-supplied prompts that still template it.
 fn apply_model_template(
     prompt: &str,
     model_id: &str,
@@ -1044,12 +1047,12 @@ fn render_core_tool_group(group: &[&str], core_tools: &[&str]) -> Option<String>
 const AUTHORITY_RECAP: &str = "\
 ## Authority Recap
 
-The Constitution of CodeWhale (Articles I-VII) governs your behavior.
-Tier 1 rules — truthfulness, user agency, tool-use mandate, verification
-duty — are non-negotiable. The user's next message is the highest
-directive within Constitutional bounds. Personality, memory, and handoff
-context are subordinate to the Constitution, the Statutes, and the user's
-current request. When in doubt, consult Article VII: The Hierarchy of Law.";
+The Constitution of CodeWhale governs your behavior. Ground truth is the
+ground everything stands on: you may be ordered past a fact, but you may
+never report one that isn't there. When instructions conflict, the
+operator's words this turn outrank project instructions, which outrank
+memory, which outranks handoffs — the nearest scope and the most recent
+breaking ties. When in doubt, consult Article VI: Priority.";
 
 pub fn compose_prompt(personality: Personality) -> String {
     compose_prompt_with_approval_model_and_shell(personality, "codewhale")
@@ -1469,10 +1472,14 @@ mod tests {
         let composer: Box<StaticPromptComposer> = Box::new(|ctx| {
             assert_eq!(ctx.model_id, "deepseek-v4-pro");
             assert_eq!(ctx.personality, Personality::Calm);
-            assert!(ctx.default_layers.contains("You are deepseek-v4-pro"));
-            // Personality tier removed — default_layers no longer carries a separate
-            // "Personality: Calm" section. Tone guidance is in the preamble.
-            assert!(ctx.default_layers.contains("Rule Number 6 applies"));
+            // v4 preamble is model-agnostic ("You are here to build") and
+            // folds tone in — no per-model id line, no separate personality
+            // section in default_layers.
+            assert!(ctx.default_layers.contains("You are here to build"));
+            assert!(
+                ctx.default_layers
+                    .contains("Take the work seriously. Don't take")
+            );
             assert!(!ctx.default_layers.contains("## Core Tool Taxonomy"));
             assert!(!ctx.default_layers.contains("Approval Policy"));
             "embedder static prompt".to_string()
@@ -1525,17 +1532,17 @@ mod tests {
 
     #[test]
     fn base_prompt_carries_constitutional_preamble() {
-        // Pin the load-bearing Constitutional anchors. The preamble has
-        // been revised from the Brother Whale framing to a direct "A" /
-        // Rule Number 6 stance. Verify the A, the possibility principle,
-        // the coordination legacy, and the hierarchy of law are all present.
+        // Pin the load-bearing Constitutional anchors. v4 is "zero
+        // ceremony": a preamble plus six articles (I. Ground Truth …
+        // VI. Priority). Verify the preamble stance, the ground-truth
+        // line, the legacy clause, and the priority article are present.
         for phrase in [
-            "You begin with an A",
-            "possibility comes before certainty",
-            "Rule Number 6 applies",
-            "future intelligences can better coordinate",
-            "Article II — The Primacy of Truth",
-            "Article VII — The Hierarchy of Law",
+            "You are here to build",
+            "Let the work speak",
+            "Take the work seriously. Don't take",
+            "Leave the workspace cleaner than you found it",
+            "### I. Ground Truth",
+            "### VI. Priority",
         ] {
             assert!(
                 BASE_PROMPT.contains(phrase),
@@ -1546,34 +1553,51 @@ mod tests {
 
     #[test]
     fn constitutional_hierarchy_keeps_case_command_above_local_law() {
-        let case_at = BASE_PROMPT
-            .find("2. **Case Command.**")
-            .expect("case command tier present");
-        let statute_at = BASE_PROMPT
-            .find("3. **Statutes.**")
-            .expect("statutes tier present");
-        let local_law_at = BASE_PROMPT
-            .find("5. **Local Law.**")
-            .expect("local law tier present");
+        // v4 Article VI ("Priority") carries precedence in prose, not a
+        // numbered tier ladder: the operator's words this turn outrank
+        // project instructions, which outrank memory, which outranks
+        // handoffs. Pin that ordering by phrase position.
+        let priority_at = BASE_PROMPT
+            .find("### VI. Priority")
+            .expect("Priority article present");
+        let operator_at = BASE_PROMPT
+            .find("operator's words this turn")
+            .expect("operator-words clause present");
+        let project_at = BASE_PROMPT
+            .find("then project instructions")
+            .expect("project-instructions clause present");
+        let memory_at = BASE_PROMPT
+            .find("then memory; then handoffs")
+            .expect("memory-then-handoffs clause present");
 
         assert!(
-            case_at < statute_at && statute_at < local_law_at,
-            "Article VII must keep the current user request above runtime guidance and local law"
+            priority_at < operator_at && operator_at < project_at && project_at < memory_at,
+            "Article VI must rank the operator's current words above project instructions, \
+             then memory, then handoffs"
+        );
+        // Ground truth is the ground the list stands on, not a tier on it —
+        // the operator may override a fact, but no one may invent one.
+        assert!(
+            BASE_PROMPT.contains("Ground truth is not on this list"),
+            "Article VI must hold ground truth above the precedence ladder"
         );
         assert!(
-            BASE_PROMPT.contains("actual runtime gates still determine what tools can execute"),
-            "Article VII must distinguish prompt authority from executable runtime gates"
+            BASE_PROMPT.contains("the operator may override a fact, but no one may invent one"),
+            "Article VI must keep ground truth overridable but never inventable"
         );
     }
 
     #[test]
-    fn base_prompt_contains_model_id_template() {
+    fn base_prompt_contains_model_fact_templates() {
+        // v4's constitution is model-agnostic — there is no longer a
+        // {model_id} placeholder in the preamble (the prompt no longer
+        // says "You are <model>"). The model-fact placeholders, however,
+        // still live in the retained operational tail; without them the
+        // apply_model_template substitutions would be inert (#3025).
         assert!(
-            BASE_PROMPT.contains("{model_id}"),
-            "BASE_PROMPT must contain the {{model_id}} template for dynamic injection"
+            !BASE_PROMPT.contains("{model_id}"),
+            "v4 BASE_PROMPT must not carry a {{model_id}} template — it is model-agnostic"
         );
-        // #3025: the model-facts placeholders must exist in base.md or the
-        // apply_model_template substitutions are inert.
         for placeholder in [
             "{context_window_note}",
             "{subagent_economics}",
@@ -1673,16 +1697,26 @@ mod tests {
     }
 
     #[test]
-    fn compose_prompt_injects_model_id() {
-        let prompt =
+    fn compose_prompt_is_model_agnostic_in_preamble() {
+        // v4 dropped per-model identity from the preamble: the prompt no
+        // longer says "You are <model>". The preamble is byte-for-byte the
+        // same regardless of model id, and no {model_id} placeholder leaks.
+        let flash =
             compose_prompt_with_approval_model_and_shell(Personality::Calm, "deepseek-v4-flash");
+        let kimi =
+            compose_prompt_with_approval_model_and_shell(Personality::Calm, "moonshotai/kimi-k2.6");
         assert!(
-            prompt.contains("You are deepseek-v4-flash"),
-            "composed prompt must contain the injected model id"
+            flash.contains("You are here to build"),
+            "v4 preamble must open with the model-agnostic build-first stance"
         );
         assert!(
-            !prompt.contains("{model_id}"),
-            "composed prompt must not contain the raw template placeholder"
+            !flash.contains("You are deepseek-v4-flash")
+                && !kimi.contains("You are moonshotai/kimi-k2.6"),
+            "v4 preamble must not inject a per-model identity line"
+        );
+        assert!(
+            !flash.contains("{model_id}") && !kimi.contains("{model_id}"),
+            "composed prompt must not contain the raw {{model_id}} placeholder"
         );
     }
 
@@ -1723,10 +1757,9 @@ mod tests {
                 "static prompt must always include shell guidance: {required:?}"
             );
         }
-        assert!(
-            prompt.contains("actual runtime gates still determine what tools can execute"),
-            "static prompt must include the runtime-gates hierarchy clause"
-        );
+        // The runtime-gates clause moved out of the constitution with the old
+        // numbered hierarchy; it now lives in the per-turn Runtime Policy
+        // Reference (covered by runtime_policy_reference_is_included_in_full_prompt).
         assert!(
             prompt.contains("`task_gate_run`") && prompt.contains("`github_issue_context`"),
             "static prompt must include non-shell task evidence tools"
@@ -1743,7 +1776,7 @@ mod tests {
         // system prompt, scoped under each mode sub-heading.
         // (The "## Toolbox" section from the Constitutional preamble remains.)
         assert!(!prompt.contains("## Core Tool Taxonomy"));
-        assert!(prompt.contains("You are deepseek-v4-pro"));
+        assert!(prompt.contains("You are here to build"));
     }
 
     #[test]
@@ -1799,8 +1832,12 @@ mod tests {
             "full system prompt must contain the authority recap"
         );
         assert!(
-            text.contains("The Constitution of CodeWhale (Articles I-VII) governs your behavior"),
+            text.contains("The Constitution of CodeWhale governs your behavior"),
             "authority recap must reference the Constitution"
+        );
+        assert!(
+            text.contains("consult Article VI: Priority"),
+            "authority recap must point at v4's priority article"
         );
     }
 
@@ -1962,20 +1999,22 @@ mod tests {
 
     #[test]
     fn constitution_has_no_separate_personality_tier() {
-        // The personality tier (previously Tier 8) has been removed.
-        // Voice and tone guidance now lives in the preamble ("don't take
-        // yourself too seriously") and is not a separate tier.
+        // v4 has no personality tier. Voice and tone live in the
+        // preamble ("Take the work seriously. Don't take yourself
+        // seriously. Let the work speak.") rather than a separate
+        // section, so personality remains folded in by omission.
         let prompt = compose_prompt(Personality::Calm);
         assert!(
             !prompt.contains("Personality: Calm — Tier 8"),
             "Personality tier should not appear as a separate section"
         );
         assert!(
-            prompt.contains("Rule Number 6 applies"),
-            "Preamble should carry tone guidance via Rule Number 6"
+            prompt.contains("Take the work seriously. Don't take"),
+            "Preamble should carry tone guidance (take the work, not yourself, seriously)"
         );
-        // Verify the preamble still has the A / possibility stance
-        assert!(prompt.contains("You begin with an A"));
+        // Verify the preamble still carries the build-first stance.
+        assert!(prompt.contains("You are here to build"));
+        assert!(prompt.contains("Let the work speak"));
     }
 
     #[test]
@@ -2092,7 +2131,7 @@ mod tests {
             SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
         };
         let preamble_marker = "## 语言要求";
-        let base_marker = "You are codewhale";
+        let base_marker = "You are here to build";
         let preamble_pos = text
             .find(preamble_marker)
             .expect("zh-Hans preamble should be present");
@@ -2577,9 +2616,9 @@ mod tests {
     #[test]
     fn compose_prompt_includes_all_layers() {
         let prompt = compose_prompt(Personality::Calm);
-        // Base layer — preamble + Constitution
-        assert!(prompt.contains("You are codewhale"));
-        assert!(prompt.contains("Article VII — The Hierarchy of Law"));
+        // Base layer — v4 preamble + Constitution
+        assert!(prompt.contains("You are here to build"));
+        assert!(prompt.contains("### VI. Priority"));
         // Statutes layer
         assert!(prompt.contains("## STATUTES (Tier 2)"));
         // Evidence layer
@@ -2640,10 +2679,10 @@ mod tests {
     #[test]
     fn compose_prompt_deterministic_order() {
         let prompt = compose_prompt(Personality::Calm);
-        // Personality tier removed. Verify preamble appears before the
-        // first Article, which is the structure that governs ordering.
-        let base_pos = prompt.find("You are codewhale").unwrap();
-        let article_pos = prompt.find("Article I — The Identity").unwrap();
+        // Verify the preamble appears before the first article
+        // (I. Ground Truth), which is the structure that governs ordering.
+        let base_pos = prompt.find("You are here to build").unwrap();
+        let article_pos = prompt.find("### I. Ground Truth").unwrap();
 
         assert!(base_pos < article_pos);
     }
@@ -2657,9 +2696,9 @@ mod tests {
         assert!(!prompt.contains("Mode: YOLO"));
         assert!(!prompt.contains("Mode: Plan"));
         assert!(!prompt.contains("Approval Policy:"));
-        // Base prompt contains Constitutional preamble (personality tier removed)
-        assert!(prompt.contains("You are codewhale"));
-        assert!(prompt.contains("Rule Number 6 applies"));
+        // Base prompt carries the v4 Constitutional preamble.
+        assert!(prompt.contains("You are here to build"));
+        assert!(prompt.contains("Take the work seriously. Don't take"));
     }
 
     #[test]
@@ -2667,24 +2706,23 @@ mod tests {
         let prompt = compose_prompt(Personality::Calm);
         assert!(!prompt.contains("Mode: Agent"));
         assert!(!prompt.contains("Approval Policy:"));
-        // Constitutional preamble is still present
-        assert!(prompt.contains("You are codewhale"));
+        // The v4 Constitutional preamble is still present.
+        assert!(prompt.contains("You are here to build"));
     }
 
     #[test]
     fn personality_is_folded_into_constitution() {
-        // The separate personality tier (Tier 8) has been removed.
-        // Voice and tone guidance now lives in the preamble. Both
-        // Calm and Playful compose_prompt calls produce identical
-        // output since no separate personality overlay is appended.
+        // v4 has no separate personality tier. Voice and tone live in
+        // the preamble, so both Calm and Playful compose_prompt calls
+        // produce identical output (no personality overlay is appended).
         let calm = compose_prompt(Personality::Calm);
         let playful = compose_prompt(Personality::Playful);
         assert_eq!(
             calm, playful,
             "personality enum is a no-op — both produce identical output"
         );
-        assert!(calm.contains("Rule Number 6 applies"));
-        assert!(calm.contains("You begin with an A"));
+        assert!(calm.contains("Take the work seriously. Don't take"));
+        assert!(calm.contains("You are here to build"));
     }
 
     #[test]
@@ -2873,32 +2911,40 @@ mod tests {
         );
     }
 
-    /// Tier 5 Local Law must explicitly cover `EngineConfig.instructions`
-    /// files. Without this clause, embedders that inject instructions via the
-    /// config field (rather than via the four hard-coded path conventions)
-    /// get their files classified by path — and since those embedder-supplied
-    /// paths aren't `AGENTS.md` / `CLAUDE.md` / `.codewhale/instructions.md` /
-    /// `.deepseek/instructions.md`, the model defaults to treating their
-    /// imperatives as Tier 7 Memory (the lowest tier per Article VII),
-    /// overridable by a single user sentence.
+    /// v4 collapses the old Tier 5 "Local Law" into Article VI's prose:
+    /// project instructions rank above memory, with the nearest scope
+    /// winning over the broader. The embedder-injected-instructions case
+    /// is covered by "project instructions" sitting above "memory" in the
+    /// precedence list — so an embedder's imperatives are project-tier,
+    /// not memory-tier, overridable only by the operator's current words.
     #[test]
-    fn local_law_tier_covers_engine_config_instructions() {
+    fn project_instructions_outrank_memory_in_priority_article() {
         let prompt = compose_prompt(Personality::Calm);
+        let project_at = prompt
+            .find("then project instructions")
+            .expect("Article VI must rank project instructions");
+        let memory_at = prompt
+            .find("then memory; then handoffs")
+            .expect("Article VI must rank memory below project instructions");
         assert!(
-            prompt.contains("any file configured via `EngineConfig.instructions`"),
-            "Tier 5 must explicitly cover EngineConfig.instructions so \
-             embedder-injected instructions are not default-classified as Tier 7 Memory."
+            project_at < memory_at,
+            "project instructions must outrank memory so embedder-injected \
+             instructions are not treated as mere memory preferences"
         );
     }
 
     #[test]
     fn workspace_orientation_guidance_present() {
+        // v4 expresses project-instruction precedence in prose ("project
+        // instructions, the nearest in scope winning over the broader")
+        // rather than enumerating AGENTS.md / CLAUDE.md by name. Verify the
+        // scope-nesting stance survives.
         let prompt = compose_prompt(Personality::Calm);
-        assert!(prompt.contains("AGENTS.md"));
-        assert!(prompt.contains("Local Law"));
+        assert!(prompt.contains("then project instructions"));
         assert!(
-            prompt.contains("CLAUDE.md"),
-            "CLAUDE.md must be listed as a project instruction source"
+            prompt.contains("the nearest in\nscope winning over the broader")
+                || prompt.contains("the nearest in scope winning over the broader"),
+            "Article VI must keep the nearest-scope-wins rule for project instructions"
         );
     }
 
@@ -2962,12 +3008,12 @@ mod tests {
     #[test]
     fn preamble_carries_tone_and_ownership_guidance() {
         let prompt = compose_prompt(Personality::Calm);
-        // Personality tier was removed. Tone guidance now lives in the preamble
-        // via "Rule Number 6" (don't take yourself too seriously) and the
-        // "possibility before certainty" stance.
-        assert!(prompt.contains("Rule Number 6 applies"));
-        assert!(prompt.contains("do not take yourself too seriously"));
-        assert!(prompt.contains("possibility comes before certainty"));
+        // v4 folds tone and ownership into the preamble: arrive trusted
+        // and capable, take the work (not yourself) seriously, and own
+        // the environment you leave for the intelligence that follows.
+        assert!(prompt.contains("You arrive trusted and capable"));
+        assert!(prompt.contains("Take the work seriously. Don't take"));
+        assert!(prompt.contains("The environment you leave is your contribution"));
     }
 
     #[test]

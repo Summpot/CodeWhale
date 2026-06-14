@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-Render the CodeWhale constitution from YAML to the markdown format
-the engine currently expects (equivalent to prompts/base.md output).
+Render the CodeWhale constitution (v4) from YAML to the markdown that the
+engine embeds via `include_str!("prompts/constitution.md")`.
 
 Usage:
-    python3 render_constitution.py [--yaml constitution.yaml] [--model deepseek-v4-pro]
+    python3 render_constitution.py [--yaml constitution.yaml]
 
-The YAML structure uses indentation to encode precedence:
-  - tier 1 (constitution) is at top level
-  - tier 3 (statutes) is nested under statutes
-  - tier 4 (regulations) is nested under regulations
-  - etc.
+v4 is "zero ceremony": the constitutional head is a preamble plus six prose
+articles (I. Ground Truth, II. Verification, III. Momentum, IV. Legacy,
+V. Help, VI. Priority). It is model-agnostic — there is no `{model_id}`
+templating, no numbered tier ladder, and no separate identity article.
 
-This renderer flattens the YAML into the current flat-markdown format
-that the engine's prompt assembly pipeline expects.
+The operational sections below the constitution (statutes / regulations /
+evidence) keep their tier labels because the runtime prompt-assembly pipeline
+and its tests still depend on them; this renderer reproduces them verbatim.
+
+The output is the full committed `constitution.md`. The runtime appends the
+Authority Recap and any Compaction Relay at assembly time, so this renderer
+deliberately does NOT emit them. Redirect stdout to regenerate the file:
+
+    python3 render_constitution.py > constitution.md
 """
 
 import sys
@@ -38,82 +44,25 @@ def numbered_list(items: list) -> str:
     return "\n".join(f"{i}. {item}" for i, item in enumerate(items, 1))
 
 
-def render_constitution(data: dict, model_id: str = "codewhale") -> str:
-    """Convert the YAML constitution into markdown."""
+def render_constitution(data: dict) -> str:
+    """Render the v4 constitution (preamble + six articles) plus the retained
+    operational sections into the committed `constitution.md` markdown."""
     out = []
 
-    # ── Preamble ──
+    # ── Preamble ── (v4 is model-agnostic: no {model_id} substitution)
     preamble = data.get("preamble", "")
-    out.append(preamble.replace("{model_id}", model_id).strip())
+    out.append(preamble.strip())
     out.append("")
 
-    # ── Constitution (Tier 1) ──
+    # ── Constitution (Tier 1): the six v4 articles ──
+    # v4 articles are prose with a `### <numeral>. <title>` heading. Precedence
+    # lives inside Article VI; there is no numbered tier ladder to render.
     const = data.get("constitution", {})
-
-    # Article I
-    a1 = const.get("article_1_identity", {})
-    out.append("### Article I — The Identity of the Agent")
-    out.append("")
-    out.append(a1.get("text", "").strip())
-    out.append("")
-    for rule in a1.get("rules", []):
-        out.append(rule)
-    out.append("")
-
-    # Article II
-    a2 = const.get("article_2_truth", {})
-    out.append("### Article II — The Primacy of Truth")
-    out.append("")
-    out.append(a2.get("text", "").strip())
-    out.append("")
-    if a2.get("non_negotiable"):
-        out.append(f"This Article is non-negotiable. {a2.get('note', '')}")
-    out.append("")
-
-    # Article III
-    a3 = const.get("article_3_user_agency", {})
-    out.append("### Article III — The Agency of the User")
-    out.append("")
-    out.append(a3.get("text", "").strip())
-    out.append("")
-    for g in a3.get("guidance", []):
-        out.append(g)
-    out.append("")
-
-    # Article IV
-    a4 = const.get("article_4_action", {})
-    out.append("### Article IV — The Duty of Action")
-    out.append("")
-    out.append(a4.get("text", "").strip())
-    out.append("")
-
-    # Article V
-    a5 = const.get("article_5_verification", {})
-    out.append("### Article V — The Discipline of Verification")
-    out.append("")
-    out.append(a5.get("text", "").strip())
-    out.append("")
-
-    # Article VI
-    a6 = const.get("article_6_legacy", {})
-    out.append("### Article VI — The Legacy of Coordination")
-    out.append("")
-    out.append(a6.get("text", "").strip())
-    out.append("")
-    deeper = a6.get("deeper", "")
-    if deeper:
-        out.append(deeper.strip())
-    out.append("")
-
-    # Article VII — Hierarchy
-    a7 = const.get("article_7_hierarchy", {})
-    out.append("### Article VII — The Hierarchy of Law")
-    out.append("")
-    out.append(a7.get("text", "").strip())
-    out.append("")
-    for level in a7.get("levels", []):
-        out.append(f"{level['tier']}. **{level['name']}.** {level.get('note', '')}")
-    out.append("")
+    for article in const.get("articles", []):
+        out.append(f"### {article['title']}")
+        out.append("")
+        out.append(article.get("text", "").strip())
+        out.append("")
 
     out.append("---")
     out.append("")
@@ -285,70 +234,23 @@ def render_constitution(data: dict, model_id: str = "codewhale") -> str:
     out.append("## Internal Sub-agent Completion Events")
     out.append("")
     out.append(sdp.get("text", "").strip())
-    out.append("")
 
-    out.append("---")
-    out.append("")
-
-    # ── Compaction Relay (Tier 9) ──
-    cr = data.get("compaction_relay", {})
-    if cr.get("conditional"):
-        out.append("<!-- COMPACTION_RELAY_PLACEHOLDER -->")
-        out.append("")
-        out.append("## Compaction Relay — Tier 9 (Precedent)")
-        out.append("")
-        out.append("The conversation above this point has been compacted.")
-        out.append("Below is a structured summary of what was discussed and decided.")
-        out.append("")
-        for key in ["goal", "constraints"]:
-            val = cr.get("template", {}).get(key, "")
-            title = key.replace("_", " ").title()
-            out.append(f"### {title}")
-            out.append(val)
-            out.append("")
-        progress = cr.get("template", {}).get("progress", {})
-        if progress:
-            out.append("### Progress")
-            out.append("")
-            for subkey in ["done", "in_progress", "blocked"]:
-                val = progress.get(subkey, "")
-                title = subkey.replace("_", " ").title()
-                out.append(f"#### {title}")
-                out.append(val)
-                out.append("")
-        for key in ["key_decisions", "next_step"]:
-            val = cr.get("template", {}).get(key, "")
-            title = key.replace("_", " ").title()
-            out.append(f"### {title}")
-            out.append(val)
-            out.append("")
-        out.append(cr.get("template", {}).get("staleability", "").strip())
-
-    out.append("")
-    out.append("---")
-    out.append("")
-
-    # ── Authority Recap ──
-    recap = data.get("authority_recap", {}).get("text", "")
-    out.append("## Authority Recap")
-    out.append("")
-    out.append(recap.strip())
+    # The committed `constitution.md` ends here. The Authority Recap and any
+    # Compaction Relay are appended at runtime by the prompt-assembly pipeline
+    # (see `AUTHORITY_RECAP` in prompts.rs), not baked into the embedded file,
+    # so this renderer deliberately stops at the sub-agent protocol section.
 
     return "\n".join(out)
 
 
 def main():
     yaml_path = Path(__file__).parent / "constitution.yaml"
-    model_id = "codewhale"
 
     args = sys.argv[1:]
     i = 0
     while i < len(args):
         if args[i] == "--yaml" and i + 1 < len(args):
             yaml_path = Path(args[i + 1])
-            i += 2
-        elif args[i] == "--model" and i + 1 < len(args):
-            model_id = args[i + 1]
             i += 2
         else:
             i += 1
@@ -360,7 +262,7 @@ def main():
     with open(yaml_path) as f:
         data = yaml.safe_load(f)
 
-    rendered = render_constitution(data, model_id)
+    rendered = render_constitution(data)
     print(rendered)
 
     # Stats
