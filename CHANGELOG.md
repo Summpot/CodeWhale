@@ -36,6 +36,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delegate skill examples now use provider-neutral `model_strength` instead of
   hardcoded DeepSeek model ids.
 
+### Agent clarification questions (#3102)
+
+- Agents now have a first-class `request_user_input` tool to ask the user
+  structured clarifying questions through a modal UI surface instead of only
+  emitting a chat message and hoping the user notices. Mirrors the
+  approval/secret-request flow the harness already used for permissions.
+- The tool accepts 1-3 questions, each with a header, an id, 2-4 selectable
+  options (label + description), and `allow_free_text` / `multi_select` flags
+  (both default to `false` for back-compat). Input is validated up front with
+  actionable errors.
+- Wired across all layers: the `request_user_input` tool, engine handling
+  (`turn_loop` → `approval`), an interactive TUI modal (`UserInputView`) with
+  full keyboard navigation, and the runtime protocol
+  (`EventFrame::UserInputRequest` + `AppRequest::SubmitUserInput`) so headless
+  / app-server clients can answer programmatically. Parity tests cover the
+  wire round-trip and the omitted-flags default.
+
+### Sub-agent summary provenance (#2652)
+
+- A sub-agent's free-text result is now explicitly treated as an unverified
+  self-report rather than confirmed evidence. The completion sentinel carries
+  `summary_kind: complete | truncated` so the parent model can branch on
+  whether it saw the full report or a clipped excerpt.
+- Short summaries (≤ 12,000 chars) get a soft "re-verify material claims"
+  suffix; longer ones are head+tail truncated with an honest marker stating
+  the elided middle is not retrievable via `retrieve_tool_result`. Every
+  summary therefore carries exactly one boundary marker, never both.
+
+### Transcript hyperlinks — out-of-band OSC 8 (#3029)
+
+- Clickable file / file:line / URL links now reach the terminal through a
+  column-drift-safe path. Link payloads are embedded in-band by the markdown
+  renderer, then extracted out of the ratatui buffer cells and re-emitted
+  out-of-band by `ColorCompatBackend` — so the `ESC` bytes never occupy display
+  columns or corrupt selection. Supporting terminals get live hyperlinks;
+  others see the label text unchanged. Clipboard/selection extraction strips
+  residual codes as defense-in-depth.
+
 > Note: the workspace version is intentionally still `0.8.61`. A full version
 > bump to `0.8.62` is deferred until the routing change is smoke-tested end to
 > end against the live Z.ai and OpenRouter endpoints.
