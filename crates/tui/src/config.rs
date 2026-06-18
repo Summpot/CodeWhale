@@ -5683,37 +5683,8 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         .context("Failed to resolve config path: home directory not found.")?;
     ensure_parent_dir(&config_path)?;
 
-    let table_name = match provider {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
-            return Err(anyhow::anyhow!(
-                "save_api_key_for: DeepSeek variants must use the root api_key field, not provider-specific storage"
-            ));
-        }
-        ApiProvider::NvidiaNim => "providers.nvidia_nim",
-        ApiProvider::Openai => "providers.openai",
-        ApiProvider::Anthropic => "providers.anthropic",
-        ApiProvider::Atlascloud => "providers.atlascloud",
-        ApiProvider::WanjieArk => "providers.wanjie_ark",
-        ApiProvider::Openrouter => "providers.openrouter",
-        ApiProvider::XiaomiMimo => "providers.xiaomi_mimo",
-        ApiProvider::Novita => "providers.novita",
-        ApiProvider::Fireworks => "providers.fireworks",
-        ApiProvider::Siliconflow => "providers.siliconflow",
-        ApiProvider::SiliconflowCn => "providers.siliconflow_cn",
-        ApiProvider::Arcee => "providers.arcee",
-        ApiProvider::Huggingface => "providers.huggingface",
-        ApiProvider::Deepinfra => "providers.deepinfra",
-        ApiProvider::Moonshot => "providers.moonshot",
-        ApiProvider::Sglang => "providers.sglang",
-        ApiProvider::Vllm => "providers.vllm",
-        ApiProvider::Ollama => "providers.ollama",
-        ApiProvider::Volcengine => "providers.volcengine",
-        ApiProvider::Together => "providers.together",
-        ApiProvider::OpenaiCodex => "providers.openai_codex",
-        ApiProvider::Zai => "providers.zai",
-        ApiProvider::Stepfun => "providers.stepfun",
-        ApiProvider::Minimax => "providers.minimax",
-    };
+    let key_inside = provider_config_key(provider).context("provider api key table")?;
+    let table_name = format!("providers.{key_inside}");
 
     // Parse existing TOML (or start fresh) so we can edit the right table
     // without disturbing other sections.
@@ -5733,37 +5704,6 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
         .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
         .as_table_mut()
         .context("`providers` must be a table.")?;
-    let key_inside = match provider {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
-            return Err(anyhow::anyhow!(
-                "save_api_key_for: DeepSeek variants must use the root api_key field, not provider-specific storage"
-            ));
-        }
-        ApiProvider::NvidiaNim => "nvidia_nim",
-        ApiProvider::Openai => "openai",
-        ApiProvider::Anthropic => "anthropic",
-        ApiProvider::Atlascloud => "atlascloud",
-        ApiProvider::WanjieArk => "wanjie_ark",
-        ApiProvider::Openrouter => "openrouter",
-        ApiProvider::XiaomiMimo => "xiaomi_mimo",
-        ApiProvider::Novita => "novita",
-        ApiProvider::Fireworks => "fireworks",
-        ApiProvider::Siliconflow => "siliconflow",
-        ApiProvider::SiliconflowCn => "siliconflow_cn",
-        ApiProvider::Arcee => "arcee",
-        ApiProvider::Huggingface => "huggingface",
-        ApiProvider::Deepinfra => "deepinfra",
-        ApiProvider::Moonshot => "moonshot",
-        ApiProvider::Sglang => "sglang",
-        ApiProvider::Vllm => "vllm",
-        ApiProvider::Ollama => "ollama",
-        ApiProvider::Volcengine => "volcengine",
-        ApiProvider::Together => "together",
-        ApiProvider::OpenaiCodex => "openai_codex",
-        ApiProvider::Zai => "zai",
-        ApiProvider::Stepfun => "stepfun",
-        ApiProvider::Minimax => "minimax",
-    };
     let entry = providers
         .entry(key_inside.to_string())
         .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
@@ -5837,35 +5777,13 @@ pub fn save_provider_auth_mode_for(provider: ApiProvider, auth_mode: &str) -> Re
 }
 
 fn provider_config_key(provider: ApiProvider) -> Result<&'static str> {
-    match provider {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
-            anyhow::bail!("DeepSeek stores auth at the root config level")
-        }
-        ApiProvider::NvidiaNim => Ok("nvidia_nim"),
-        ApiProvider::Openai => Ok("openai"),
-        ApiProvider::Anthropic => Ok("anthropic"),
-        ApiProvider::Atlascloud => Ok("atlascloud"),
-        ApiProvider::WanjieArk => Ok("wanjie_ark"),
-        ApiProvider::Volcengine => Ok("volcengine"),
-        ApiProvider::Openrouter => Ok("openrouter"),
-        ApiProvider::XiaomiMimo => Ok("xiaomi_mimo"),
-        ApiProvider::Novita => Ok("novita"),
-        ApiProvider::Fireworks => Ok("fireworks"),
-        ApiProvider::Siliconflow => Ok("siliconflow"),
-        ApiProvider::SiliconflowCn => Ok("siliconflow_cn"),
-        ApiProvider::Arcee => Ok("arcee"),
-        ApiProvider::Huggingface => Ok("huggingface"),
-        ApiProvider::Deepinfra => Ok("deepinfra"),
-        ApiProvider::Moonshot => Ok("moonshot"),
-        ApiProvider::Sglang => Ok("sglang"),
-        ApiProvider::Vllm => Ok("vllm"),
-        ApiProvider::Ollama => Ok("ollama"),
-        ApiProvider::Together => Ok("together"),
-        ApiProvider::OpenaiCodex => Ok("openai_codex"),
-        ApiProvider::Zai => Ok("zai"),
-        ApiProvider::Stepfun => Ok("stepfun"),
-        ApiProvider::Minimax => Ok("minimax"),
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        anyhow::bail!("DeepSeek stores auth at the root config level");
     }
+    provider
+        .metadata()
+        .map(|metadata| metadata.provider_config_key())
+        .context("provider config key")
 }
 
 const KIMI_CODE_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
@@ -6199,6 +6117,23 @@ mod tests {
             ApiProvider::DeepseekCN.default_base_url(),
             DEFAULT_DEEPSEEKCN_BASE_URL
         );
+    }
+
+    #[test]
+    fn provider_config_key_follows_config_provider_metadata() {
+        for kind in codewhale_config::ProviderKind::ALL
+            .into_iter()
+            .filter(|kind| *kind != codewhale_config::ProviderKind::Deepseek)
+        {
+            let provider = ApiProvider::from_kind(kind);
+            assert_eq!(
+                provider_config_key(provider).expect("metadata-backed config key"),
+                kind.provider().provider_config_key()
+            );
+        }
+
+        assert!(provider_config_key(ApiProvider::Deepseek).is_err());
+        assert!(provider_config_key(ApiProvider::DeepseekCN).is_err());
     }
 
     // GHSA-72w5-pf8h-xfp4 — regression: `allow_shell` must be opt-in.
