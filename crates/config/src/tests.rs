@@ -2118,6 +2118,43 @@ fn normalize_config_file_path_rejects_traversal() {
     assert!(format!("{err:#}").contains("cannot contain '..'"));
 }
 
+#[test]
+fn resolve_config_path_rejects_env_traversal() {
+    let _lock = env_lock();
+    struct ConfigPathEnvGuard {
+        codewhale: Option<OsString>,
+        deepseek: Option<OsString>,
+    }
+    impl Drop for ConfigPathEnvGuard {
+        fn drop(&mut self) {
+            // Safety: test-only environment mutation is serialized by env_lock().
+            unsafe {
+                match self.codewhale.as_ref() {
+                    Some(value) => env::set_var("CODEWHALE_CONFIG_PATH", value),
+                    None => env::remove_var("CODEWHALE_CONFIG_PATH"),
+                }
+                match self.deepseek.as_ref() {
+                    Some(value) => env::set_var("DEEPSEEK_CONFIG_PATH", value),
+                    None => env::remove_var("DEEPSEEK_CONFIG_PATH"),
+                }
+            }
+        }
+    }
+    let _guard = ConfigPathEnvGuard {
+        codewhale: env::var_os("CODEWHALE_CONFIG_PATH"),
+        deepseek: env::var_os("DEEPSEEK_CONFIG_PATH"),
+    };
+
+    // Safety: test-only environment mutation is serialized by env_lock().
+    unsafe {
+        env::set_var("CODEWHALE_CONFIG_PATH", "../config.toml");
+        env::remove_var("DEEPSEEK_CONFIG_PATH");
+    }
+
+    let err = resolve_config_path(None).expect_err("env traversal should fail");
+    assert!(format!("{err:#}").contains("cannot contain '..'"));
+}
+
 #[cfg(unix)]
 #[test]
 fn normalize_config_file_path_rejects_symlink_file() {

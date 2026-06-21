@@ -2883,9 +2883,8 @@ pub struct ConfigStore {
 impl ConfigStore {
     pub fn load(path: Option<PathBuf>) -> Result<Self> {
         let path = resolve_config_path(path)?;
-        let (config, original_raw) = if path.exists() {
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read config at {}", path.display()))?;
+        let (config, original_raw) = if checked_path_exists(&path)? {
+            let raw = read_checked_config_file(&path)?;
             let parsed: ConfigToml = toml::from_str(&raw)
                 .with_context(|| format!("failed to parse config at {}", path.display()))?;
             (parsed, Some(raw))
@@ -2918,18 +2917,12 @@ impl ConfigStore {
         } else {
             toml::to_string_pretty(&self.config).context("failed to serialize config")?
         };
-        match fs::read_to_string(&self.path) {
-            Ok(existing) => {
-                if existing == body {
-                    return Ok(());
-                }
-                write_one_time_config_backup(&self.path)?;
+        if checked_path_exists(&self.path)? {
+            let existing = read_checked_config_file(&self.path)?;
+            if existing == body {
+                return Ok(());
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to read config at {}", self.path.display()));
-            }
+            write_one_time_config_backup(&self.path)?;
         }
         #[cfg(unix)]
         {
@@ -2970,7 +2963,8 @@ impl ConfigStore {
 
     #[must_use]
     pub fn permissions_path(&self) -> PathBuf {
-        permissions_path_for_config_path(&self.path)
+        checked_permissions_path_for_config_path(&self.path)
+            .expect("ConfigStore path is validated before construction")
     }
 
     #[must_use]
@@ -3442,26 +3436,31 @@ pub fn ensure_project_state_dir(workspace: &Path, subdir: &str) -> Result<PathBu
 }
 
 pub fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    let path = if let Some(path) = explicit {
-        path
-    } else if let Ok(path) = std::env::var("CODEWHALE_CONFIG_PATH") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            PathBuf::from(trimmed)
-        } else {
-            return default_config_path();
+    if let Some(path) = explicit {
+        return normalize_config_file_path(path);
+    }
+    if let Ok(path) = std::env::var("CODEWHALE_CONFIG_PATH") {
+        if let Some(path) = config_path_from_env_value(&path)? {
+            return Ok(path);
         }
-    } else if let Ok(path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            PathBuf::from(trimmed)
-        } else {
-            return default_config_path();
-        }
-    } else {
         return default_config_path();
-    };
-    normalize_config_file_path(path)
+    }
+    if let Ok(path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
+        if let Some(path) = config_path_from_env_value(&path)? {
+            return Ok(path);
+        }
+        return default_config_path();
+    }
+    default_config_path()
+}
+
+fn config_path_from_env_value(path: &str) -> Result<Option<PathBuf>> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        normalize_config_file_path(PathBuf::from(trimmed)).map(Some)
+    }
 }
 
 #[must_use]
@@ -3839,6 +3838,18 @@ fn normalize_config_file_path(path: PathBuf) -> Result<PathBuf> {
     let normalized = parent.join(file_name);
     reject_path_symlink(&normalized)?;
     Ok(normalized)
+}
+
+fn checked_path_exists(path: &Path) -> Result<bool> {
+    let path = normalize_config_file_path(path.to_path_buf())?;
+    path.try_exists()
+        .with_context(|| format!("failed to inspect config path {}", path.display()))
+}
+
+fn read_checked_config_file(path: &Path) -> Result<String> {
+    let path = normalize_config_file_path(path.to_path_buf())?;
+    fs::read_to_string(&path)
+        .with_context(|| format!("failed to read config at {}", path.display()))
 }
 
 fn reject_path_symlink(path: &Path) -> Result<()> {

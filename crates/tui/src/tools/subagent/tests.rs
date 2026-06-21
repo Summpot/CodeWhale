@@ -2569,6 +2569,21 @@ fn load_state_rejects_symlinked_state_file() {
     assert!(format!("{err:#}").contains("must not traverse symlinks"));
 }
 
+#[test]
+fn persist_state_rejects_state_path_outside_workspace() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    let outside_state = tmp.path().join("outside-state.json");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+
+    let manager = SubAgentManager::new(workspace, 1).with_state_path(outside_state);
+    let err = manager
+        .persist_state()
+        .expect_err("outside state path should fail");
+
+    assert!(format!("{err:#}").contains("must stay within workspace"));
+}
+
 #[cfg(unix)]
 #[test]
 fn persist_state_rejects_symlinked_state_directory() {

@@ -2027,7 +2027,7 @@ impl SubAgentManager {
             agents,
             workers: self.sorted_worker_records(),
         };
-        write_json_atomic(&path, &payload)
+        write_json_atomic(&self.workspace, &path, &payload)
     }
 
     fn persist_state_best_effort(&self) {
@@ -3418,17 +3418,15 @@ fn instant_from_duration(duration: Duration) -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+fn write_json_atomic<T: Serialize>(workspace: &Path, path: &Path, value: &T) -> Result<()> {
+    let workspace = normalize_subagent_workspace(workspace);
+    reject_workspace_relative_symlinks(&workspace, path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let payload = serde_json::to_string_pretty(value)?;
-    reject_workspace_relative_symlinks(path.parent().unwrap_or_else(|| Path::new(".")), path)?;
     let tmp_path = path.with_extension(format!("{}.tmp", std::process::id()));
-    reject_workspace_relative_symlinks(
-        tmp_path.parent().unwrap_or_else(|| Path::new(".")),
-        &tmp_path,
-    )?;
+    reject_workspace_relative_symlinks(&workspace, &tmp_path)?;
     fs::write(&tmp_path, payload)?;
     fs::rename(tmp_path, path)?;
     Ok(())
