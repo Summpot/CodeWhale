@@ -58,6 +58,24 @@ fn approval_intent_summary(text: &str) -> Option<String> {
     Some(summary)
 }
 
+pub(super) fn registered_tool_approval_required(
+    tool_name: &str,
+    requirement: ApprovalRequirement,
+    auto_approve: bool,
+) -> bool {
+    if requirement == ApprovalRequirement::Auto {
+        return false;
+    }
+    if registered_tool_requires_non_bypassable_approval(tool_name) {
+        return true;
+    }
+    !auto_approve
+}
+
+fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
+    matches!(tool_name, "rlm_eval")
+}
+
 impl Engine {
     fn drain_shell_completion_events(&self) -> Vec<crate::tools::shell::ShellCompletionEvent> {
         self.shell_manager
@@ -1547,9 +1565,11 @@ impl Engine {
                 } else if let Some(registry) = tool_registry
                     && let Some(spec) = registry.get(&tool_name)
                 {
-                    approval_required = spec.approval_requirement_for(&tool_input)
-                        != ApprovalRequirement::Auto
-                        && !registry.context().auto_approve;
+                    approval_required = registered_tool_approval_required(
+                        &tool_name,
+                        spec.approval_requirement_for(&tool_input),
+                        registry.context().auto_approve,
+                    );
                     approval_description = spec.description().to_string();
                     supports_parallel = spec.supports_parallel_for(&tool_input);
                     read_only = spec.is_read_only_for(&tool_input);

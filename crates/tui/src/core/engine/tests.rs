@@ -1,6 +1,7 @@
 use super::*;
 
 use super::context::{COMPACTION_SUMMARY_MARKER, TURN_MAX_OUTPUT_TOKENS};
+use super::turn_loop::registered_tool_approval_required;
 use crate::config::ApiProvider;
 use crate::models::SystemBlock;
 use crate::test_support::lock_test_env;
@@ -365,6 +366,29 @@ fn auto_review_policy_blocks_hold_when_approval_is_never() {
     );
     assert_eq!(audit["approval_mode"], "NEVER");
     assert_eq!(audit["decision"], "hold_for_review");
+}
+
+#[test]
+fn rlm_eval_required_approval_ignores_generic_auto_approve() {
+    assert!(registered_tool_approval_required(
+        "rlm_eval",
+        ApprovalRequirement::Required,
+        true
+    ));
+}
+
+#[test]
+fn generic_required_tools_keep_auto_approve_behavior() {
+    assert!(!registered_tool_approval_required(
+        "exec_shell",
+        ApprovalRequirement::Required,
+        true
+    ));
+    assert!(registered_tool_approval_required(
+        "exec_shell",
+        ApprovalRequirement::Required,
+        false
+    ));
 }
 
 #[test]
