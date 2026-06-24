@@ -30,7 +30,7 @@ use crate::config::{ApiProvider, Config, has_api_key_for, kimi_cli_credentials_p
 use crate::palette;
 use crate::tui::app::ReasoningEffort;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
-use codewhale_config::catalog::{CatalogOffering, CatalogSnapshot, CatalogSource};
+use codewhale_config::catalog::{CatalogOffering, CatalogSnapshot};
 use codewhale_config::provider::WireFormat;
 use codewhale_config::route::{
     LogicalModelRef, PricingSku, RequestProtocol, RouteRequest, RouteResolver, bundled_offerings,
@@ -448,25 +448,12 @@ fn reasoning_catalog_offering(
 fn bundled_reasoning_catalog() -> &'static CatalogSnapshot {
     static CATALOG: OnceLock<CatalogSnapshot> = OnceLock::new();
     CATALOG.get_or_init(|| CatalogSnapshot {
-        // Keep these rows in catalog shape and exact provider+wire scope; the
-        // full Models.dev snapshot can replace this seed without changing the
-        // TUI projection contract.
-        offerings: vec![CatalogOffering {
-            provider: "zai".to_string(),
-            wire_model_id: "glm-5.2".to_string(),
-            canonical_model: Some("zhipuai/glm-5.2".to_string()),
-            endpoint_key: "chat".to_string(),
-            default_for_provider: true,
-            family: Some("glm".to_string()),
-            limit: None,
-            cost: None,
-            reasoning: Some(true),
-            reasoning_options: vec![serde_json::json!({
-                "type": "effort",
-                "values": ["high", "max"],
-            })],
-            source: CatalogSource::Bundled,
-        }],
+        // Source reasoning descriptors from the single bundled Models.dev
+        // snapshot (the same data #3385's catalog layer uses) rather than a
+        // hand-maintained per-row seed, so provider reasoning rows (GLM-5.2,
+        // etc.) cannot drift from the catalog and every bundled provider with
+        // reasoning facts is covered, not just GLM.
+        offerings: codewhale_config::catalog::bundled_catalog_offerings(),
     })
 }
 
