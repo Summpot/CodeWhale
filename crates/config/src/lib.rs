@@ -3,6 +3,7 @@ pub mod catalog;
 mod harness;
 pub mod model_reference;
 pub mod models_dev;
+pub mod persistence;
 pub mod pricing;
 pub mod provider;
 mod provider_defaults;
