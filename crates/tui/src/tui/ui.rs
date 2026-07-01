@@ -9630,6 +9630,24 @@ async fn handle_view_events(
                         Some("Model route picker opened from /setup readiness.".to_string());
                 }
             }
+            ViewEvent::SetupOpenModeRequested => {
+                if app.view_stack.top_kind() != Some(ModalKind::ModePicker) {
+                    app.view_stack
+                        .push(crate::tui::views::mode_picker::ModePickerView::new(
+                            app.mode,
+                            app.ui_locale,
+                        ));
+                    app.status_message =
+                        Some("Work mode picker opened from /setup runtime posture.".to_string());
+                }
+            }
+            ViewEvent::SetupOpenConfigRequested => {
+                if app.view_stack.top_kind() != Some(ModalKind::Config) {
+                    app.view_stack.push(ConfigView::new_for_app(app));
+                    app.status_message =
+                        Some("Config view opened from /setup runtime posture.".to_string());
+                }
+            }
             ViewEvent::HotbarDisableRequested => {
                 disable_hotbar(app, config);
             }

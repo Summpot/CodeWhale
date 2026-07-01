@@ -1082,6 +1082,12 @@ impl ModalView for SetupWizardView {
             KeyCode::Char('m') if self.selected_step() == SetupStep::ProviderModel => {
                 ViewAction::EmitAndClose(ViewEvent::SetupOpenModelRequested)
             }
+            KeyCode::Char('m') if self.selected_step() == SetupStep::TrustSandbox => {
+                ViewAction::EmitAndClose(ViewEvent::SetupOpenModeRequested)
+            }
+            KeyCode::Char('c') if self.selected_step() == SetupStep::TrustSandbox => {
+                ViewAction::EmitAndClose(ViewEvent::SetupOpenConfigRequested)
+            }
             KeyCode::Char(key @ ('1' | '2' | '3' | '4' | '5' | '6'))
                 if self.selected_step() == SetupStep::Constitution =>
             {
@@ -1166,6 +1172,15 @@ impl ModalView for SetupWizardView {
             hints.push(ActionHint::new(
                 "M",
                 tr(self.locale, MessageId::SetupActionModel).to_string(),
+            ));
+        } else if self.selected_step() == SetupStep::TrustSandbox {
+            hints.push(ActionHint::new(
+                "M",
+                tr(self.locale, MessageId::SetupActionMode).to_string(),
+            ));
+            hints.push(ActionHint::new(
+                "C",
+                tr(self.locale, MessageId::SetupActionConfig).to_string(),
             ));
         }
         hints.extend([
@@ -1820,6 +1835,28 @@ mod tests {
         assert!(matches!(
             model_action,
             ViewAction::EmitAndClose(ViewEvent::SetupOpenModelRequested)
+        ));
+    }
+
+    #[test]
+    fn runtime_posture_step_hands_off_to_mode_and_config_surfaces() {
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::TrustSandbox,
+            SetupRuntimeFacts::default(),
+        );
+
+        let mode_action = view.handle_key(key(KeyCode::Char('m')));
+        assert!(matches!(
+            mode_action,
+            ViewAction::EmitAndClose(ViewEvent::SetupOpenModeRequested)
+        ));
+
+        let config_action = view.handle_key(key(KeyCode::Char('c')));
+        assert!(matches!(
+            config_action,
+            ViewAction::EmitAndClose(ViewEvent::SetupOpenConfigRequested)
         ));
     }
 

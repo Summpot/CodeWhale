@@ -629,6 +629,12 @@ pub enum ViewEvent {
     /// Emitted by the setup Provider/Model readiness card to hand off to the
     /// existing provider-qualified model route picker.
     SetupOpenModelRequested,
+    /// Emitted by the setup Runtime Posture card to hand off to the existing
+    /// work-mode picker.
+    SetupOpenModeRequested,
+    /// Emitted by the setup Runtime Posture card to hand off to the existing
+    /// config view for approval/sandbox/network details.
+    SetupOpenConfigRequested,
     /// Emitted by the `/hotbar` setup wizard when the user chooses "Disable
     /// Hotbar". The host persists `hotbar = []` and hides the panel.
     HotbarDisableRequested,
