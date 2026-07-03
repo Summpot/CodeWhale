@@ -620,6 +620,15 @@ fn back_from_api_key_onboarding(app: &mut App) {
     app.status_message = None;
 }
 
+fn surface_prompt_override_notices(app: &mut App) {
+    for notice in prompts::take_prompt_override_notices() {
+        app.add_message(HistoryCell::System {
+            content: format!("Warning: {notice}"),
+        });
+        app.push_status_toast(notice, StatusToastLevel::Warning, Some(12_000));
+    }
+}
+
 /// Run the interactive TUI event loop.
 ///
 /// # Examples
@@ -774,6 +783,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
     let mut app = App::new(options.clone(), config);
     crate::startup_trace::mark("app_constructed");
     sync_config_provider_from_app(config, &app);
+    surface_prompt_override_notices(&mut app);
 
     if options.resume_session_id.is_none() {
         let opened_setup = open_setup_checkpoint_if_due(&mut app, config, options.skip_onboarding);
