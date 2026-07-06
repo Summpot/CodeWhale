@@ -13,8 +13,7 @@
   named integration branch still exists — verify before relying on it.
 - **Workspace version:** read it from `Cargo.toml` (`[workspace.package]
   version`); it advances per release lane, so don't trust a number memorized
-  here. Do not bump versions opportunistically; version bumps, tags, release
-  artifacts, publishing, and GitHub Releases require Hunter's explicit approval.
+  here. Don't bump versions opportunistically — keep a bump to its own commit.
 - **Milestone guidepost:** use the current release milestone named in the active
   handoff and list it live, e.g.
   `gh issue list --repo Hmbown/CodeWhale --milestone "<current milestone>" --state open`.
@@ -64,11 +63,11 @@
 - Credit every harvested PR, issue report, or comment that materially shaped a
   fix. Preserve authorship when possible; otherwise use mappable GitHub
   noreply `Co-authored-by` trailers from `.github/AUTHOR_MAP`.
-- Do not tag, publish, create a GitHub Release, or push release artifacts
-  without Hunter approval.
-- Use CodeWhale branding while keeping DeepSeek support first-class. Retiring
-  legacy `deepseek-tui` names must never read as deprecating DeepSeek models or
-  provider support.
+- CodeWhale started as a DeepSeek-only harness; it's now about building the
+  greatest possible coding harness with the help of an open-source community.
+  Keep CodeWhale branding and every model/provider first-class — none
+  privileged. Retiring legacy names like `deepseek-tui` must never read as
+  dropping support for any model or provider.
 - Review PRs from code, tests, linked issues, comments, and check results.
   Never merge, close, harvest, or defer community work from title or labels
   alone.
