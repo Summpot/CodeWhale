@@ -47,9 +47,6 @@ const TASK_STOP_TARGET_LABEL: &str = "[x]";
 const TASK_STOP_TARGET_SUFFIX: &str = " [x]";
 const HOTBAR_PANEL_HEIGHT: u16 = 4;
 const HOTBAR_ROW_COLUMNS: usize = 4;
-/// Maximum character width for goal/objective text displayed in the
-/// compact To-do sidebar panel. Hover text shows the full objective.
-const SIDEBAR_GOAL_MAX_CHARS: usize = 50;
 
 pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App, config: &Config) {
     // Clear hover state at the start of each render
@@ -707,7 +704,7 @@ fn work_panel_hover_texts(
         } else {
             "◆"
         };
-        texts.push(format!("{icon} {objective}"));
+        texts.push(format!("Goal: {icon} {objective}"));
 
         if let Some(started) = summary.goal_started_at
             && texts.len() < max_rows
@@ -901,14 +898,13 @@ fn push_work_goal_lines(
             .fg(theme.warning)
             .add_modifier(ratatui::style::Modifier::BOLD)
     };
-    // Truncate long goal text to a short sidebar label — never leak raw
-    // prompt/goal text into the compact To-do panel. The hover text still
-    // shows the full objective.
-    let display = crate::tui::ui::short_title_truncate(objective, SIDEBAR_GOAL_MAX_CHARS);
+    // Show the full goal objective — this is goal mode's primary status
+    // surface. Prefix with "Goal:" so the compact row is clearly labelled
+    // as a goal-mode objective, not a generic session title.
     let label = if let Some(indicator) = summary.pause_indicator.as_deref() {
-        format!("{display} {indicator}")
+        format!("Goal: {objective} {indicator}")
     } else {
-        display
+        format!("Goal: {objective}")
     };
 
     lines.push(Line::from(Span::styled(
