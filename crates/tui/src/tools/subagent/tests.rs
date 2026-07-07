@@ -3562,11 +3562,20 @@ fn git_repo_root_discovers_one_level_nested_repo_from_harness() {
 
 #[test]
 fn git_repo_root_reports_attempted_paths_when_no_repo_found() {
-    let empty = tempdir().expect("empty dir");
-    let err = git_repo_root(empty.path()).expect_err("missing repo should fail cleanly");
+    let harness = tempdir().expect("empty harness dir");
+    let empty = harness
+        .path()
+        .join("isolated")
+        .join("a")
+        .join("b")
+        .join("c")
+        .join("d")
+        .join("empty");
+    std::fs::create_dir_all(&empty).expect("empty nested dir");
+    let err = git_repo_root(&empty).expect_err("missing repo should fail cleanly");
     let message = err.to_string();
     assert!(
-        message.contains("Tried:") && message.contains(empty.path().to_string_lossy().as_ref()),
+        message.contains("Tried:") && message.contains(empty.to_string_lossy().as_ref()),
         "expected friendly attempted-path error, got: {message}"
     );
 }
