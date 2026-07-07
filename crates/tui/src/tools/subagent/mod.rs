@@ -4233,7 +4233,9 @@ async fn run_subagent_task(task: SubAgentTask) {
             let raw = summarize_subagent_result(res);
             let (summary, truncated) = stamp_subagent_summary(&raw);
             let sentinel = match &res.status {
-                SubAgentStatus::Failed(error) => subagent_failed_sentinel(&task.agent_id, error),
+                SubAgentStatus::Failed(_) | SubAgentStatus::BudgetExhausted => {
+                    subagent_failed_sentinel(&task.agent_id, &raw)
+                }
                 _ => subagent_done_sentinel(&task.agent_id, res, truncated),
             };
             (summary, sentinel)
@@ -4259,10 +4261,12 @@ async fn run_subagent_task(task: SubAgentTask) {
     if let Some(mb) = task.runtime.mailbox.as_ref() {
         let envelope = match &result {
             Ok(res) => match &res.status {
-                SubAgentStatus::Failed(error) => MailboxMessage::Failed {
-                    agent_id: task.agent_id.clone(),
-                    error: error.clone(),
-                },
+                SubAgentStatus::Failed(_) | SubAgentStatus::BudgetExhausted => {
+                    MailboxMessage::Failed {
+                        agent_id: task.agent_id.clone(),
+                        error: summary.clone(),
+                    }
+                }
                 _ => MailboxMessage::Completed {
                     agent_id: task.agent_id.clone(),
                     summary: summary.clone(),
@@ -7360,7 +7364,12 @@ fn summarize_subagent_result(result: &SubAgentResult) -> String {
         (SubAgentStatus::Completed, None) => "Completed (no final summary returned)".to_string(),
         (SubAgentStatus::Interrupted(error), _) => format!("Interrupted: {error}"),
         (SubAgentStatus::Cancelled, _) => "Cancelled".to_string(),
-        (SubAgentStatus::BudgetExhausted, _) => "Token budget exhausted".to_string(),
+        (SubAgentStatus::BudgetExhausted, Some(text)) => format!(
+            "Child token budget exhausted before finishing; partial output preserved below.\n{text}"
+        ),
+        (SubAgentStatus::BudgetExhausted, None) => {
+            "Child token budget exhausted before returning a final summary; retry with a smaller scoped task or split the work.".to_string()
+        }
         (SubAgentStatus::Failed(error), _) => format!("Failed: {error}"),
         (SubAgentStatus::Running, _) => "Running".to_string(),
     }

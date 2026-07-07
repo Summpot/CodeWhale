@@ -3638,6 +3638,104 @@ fn create_isolated_worktree_rejects_invalid_branch_as_input() {
     );
 }
 
+fn init_git_repo_at(path: &std::path::Path) {
+    let init = Command::new("git")
+        .arg("init")
+        .current_dir(path)
+        .output()
+        .expect("git init should run");
+    assert!(init.status.success(), "git init failed");
+    let commit = Command::new("git")
+        .args([
+            "-c",
+            "user.name=codewhale Tests",
+            "-c",
+            "user.email=tests@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .current_dir(path)
+        .output()
+        .expect("git commit should run");
+    assert!(commit.status.success(), "git commit failed");
+}
+
+#[test]
+fn create_isolated_worktree_discovers_nested_repo_from_harness_parent() {
+    let harness = tempdir().expect("harness");
+    let nested = harness.path().join("CodeWhale");
+    std::fs::create_dir_all(&nested).expect("nested checkout dir");
+    init_git_repo_at(&nested);
+    let worktree_home = tempdir().expect("worktree home");
+    let request = SubAgentWorktreeRequest {
+        branch: Some("codex/agent-harness-nested".to_string()),
+        path: Some(worktree_home.path().join("isolated")),
+        base_ref: None,
+    };
+
+    let path = create_isolated_worktree(
+        harness.path(),
+        &request,
+        Some("harness-nested"),
+        &SubAgentType::Explore,
+    )
+    .expect("harness parent should discover nested repo");
+
+    assert!(path.exists(), "worktree path should exist");
+    assert_eq!(
+        current_git_branch(&path).as_deref(),
+        Some("codex/agent-harness-nested")
+    );
+}
+
+#[test]
+fn create_isolated_worktree_reports_friendly_error_when_no_repo_found() {
+    let harness = tempdir().expect("harness");
+    std::fs::create_dir_all(harness.path().join("not-a-repo")).expect("mkdir");
+    let worktree_home = tempdir().expect("worktree home");
+    let request = SubAgentWorktreeRequest {
+        branch: Some("codex/agent-missing".to_string()),
+        path: Some(worktree_home.path().join("isolated")),
+        base_ref: None,
+    };
+
+    let err = create_isolated_worktree(harness.path(), &request, None, &SubAgentType::General)
+        .expect_err("missing repo should fail with friendly error");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("requires a git repository") && message.contains("Tried:"),
+        "expected actionable discovery error, got: {message}"
+    );
+}
+
+#[test]
+fn create_isolated_worktree_rejects_ambiguous_nested_repos() {
+    let harness = tempdir().expect("harness");
+    for name in ["RepoA", "RepoB"] {
+        let nested = harness.path().join(name);
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        init_git_repo_at(&nested);
+    }
+    let worktree_home = tempdir().expect("worktree home");
+    let request = SubAgentWorktreeRequest {
+        branch: Some("codex/agent-ambiguous".to_string()),
+        path: Some(worktree_home.path().join("isolated")),
+        base_ref: None,
+    };
+
+    let err = create_isolated_worktree(harness.path(), &request, None, &SubAgentType::General)
+        .expect_err("multiple nested repos should fail deterministically");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("Multiple git repositories found"),
+        "expected ambiguity diagnostic, got: {message}"
+    );
+}
+
 #[test]
 fn build_subagent_system_prompt_appends_role_when_set() {
     let assignment = SubAgentAssignment::new("p".to_string(), Some("worker".to_string()));
@@ -5160,6 +5258,22 @@ fn summarize_subagent_result_diagnoses_missing_completed_payload() {
     assert!(
         summary.contains("no final summary"),
         "Completed without payload must not read as silent success: {summary}"
+    );
+}
+
+#[test]
+fn summarize_subagent_result_budget_exhaustion_is_actionable_not_raw_done() {
+    let mut snap = make_snapshot(SubAgentStatus::BudgetExhausted);
+    snap.result = Some("partial findings from step 1".to_string());
+    let summary = summarize_subagent_result(&snap);
+    assert!(summary.contains("partial output preserved"), "{summary}");
+    assert!(!summary.eq("Token budget exhausted"), "{summary}");
+
+    let empty = make_snapshot(SubAgentStatus::BudgetExhausted);
+    let summary = summarize_subagent_result(&empty);
+    assert!(
+        summary.contains("retry with a smaller scoped task"),
+        "{summary}"
     );
 }
 
