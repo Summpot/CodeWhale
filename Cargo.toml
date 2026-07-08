@@ -63,6 +63,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.11", features = ["v4"] }
 mimalloc = { version = "0.1", default-features = false }
 
+codewhale-protocol = { path = "./crates/protocol" }
+codewhale-secrets = { path = "./crates/secrets" }
+codewhale-execpolicy = { path = "./crates/execpolicy" }
+codewhale-config = { path = "./crates/config" }
+codewhale-agent = { path = "./crates/agent" }
+codewhale-state = { path = "./crates/state" }
+codewhale-tools = { path = "./crates/tools" }
+codewhale-mcp = { path = "./crates/mcp" }
+codewhale-hooks = { path = "./crates/hooks" }
+codewhale-core = { path = "./crates/core" }
+
 [profile.release]
 lto = true
 strip = true
