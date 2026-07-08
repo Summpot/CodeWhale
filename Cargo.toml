@@ -63,6 +63,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.11", features = ["v4"] }
 mimalloc = { version = "0.1", default-features = false }
+keyring = "3"
 
 codewhale-protocol = { path = "./crates/protocol" }
 codewhale-secrets = { path = "./crates/secrets" }
