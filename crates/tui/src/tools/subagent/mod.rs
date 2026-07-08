@@ -43,6 +43,7 @@ use crate::tools::todo::SharedTodoList;
 #[cfg(test)]
 use crate::tools::todo::TodoList;
 use crate::tools::truncate::{SPILLOVER_HEAD_BYTES, SPILLOVER_THRESHOLD_BYTES, maybe_spillover};
+use crate::tui::app::AppMode;
 use crate::tui::app::ReasoningEffort;
 use crate::utils::spawn_supervised;
 use crate::worker_profile::{ModelRoute, ShellPolicy, ToolScope, WorkerRuntimeProfile};
@@ -57,15 +58,14 @@ pub use mailbox::{Mailbox, MailboxEnvelope, MailboxMessage, MailboxReceiver};
 /// Maps file path → agent id. Agents hold a lease on a file while running;
 /// the lease is released when the agent reaches a terminal state.
 static RESIDENT_LEASES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, String>>,
+    parking_lot::Mutex<std::collections::HashMap<String, String>>,
 > = std::sync::OnceLock::new();
 
 /// Release all resident file leases held by `agent_id`. Called when an
 /// agent transitions to a terminal state (completed, failed, cancelled).
 fn release_resident_leases_for(agent_id: &str) {
-    if let Some(lock) = RESIDENT_LEASES.get()
-        && let Ok(mut guard) = lock.lock()
-    {
+    if let Some(lock) = RESIDENT_LEASES.get() {
+        let mut guard = lock.lock();
         guard.retain(|_, owner| owner != agent_id);
     }
 }
@@ -432,118 +432,6 @@ impl SubAgentType {
             Self::Custom => CUSTOM_AGENT_INTRO,
         };
         format!("{role_intro}{SUBAGENT_OUTPUT_FORMAT}")
-    }
-
-    /// Get the default allowed tools for this agent type.
-    ///
-    /// **Deprecated since v0.6.6.** Default sub-agents now inherit the full
-    /// parent registry; the per-type allowlist is advisory only. Pass an explicit
-    /// `allowed_tools` array for narrow Custom roles instead.
-    #[must_use]
-    #[deprecated(
-        since = "0.6.6",
-        note = "Default sub-agents inherit the full parent registry; pass an explicit allowed_tools list only for narrow Custom roles."
-    )]
-    pub fn allowed_tools(&self) -> Vec<&'static str> {
-        match self {
-            Self::General => vec![
-                "list_dir",
-                "read_file",
-                "write_file",
-                "edit_file",
-                "apply_patch",
-                "grep_files",
-                "file_search",
-                "web.run",
-                "web_search",
-                "exec_shell",
-                "exec_shell_wait",
-                "exec_shell_interact",
-                "exec_wait",
-                "exec_interact",
-                "note",
-                "checklist_write",
-                "checklist_add",
-                "checklist_update",
-                "checklist_list",
-                "todo_write",
-                "todo_add",
-                "todo_update",
-                "todo_list",
-                "update_plan",
-            ],
-            Self::Explore => vec![
-                "list_dir",
-                "read_file",
-                "grep_files",
-                "file_search",
-                "web.run",
-                "web_search",
-                "exec_shell",
-                "exec_shell_wait",
-                "exec_shell_interact",
-                "exec_wait",
-                "exec_interact",
-            ],
-            Self::Plan => vec![
-                "list_dir",
-                "read_file",
-                "grep_files",
-                "file_search",
-                "web.run",
-                "note",
-                "update_plan",
-                "checklist_write",
-                "checklist_add",
-                "checklist_update",
-                "checklist_list",
-                "todo_write",
-                "todo_add",
-                "todo_update",
-                "todo_list",
-            ],
-            Self::Review => vec!["list_dir", "read_file", "grep_files", "file_search", "note"],
-            Self::Implementer => vec![
-                "list_dir",
-                "read_file",
-                "write_file",
-                "edit_file",
-                "apply_patch",
-                "grep_files",
-                "file_search",
-                "exec_shell",
-                "exec_shell_wait",
-                "exec_shell_interact",
-                "exec_wait",
-                "exec_interact",
-                "note",
-                "checklist_write",
-                "checklist_add",
-                "checklist_update",
-                "checklist_list",
-                "todo_write",
-                "todo_add",
-                "todo_update",
-                "todo_list",
-                "update_plan",
-            ],
-            Self::Verifier => vec![
-                "list_dir",
-                "read_file",
-                "grep_files",
-                "file_search",
-                "exec_shell",
-                "exec_shell_wait",
-                "exec_shell_interact",
-                "exec_wait",
-                "exec_interact",
-                "run_tests",
-                "run_verifiers",
-                "diagnostics",
-                "note",
-            ],
-            Self::Custom => vec![], // Must be provided by caller.
-        }
     }
 }
 
@@ -1248,10 +1136,22 @@ struct SpawnRequest {
     session_name: Option<String>,
     prompt: String,
     agent_type: SubAgentType,
+    /// True when the caller supplied `type`/`agent_type` or `role` explicitly
+    /// (vs the `General` default). A fleet `profile` only sets the agent type
+    /// when the caller did not, and conflicts are rejected only for explicit
+    /// values.
+    agent_type_explicit: bool,
+    /// Optional Fleet roster member id (trimmed, lowercased). Resolved at
+    /// spawn time against the runtime roster — parsing has no runtime access.
+    profile: Option<String>,
     assignment: SubAgentAssignment,
     allowed_tools: Option<Vec<String>>,
     model: Option<String>,
     model_strength: SubAgentModelStrength,
+    /// True when the caller supplied `model_strength` explicitly. An explicit
+    /// strength outranks a fleet profile's model pin/loadout; the parse-time
+    /// default does not.
+    model_strength_explicit: bool,
     thinking: SubAgentThinking,
     /// Optional working directory for the child. Must canonicalize to a path
     /// inside the parent's workspace. For first-class git worktree isolation,
@@ -1439,11 +1339,29 @@ pub struct SubAgentForkContext {
 #[derive(Clone)]
 pub struct SubAgentRuntime {
     pub client: DeepSeekClient,
+    /// Session `Config` snapshot, used to build a *fresh* LLM client bound to a
+    /// different provider when a fleet roster member's profile pins one (#4193,
+    /// the interactive-TUI twin of the headless `codewhale exec --provider`
+    /// route from #4181). The engine threads it in via
+    /// [`SubAgentRuntime::with_api_config`]; `child_runtime`/`background_runtime`
+    /// clone the `Arc` so every descendant can re-derive a provider-B client.
+    ///
+    /// `None` for legacy/test runtimes that never threaded a config. When a
+    /// profile pins a provider different from the session's and this is `None`
+    /// (or the pinned provider's credentials cannot be resolved), the spawn
+    /// FAILS rather than silently reusing the session client — a silent reuse
+    /// would send model B's id to provider A's endpoint, the exact #4093 defect.
+    pub api_config: Option<std::sync::Arc<crate::config::Config>>,
     pub model: String,
     pub auto_model: bool,
     pub reasoning_effort: Option<String>,
     pub reasoning_effort_auto: bool,
     pub role_models: HashMap<String, String>,
+    /// Shared fleet roster of named agent roles (#fleet-roster cutover
+    /// (v0.8.67)). Built-ins only by default; the engine installs the merged
+    /// built-in/config/workspace roster so model-spawned sub-agents and fleet
+    /// dispatch resolve the same party. Cloned into child runtimes.
+    pub fleet_roster: std::sync::Arc<crate::fleet::roster::FleetRoster>,
     pub context: ToolContext,
     pub allow_shell: bool,
     /// Native Agent-mode tool surface inherited from the parent turn. Carries
@@ -1509,6 +1427,8 @@ pub struct SubAgentRuntime {
     /// Work sidebar live. Without this, each child gets a fresh isolated
     /// list and the parent never sees child progress until completion.
     pub todos: SharedTodoList,
+    /// Session mode of the orchestrating parent at spawn time (Wave 7 M4/M5).
+    pub parent_mode: AppMode,
 }
 
 impl SubAgentRuntime {
@@ -1527,11 +1447,13 @@ impl SubAgentRuntime {
     ) -> Self {
         Self {
             client,
+            api_config: None,
             model,
             auto_model: false,
             reasoning_effort: None,
             reasoning_effort_auto: false,
             role_models: HashMap::new(),
+            fleet_roster: std::sync::Arc::new(crate::fleet::roster::FleetRoster::built_ins_only()),
             context,
             allow_shell,
             agent_tool_surface_options: AgentToolSurfaceOptions::new(
@@ -1552,7 +1474,15 @@ impl SubAgentRuntime {
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             speech_output_dir: None,
             todos: crate::tools::todo::new_shared_todo_list(),
+            parent_mode: AppMode::Agent,
         }
+    }
+
+    /// Preserve the parent session mode for spawn-policy decisions.
+    #[must_use]
+    pub fn with_parent_mode(mut self, mode: AppMode) -> Self {
+        self.parent_mode = mode;
+        self
     }
 
     /// Attach the parent's shared todo list so sub-agent `checklist_update`
@@ -1657,6 +1587,60 @@ impl SubAgentRuntime {
         self
     }
 
+    /// Attach the session `Config` so a spawn can build a fresh LLM client for a
+    /// fleet profile's pinned provider (#4193). Without it, cross-provider
+    /// in-process spawns fail closed rather than misrouting (see the
+    /// [`api_config`](Self::api_config) field docs). Engine-only wiring; test
+    /// and legacy runtimes may leave it unset.
+    #[must_use]
+    pub fn with_api_config(mut self, config: crate::config::Config) -> Self {
+        self.api_config = Some(std::sync::Arc::new(config));
+        self
+    }
+
+    /// Build an LLM client bound to `provider` from the threaded session
+    /// `Config` (#4193). Mirrors the proven per-provider client factory used by
+    /// per-turn auto-routing (`model_routing`) and the engine's provider switch:
+    /// clone the session config, override only its `provider`, and let
+    /// [`DeepSeekClient::new`] re-resolve that provider's base URL + credentials
+    /// from config/env.
+    ///
+    /// Returns `Err` when no config was threaded in, or when the provider's
+    /// credentials/base URL cannot be resolved. Callers MUST surface that error
+    /// rather than fall back to the session client: a silent fallback would send
+    /// the pinned model id to the session provider's endpoint (#4093).
+    fn client_for_provider(
+        &self,
+        provider: crate::config::ApiProvider,
+    ) -> Result<DeepSeekClient, String> {
+        let Some(api_config) = self.api_config.as_ref() else {
+            return Err(
+                "session Config was not threaded into this runtime; cannot build a \
+                 provider-pinned client"
+                    .to_string(),
+            );
+        };
+        let mut provider_config = (**api_config).clone();
+        // EPIC #2608: the provider is taken verbatim from the profile pin
+        // (already parsed to a canonical `ApiProvider`), never inferred from the
+        // model id. Overriding only `provider` makes `Config::api_provider`,
+        // `deepseek_base_url`, and `deepseek_api_key` all re-resolve for the
+        // pinned provider.
+        provider_config.provider = Some(provider.as_str().to_string());
+        DeepSeekClient::new(&provider_config).map_err(|err| err.to_string())
+    }
+
+    /// Install the merged fleet roster (#fleet-roster cutover (v0.8.67)).
+    /// The engine builds it once per session config; children inherit it.
+    #[must_use]
+    pub fn with_fleet_roster(
+        mut self,
+        roster: std::sync::Arc<crate::fleet::roster::FleetRoster>,
+    ) -> Self {
+        self.fleet_roster = roster;
+        self
+    }
+
     /// Preserve whether the parent session is using per-turn model routing.
     #[must_use]
     pub fn with_auto_model(mut self, auto_model: bool) -> Self {
@@ -1704,11 +1688,13 @@ impl SubAgentRuntime {
         child_context.auto_approve = self.context.auto_approve;
         Self {
             client: self.client.clone(),
+            api_config: self.api_config.clone(),
             model: self.model.clone(),
             auto_model: self.auto_model,
             reasoning_effort: self.reasoning_effort.clone(),
             reasoning_effort_auto: self.reasoning_effort_auto,
             role_models: self.role_models.clone(),
+            fleet_roster: self.fleet_roster.clone(),
             context: child_context,
             allow_shell: self.allow_shell,
             agent_tool_surface_options: self.agent_tool_surface_options.clone(),
@@ -1727,6 +1713,7 @@ impl SubAgentRuntime {
             tool_timeout: self.tool_timeout,
             speech_output_dir: self.speech_output_dir.clone(),
             todos: self.todos.clone(),
+            parent_mode: self.parent_mode,
         }
     }
 
@@ -2127,10 +2114,10 @@ impl SubAgentManager {
             self.persist_pending = false;
             // Synchronous disk I/O — safe because we are shutting down and no
             // callers depend on releasing the write lock quickly.
-            if let Ok(Some((path, payload))) = self.build_persist_payload() {
-                if let Err(err) = write_json_atomic(&self.workspace, &path, &payload) {
-                    tracing::warn!(target: "subagent", ?err, "failed to flush pending sub-agent state");
-                }
+            if let Ok(Some((path, payload))) = self.build_persist_payload()
+                && let Err(err) = write_json_atomic(&self.workspace, &path, &payload)
+            {
+                tracing::warn!(target: "subagent", ?err, "failed to flush pending sub-agent state");
             }
         }
     }
@@ -2355,6 +2342,30 @@ impl SubAgentManager {
         record.usage.budget_remaining_tokens = Some(scope.remaining);
         refresh_usage_note(&mut record.usage);
         self.refresh_budget_scope(&scope.scope_id);
+    }
+
+    /// Aggregate token spend for a shared workflow budget scope.
+    pub(crate) fn budget_spent_for_scope(&self, scope_id: &str) -> u64 {
+        self.aggregate_budget_spent(scope_id)
+    }
+
+    /// Attach a workflow child to the run-level shared budget pool.
+    pub(crate) fn attach_shared_budget_scope(
+        &mut self,
+        worker_id: &str,
+        scope_id: &str,
+        limit: u64,
+    ) {
+        let spent = self.aggregate_budget_spent(scope_id);
+        self.attach_budget_scope(
+            worker_id,
+            AgentUsageBudgetScope {
+                scope_id: scope_id.to_string(),
+                limit,
+                spent,
+                remaining: limit.saturating_sub(spent),
+            },
+        );
     }
 
     fn refresh_budget_scope(&mut self, scope_id: &str) {
@@ -2800,6 +2811,10 @@ impl SubAgentManager {
             self.attach_budget_scope(&agent_id, scope);
         }
 
+        if let Some(mb) = runtime.mailbox.as_ref() {
+            let _ = mb.send(MailboxMessage::started(&agent_id, agent_type.clone()));
+        }
+
         if let Some(event_tx) = runtime.event_tx.clone() {
             let _ = event_tx.try_send(Event::AgentSpawned {
                 id: agent_id.clone(),
@@ -3022,7 +3037,7 @@ impl SubAgentManager {
     #[must_use]
     pub fn cleanup_due(&self, min_interval: Duration) -> bool {
         self.last_cleanup_at
-            .map_or(true, |last| last.elapsed() >= min_interval)
+            .is_none_or(|last| last.elapsed() >= min_interval)
     }
 
     fn update_from_result(&mut self, agent_id: &str, result: SubAgentResult) {
@@ -3590,6 +3605,7 @@ impl ToolSpec for AgentTool {
             "Start, inspect, peek at, or cancel focused child agent tasks through one surface. Use start only for independent work that benefits from a clean context. ",
             "For several independent targets, call agent separately for each target; CodeWhale runs or queues them under runtime capacity and provider rate-limit backpressure. ",
             "The child runs in the background and reports back automatically when finished; keep tiny reads/searches local. ",
+            "Pass profile to spawn a saved Fleet roster member (e.g. reviewer, scout, builder) with its role posture, model routing, and instructions. ",
             "Use action=status or action=peek with agent_id to inspect progress, and action=cancel with agent_id to stop a running child. Returns session projections with transcript_handle for UI/debug inspection."
         )
     }
@@ -3622,6 +3638,10 @@ impl ToolSpec for AgentTool {
                 "type": {
                     "type": "string",
                     "description": SUBAGENT_TYPE_DESCRIPTION
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Optional Fleet roster member to run this child as (e.g. reviewer, scout, builder, verifier, synthesizer, manager, or a custom member from .codewhale/agents/ or [fleet.profiles] config). The member supplies role posture, model routing, instruction overlay, and delegation bounds; explicit type/model/model_strength/max_depth here override the member's defaults. See /fleet."
                 },
                 "model_strength": {
                     "type": "string",
@@ -3659,7 +3679,7 @@ impl ToolSpec for AgentTool {
                 },
                 "fork_context": {
                     "type": "boolean",
-                    "description": "false (default): fresh child context. true: include the current parent context prefix when the child needs it."
+                    "description": "false (default): fresh child context. true: include the current parent context prefix when the child needs shared context or a byte-identical parent prefix for DeepSeek prefix-cache reuse."
                 },
                 "max_depth": {
                     "type": "integer",
@@ -3739,7 +3759,7 @@ impl ToolSpec for AgentTool {
                 return cancel_agent_from_input(&input, self.manager.clone(), context).await;
             }
         }
-        let snapshot =
+        let (snapshot, spawn_policy_note) =
             spawn_subagent_from_input(input, self.manager.clone(), self.runtime.clone()).await?;
         let worker_record = {
             let manager = self.manager.read().await;
@@ -3748,12 +3768,16 @@ impl ToolSpec for AgentTool {
         let projection = subagent_session_projection(snapshot, false, context, worker_record).await;
         let mut tool_result = ToolResult::json(&projection)
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        tool_result.metadata = Some(json!({
+        let mut metadata = json!({
             "status": projection.status,
             "terminal": projection.terminal,
             "context_mode": projection.context_mode,
             "prefix_cache": projection.prefix_cache,
-        }));
+        });
+        if let Some(note) = spawn_policy_note {
+            metadata["spawn_policy"] = json!(note);
+        }
+        tool_result.metadata = Some(metadata);
         Ok(tool_result)
     }
 }
@@ -3849,12 +3873,51 @@ async fn cancel_agent_from_input(
     Ok(tool_result)
 }
 
+/// Resolve the LLM client a freshly spawned in-process child should run on,
+/// honoring a fleet roster member's explicit provider pin (#4193).
+///
+/// - No member, a member pinning no provider (profile-less / `inherit`), or a
+///   member pinning the session's own provider: reuse the parent/session client
+///   unchanged. Preserves pre-#4193 behavior — no regression.
+/// - A member pinning a provider DIFFERENT from the session: build a fresh
+///   client for that provider (its base URL + credentials). This is the
+///   substantive fix; the `provider` metadata tag alone is inert while the
+///   client is shared, so without this the request still hits the session
+///   provider's endpoint with model B's id (#4093).
+///
+/// A pinned-but-unbuildable provider is a hard error — never a silent fallback
+/// to the session client (that silent fallback IS the #4093 misroute). The
+/// provider comes only from the explicit pin ([`explicit_fleet_provider`]),
+/// never inferred from the model id (EPIC #2608).
+fn child_client_for_member(
+    runtime: &SubAgentRuntime,
+    member: Option<&crate::fleet::profile::AgentProfile>,
+) -> Result<DeepSeekClient, ToolError> {
+    let session_provider = runtime.client.api_provider();
+    match crate::fleet::worker_runtime::explicit_fleet_provider(member) {
+        Some(pinned) if pinned != session_provider => {
+            runtime.client_for_provider(pinned).map_err(|err| {
+                ToolError::execution_failed(format!(
+                    "fleet profile pins provider '{}' but its client could not be built \
+                     ({err}). Configure that provider's credentials/base URL, or drop the \
+                     provider pin to inherit the session provider '{}'.",
+                    pinned.as_str(),
+                    session_provider.as_str()
+                ))
+            })
+        }
+        _ => Ok(runtime.client.clone()),
+    }
+}
+
 async fn spawn_subagent_from_input(
     input: Value,
     manager: SharedSubAgentManager,
     runtime: SubAgentRuntime,
-) -> Result<SubAgentResult, ToolError> {
-    let spawn_request = parse_spawn_request(&input)?;
+) -> Result<(SubAgentResult, Option<String>), ToolError> {
+    let mut spawn_request = parse_spawn_request(&input)?;
+    let spawn_policy_note = apply_session_spawn_policy(&runtime, &mut spawn_request);
+    let profile_member = apply_spawn_profile(&mut spawn_request, &runtime.fleet_roster)?;
 
     if runtime.would_exceed_depth() {
         return Err(ToolError::execution_failed(format!(
@@ -3881,68 +3944,93 @@ async fn spawn_subagent_from_input(
     let child_workspace = prepare_child_workspace(&runtime.context.workspace, &spawn_request)?;
 
     let mut child_runtime = runtime.background_runtime();
-    if let Some(max_depth) = spawn_request.max_depth {
-        child_runtime.max_spawn_depth =
-            clamp_child_max_spawn_depth(child_runtime.spawn_depth, max_depth);
-    }
+    // #4193 seam 3 (the substantive fix): if the resolved roster member's
+    // profile pins a provider different from the session's, rebind the child to
+    // a fresh client for that provider BEFORE any model normalization/routing.
+    // Every downstream model decision below derives its provider from
+    // `child_runtime.client.api_provider()`, so swapping the client here is what
+    // actually routes the request to provider B's endpoint with B's creds —
+    // rather than tagging `provider = B` on a client still pointed at A (#4093).
+    child_runtime.client = child_client_for_member(&runtime, profile_member.as_ref())?;
+    child_runtime.max_spawn_depth = child_max_spawn_depth_for_spawn(
+        child_runtime.max_spawn_depth,
+        child_runtime.spawn_depth,
+        spawn_request.max_depth,
+        profile_member
+            .as_ref()
+            .and_then(|member| member.profile.delegation.max_spawn_depth),
+    );
     if let Some(workspace) = child_workspace {
         child_runtime.context.workspace = workspace;
     }
+    // #4193 seam 2: normalize/validate the requested model against the CHILD's
+    // (pinned) provider, not the session provider. `child_runtime` carries the
+    // provider-B client set above, so a profile-less/`inherit` member still
+    // sees the session provider here (no regression).
     let configured_model = match spawn_request.model.clone() {
         Some(model) => Some(normalize_requested_subagent_model(
             &model,
             "model",
-            runtime.client.api_provider(),
+            child_runtime.client.api_provider(),
         )?),
         None => configured_model_for_role_or_type(
-            &runtime,
+            &child_runtime,
             spawn_request.assignment.role.as_deref(),
             &spawn_request.agent_type,
         )?,
     };
-    let (effective_prompt, _resident_conflict) =
-        if let Some(ref file_path) = spawn_request.resident_file {
-            let abs_path = if std::path::Path::new(file_path).is_absolute() {
-                std::path::PathBuf::from(file_path)
-            } else {
-                runtime.context.workspace.join(file_path)
-            };
-            let file_contents = std::fs::read_to_string(&abs_path)
-                .unwrap_or_else(|e| format!("<!-- resident_file read error: {e} -->"));
-            let prefixed = format!(
-                "<!-- resident_file: {file_path} -->\n```\n{file_contents}\n```\n\n{}",
-                spawn_request.prompt
-            );
-            let conflict = {
-                let leases = RESIDENT_LEASES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-                let mut guard = leases.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(owner) = guard.get(file_path) {
-                    Some(format!(
-                        "Warning: agent {owner} already holds a resident lease on {file_path}"
-                    ))
-                } else {
-                    guard.insert(file_path.clone(), "pending".to_string());
-                    None
-                }
-            };
-            (prefixed, conflict)
+    // Resolved before the prompt is moved out of the request below.
+    let requested_model_route = spawn_model_route(&spawn_request, profile_member.as_ref());
+    let (effective_prompt, _resident_conflict) = if let Some(ref file_path) =
+        spawn_request.resident_file
+    {
+        let abs_path = if std::path::Path::new(file_path).is_absolute() {
+            std::path::PathBuf::from(file_path)
         } else {
-            (spawn_request.prompt, None)
+            runtime.context.workspace.join(file_path)
         };
+        let file_contents = std::fs::read_to_string(&abs_path)
+            .unwrap_or_else(|e| format!("<!-- resident_file read error: {e} -->"));
+        let prefixed = format!(
+            "<!-- resident_file: {file_path} -->\n```\n{file_contents}\n```\n\n{}",
+            spawn_request.prompt
+        );
+        let conflict = {
+            let leases = RESIDENT_LEASES.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+            let mut guard = leases.lock();
+            if let Some(owner) = guard.get(file_path) {
+                Some(format!(
+                    "Warning: agent {owner} already holds a resident lease on {file_path}"
+                ))
+            } else {
+                guard.insert(file_path.clone(), "pending".to_string());
+                None
+            }
+        };
+        (prefixed, conflict)
+    } else {
+        (spawn_request.prompt, None)
+    };
 
+    // #4193 seam 2 (cont.): strength/inherit/faster routing and the final
+    // provider-namespace guard both read the provider from the runtime's client,
+    // so route them through `child_runtime` (pinned provider) instead of the
+    // session `runtime`. Router candidates, reasoning-effort defaults, and the
+    // fixed-model validation then all resolve against provider B.
     let route = resolve_subagent_assignment_route(
-        &runtime,
+        &child_runtime,
         configured_model,
         &effective_prompt,
         &spawn_request.agent_type,
-        spawn_request.model_strength.model_route(),
+        requested_model_route,
         spawn_request.thinking,
     )
     .await;
-    child_runtime.model = route.model.clone();
+    let effective_model =
+        ensure_subagent_model_for_provider(&child_runtime, &route.model_route, route.model)?;
+    child_runtime.model = effective_model.clone();
     child_runtime.reasoning_effort = route.reasoning_effort.clone();
     child_runtime.reasoning_effort_auto = false;
-    let effective_model = route.model;
     let model_route = route.model_route;
 
     let mut manager_guard = manager.write().await;
@@ -3968,14 +4056,91 @@ async fn spawn_subagent_from_input(
 
     if let Some(ref file_path) = spawn_request.resident_file
         && let Some(lock) = RESIDENT_LEASES.get()
-        && let Ok(mut guard) = lock.lock()
-        && let Some(owner) = guard.get_mut(file_path)
-        && owner == "pending"
     {
-        *owner = result.agent_id.clone();
+        let mut guard = lock.lock();
+        if let Some(owner) = guard.get_mut(file_path)
+            && owner == "pending"
+        {
+            *owner = result.agent_id.clone();
+        }
     }
 
-    Ok(result)
+    Ok((result, spawn_policy_note))
+}
+
+/// Mode-aware spawn defaults for the root orchestrator (Wave 7 M4/M5).
+fn apply_session_spawn_policy(
+    runtime: &SubAgentRuntime,
+    request: &mut SpawnRequest,
+) -> Option<String> {
+    if runtime.spawn_depth > 0 {
+        return None;
+    }
+    match runtime.parent_mode {
+        AppMode::Multitask => {
+            // Background-friendly fan-out: when the operator did not specify
+            // strength or an exact model, prefer the faster sibling for parallel
+            // lookup/review children.
+            if !request.model_strength_explicit
+                && request.model.is_none()
+                && request.agent_type != SubAgentType::Explore
+            {
+                request.model_strength = SubAgentModelStrength::Faster;
+            }
+            None
+        }
+        AppMode::Operate => {
+            if request.profile.is_some() || request.agent_type_explicit {
+                return None;
+            }
+            Some(
+                "Operate spawn policy: pass profile=scout|builder|reviewer|verifier or use workflow for multi-step work; the operator orchestrates, workers execute."
+                    .to_string(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Spawn one Workflow `task(...)` through the same path as the public `agent`
+/// tool. Keeping this adapter inside the sub-agent module prevents the
+/// Workflow driver from copying Fleet roster/profile/depth/budget semantics.
+pub(crate) async fn spawn_workflow_task(
+    request: codewhale_workflow_js::TaskRequest,
+    manager: SharedSubAgentManager,
+    runtime: SubAgentRuntime,
+) -> Result<SubAgentResult, ToolError> {
+    let mut input = json!({
+        "prompt": request.description,
+        "worktree": request.worktree,
+    });
+    if let Some(value) = request.subagent_type {
+        input["type"] = json!(value);
+    }
+    if let Some(value) = request.profile {
+        input["profile"] = json!(value);
+    }
+    if let Some(value) = request.model {
+        input["model"] = json!(value);
+    }
+    if let Some(value) = request.model_strength {
+        input["model_strength"] = json!(value);
+    }
+    if let Some(value) = request.thinking {
+        input["thinking"] = json!(value);
+    }
+    if let Some(value) = request.allowed_tools {
+        input["allowed_tools"] = json!(value);
+    }
+    if let Some(value) = request.max_depth {
+        input["max_depth"] = json!(value);
+    }
+    if let Some(value) = request.token_budget {
+        input["token_budget"] = json!(value);
+    }
+    spawn_subagent_from_input(input, manager, runtime)
+        .await
+        .map(|(result, _)| result)
 }
 
 // === Sub-agent Execution ===
@@ -4151,7 +4316,12 @@ async fn run_subagent_task(task: SubAgentTask) {
             // parent model can branch on `summary_kind`.
             let raw = summarize_subagent_result(res);
             let (summary, truncated) = stamp_subagent_summary(&raw);
-            let sentinel = subagent_done_sentinel(&task.agent_id, res, truncated);
+            let sentinel = match &res.status {
+                SubAgentStatus::Failed(_) | SubAgentStatus::BudgetExhausted => {
+                    subagent_failed_sentinel(&task.agent_id, &raw)
+                }
+                _ => subagent_done_sentinel(&task.agent_id, res, truncated),
+            };
             (summary, sentinel)
         }
         Err(err) => {
@@ -4159,7 +4329,12 @@ async fn run_subagent_task(task: SubAgentTask) {
                 "sub-agent {} model request failed: {err:#}",
                 task.agent_id
             ));
-            let annotated = annotate_child_model_error(&subagent_failure_message(err), &model_id);
+            let annotated = annotate_child_model_error(
+                &subagent_failure_message(err),
+                &model_id,
+                task.runtime.client.api_provider(),
+                &task.runtime.worker_profile.model,
+            );
             (
                 format!("Failed: {annotated}"),
                 subagent_failed_sentinel(&task.agent_id, &annotated),
@@ -4169,13 +4344,26 @@ async fn run_subagent_task(task: SubAgentTask) {
 
     if let Some(mb) = task.runtime.mailbox.as_ref() {
         let envelope = match &result {
-            Ok(_) => MailboxMessage::Completed {
-                agent_id: task.agent_id.clone(),
-                summary: summary.clone(),
+            Ok(res) => match &res.status {
+                SubAgentStatus::Failed(_) | SubAgentStatus::BudgetExhausted => {
+                    MailboxMessage::Failed {
+                        agent_id: task.agent_id.clone(),
+                        error: summary.clone(),
+                    }
+                }
+                _ => MailboxMessage::Completed {
+                    agent_id: task.agent_id.clone(),
+                    summary: summary.clone(),
+                },
             },
             Err(err) => MailboxMessage::Failed {
                 agent_id: task.agent_id.clone(),
-                error: annotate_child_model_error(&subagent_failure_message(err), &model_id),
+                error: annotate_child_model_error(
+                    &subagent_failure_message(err),
+                    &model_id,
+                    task.runtime.client.api_provider(),
+                    &task.runtime.worker_profile.model,
+                ),
             },
         };
         let _ = mb.send(envelope);
@@ -4197,7 +4385,12 @@ async fn run_subagent_task(task: SubAgentTask) {
         Err(err) => {
             manager.update_failed(
                 &agent_id,
-                annotate_child_model_error(&subagent_failure_message(err), &model_id),
+                annotate_child_model_error(
+                    &subagent_failure_message(err),
+                    &model_id,
+                    task.runtime.client.api_provider(),
+                    &task.runtime.worker_profile.model,
+                ),
             );
         }
     }
@@ -4285,15 +4478,99 @@ pub(crate) fn emit_parent_completion(
 
 pub(crate) fn subagent_completion_from_result(result: &SubAgentResult) -> SubAgentCompletion {
     let raw = summarize_subagent_result(result);
-    let (summary, truncated) = stamp_subagent_summary(&raw);
+    let mut evidence_truncated = false;
+    let evidence_block = match &result.status {
+        SubAgentStatus::Failed(_)
+        | SubAgentStatus::BudgetExhausted
+        | SubAgentStatus::Cancelled
+        | SubAgentStatus::Interrupted(_) => None,
+        _ => result
+            .result
+            .as_deref()
+            .and_then(extract_evidence_block)
+            .map(|block| {
+                let (clipped, ev_trunc) = clip_evidence_block(&block);
+                evidence_truncated = ev_trunc;
+                clipped
+            })
+            .filter(|evidence| !evidence.trim().is_empty()),
+    };
+    let summary_source = evidence_block
+        .as_ref()
+        .map(|_| strip_evidence_block(&raw))
+        .unwrap_or(raw);
+    let (summary, truncated) = stamp_subagent_summary(&summary_source);
+    let summary_truncated = truncated || evidence_truncated;
     let sentinel = match &result.status {
         SubAgentStatus::Failed(error) => subagent_failed_sentinel(&result.agent_id, error),
-        _ => subagent_done_sentinel(&result.agent_id, result, truncated),
+        _ => subagent_done_sentinel(&result.agent_id, result, summary_truncated),
+    };
+    let payload = match evidence_block {
+        Some(evidence) => format!("{summary}\n{evidence}\n{sentinel}"),
+        None => format!("{summary}\n{sentinel}"),
     };
     SubAgentCompletion {
         agent_id: result.agent_id.clone(),
-        payload: format!("{summary}\n{sentinel}"),
+        payload,
     }
+}
+
+const SUBAGENT_EVIDENCE_CHAR_BUDGET: usize = 4_000;
+
+fn clip_evidence_block(block: &str) -> (String, bool) {
+    let total = block.chars().count();
+    if total <= SUBAGENT_EVIDENCE_CHAR_BUDGET {
+        return (block.to_string(), false);
+    }
+    let clipped: String = block.chars().take(SUBAGENT_EVIDENCE_CHAR_BUDGET).collect();
+    (format!("{clipped}…"), true)
+}
+
+fn extract_evidence_block(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let markers = ["### evidence", "## evidence", "evidence:"];
+    for marker in markers {
+        let Some(start) = lower.find(marker) else {
+            continue;
+        };
+        let block = &text[start..];
+        let tail = &block[marker.len()..];
+        let end = tail
+            .find("\n### ")
+            .or_else(|| tail.find("\n## "))
+            .or_else(|| tail.to_ascii_lowercase().find("\ngaps"))
+            .or_else(|| tail.to_ascii_lowercase().find("\nnext"))
+            .unwrap_or(tail.len());
+        let extracted = format!("{}{}", &block[..marker.len()], &tail[..end])
+            .trim()
+            .to_string();
+        if !extracted.is_empty() {
+            return Some(extracted);
+        }
+    }
+    None
+}
+
+fn strip_evidence_block(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let markers = ["### evidence", "## evidence", "evidence:"];
+    for marker in markers {
+        let Some(start) = lower.find(marker) else {
+            continue;
+        };
+        let block = &text[start..];
+        let tail = &block[marker.len()..];
+        let end = tail
+            .find("\n### ")
+            .or_else(|| tail.find("\n## "))
+            .or_else(|| tail.to_ascii_lowercase().find("\ngaps"))
+            .or_else(|| tail.to_ascii_lowercase().find("\nnext"))
+            .unwrap_or(tail.len());
+        let mut without = format!("{}{}", &text[..start], &block[marker.len() + end..]);
+        without = without.trim().to_string();
+        return without;
+    }
+    text.trim().to_string()
 }
 
 /// Build a `<codewhale:subagent.done>` JSON sentinel for a successful child.
@@ -4577,6 +4854,37 @@ fn subagent_transient_provider_retry_delay(retry_number: u32) -> Duration {
     SUBAGENT_TRANSIENT_PROVIDER_INITIAL_BACKOFF.saturating_mul(multiplier.min(4))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RetryableSubAgentProviderFailure {
+    label: &'static str,
+    checkpoint_reason: &'static str,
+    delay: Duration,
+}
+
+fn retryable_subagent_provider_failure(
+    error: &anyhow::Error,
+    retry_number: u32,
+) -> Option<RetryableSubAgentProviderFailure> {
+    if let Some(LlmError::RateLimited { retry_after, .. }) = error.downcast_ref::<LlmError>() {
+        return Some(RetryableSubAgentProviderFailure {
+            label: "rate-limited provider response",
+            checkpoint_reason: "api_rate_limited",
+            delay: retry_after
+                .unwrap_or_else(|| subagent_transient_provider_retry_delay(retry_number)),
+        });
+    }
+
+    if is_transient_subagent_provider_error(error) {
+        return Some(RetryableSubAgentProviderFailure {
+            label: "transient provider failure",
+            checkpoint_reason: "api_transient_provider_failure",
+            delay: subagent_transient_provider_retry_delay(retry_number),
+        });
+    }
+
+    None
+}
+
 fn is_transient_subagent_provider_error(error: &anyhow::Error) -> bool {
     if let Some(LlmError::RateLimited { .. }) = error.downcast_ref::<LlmError>() {
         return true;
@@ -4627,25 +4935,33 @@ async fn request_subagent_model_response_with_retries(
         .await
         {
             Ok(Ok(response)) => return Ok(response),
-            Ok(Err(err)) if is_transient_subagent_provider_error(&err) => {
+            Ok(Err(err)) => {
+                let retry_number = transient_failures.saturating_add(1);
+                let Some(retryable) = retryable_subagent_provider_failure(&err, retry_number)
+                else {
+                    return Err(SubAgentApiRequestFailure::Fatal(err));
+                };
+
                 if transient_failures >= SUBAGENT_TRANSIENT_PROVIDER_MAX_RETRIES {
                     let attempts = transient_failures.saturating_add(1);
                     return Err(SubAgentApiRequestFailure::Interrupted {
                         reason: format!(
-                            "Transient provider failure after {attempts} API attempt(s): {err}; checkpoint preserved for continuation"
+                            "{} after {attempts} API attempt(s): {err}; checkpoint preserved for continuation",
+                            retryable.label
                         ),
-                        checkpoint_reason: "api_transient_provider_failure",
+                        checkpoint_reason: retryable.checkpoint_reason,
                     });
                 }
 
                 transient_failures = transient_failures.saturating_add(1);
-                let delay = subagent_transient_provider_retry_delay(transient_failures);
+                let delay = retryable.delay;
                 record_agent_progress(
                     runtime,
                     agent_id,
                     format!(
-                        "{}: transient provider failure; retrying API request {}/{} in {}ms ({err})",
+                        "{}: {}; retrying API request {}/{} in {}ms ({err})",
                         format_step_counter(steps, max_steps),
+                        retryable.label,
                         transient_failures,
                         SUBAGENT_TRANSIENT_PROVIDER_MAX_RETRIES,
                         delay.as_millis(),
@@ -4653,7 +4969,6 @@ async fn request_subagent_model_response_with_retries(
                 );
                 tokio::time::sleep(delay).await;
             }
-            Ok(Err(err)) => return Err(SubAgentApiRequestFailure::Fatal(err)),
             Err(_) => {
                 return Err(SubAgentApiRequestFailure::Interrupted {
                     reason: format!(
@@ -4808,6 +5123,12 @@ async fn run_subagent(
     let mut consecutive_truncated_responses = 0;
     let mut latest_checkpoint: Option<SubAgentCheckpoint> = None;
     let mut tokens_used: u64 = 0;
+    // #4050: distinguish a real "the model chose to stop" exit (the `break`
+    // below) from loop exhaustion (running out of `max_steps` while still
+    // tool-calling). Only the former, with a non-empty final summary, is a
+    // genuine success; everything else must surface its stop reason instead of
+    // reporting a completed child with no payload.
+    let mut stopped_naturally = false;
 
     for _step in 0..max_steps {
         // Cooperative cancellation: bail if this session's token was cancelled
@@ -5090,77 +5411,76 @@ async fn run_subagent(
         // (both derive from `response.usage`), so the scope accounting stays
         // consistent and is never inflated by this check.
         tokens_used = tokens_used.saturating_add(usage_total_tokens(&response.usage));
-        if let Some(budget) = token_budget {
-            if tokens_used > budget {
-                record_agent_progress(
-                    runtime,
-                    &agent_id,
-                    format!(
-                        "{}: token budget exhausted ({tokens_used}/{budget})",
-                        format_step_counter(steps, max_steps)
-                    ),
-                );
-                if let Some(mb) = runtime.mailbox.as_ref() {
-                    let _ = mb.send(MailboxMessage::Cancelled {
-                        agent_id: agent_id.clone(),
-                    });
-                }
-                let status = SubAgentStatus::BudgetExhausted;
-                let duration_ms =
-                    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                latest_checkpoint = Some(
-                    checkpoint_subagent_progress(
-                        runtime,
-                        &agent_id,
-                        "token_budget_exhausted",
-                        &messages,
-                        steps,
-                        true,
-                    )
-                    .await,
-                );
-                insert_subagent_full_transcript_handle(
-                    runtime,
-                    &agent_id,
-                    &agent_type,
-                    &assignment,
-                    &status,
-                    final_result.as_ref(),
-                    latest_checkpoint.as_ref(),
-                    &messages,
-                    steps,
-                    duration_ms,
-                    fork_context_enabled,
-                )
-                .await;
-                return Ok(SubAgentResult {
-                    name: agent_id.clone(),
+        if let Some(budget) = token_budget
+            && tokens_used > budget
+        {
+            record_agent_progress(
+                runtime,
+                &agent_id,
+                format!(
+                    "{}: token budget exhausted ({tokens_used}/{budget})",
+                    format_step_counter(steps, max_steps)
+                ),
+            );
+            if let Some(mb) = runtime.mailbox.as_ref() {
+                let _ = mb.send(MailboxMessage::Cancelled {
                     agent_id: agent_id.clone(),
-                    context_mode: if fork_context_enabled {
-                        "forked"
-                    } else {
-                        "fresh"
-                    }
-                    .to_string(),
-                    fork_context: fork_context_enabled,
-                    workspace: Some(runtime.context.workspace.clone()),
-                    git_branch: current_git_branch(&runtime.context.workspace),
-                    agent_type: agent_type.clone(),
-                    assignment: assignment.clone(),
-                    model: runtime.model.clone(),
-                    nickname: None,
-                    status,
-                    worker_status: None,
-                    parent_run_id: runtime.parent_agent_id.clone(),
-                    spawn_depth: runtime.spawn_depth,
-                    result: final_result.clone(),
-                    steps_taken: steps,
-                    checkpoint: latest_checkpoint.clone(),
-                    needs_input: None,
-                    duration_ms,
-                    from_prior_session: false,
                 });
             }
+            let status = SubAgentStatus::BudgetExhausted;
+            let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            latest_checkpoint = Some(
+                checkpoint_subagent_progress(
+                    runtime,
+                    &agent_id,
+                    "token_budget_exhausted",
+                    &messages,
+                    steps,
+                    true,
+                )
+                .await,
+            );
+            insert_subagent_full_transcript_handle(
+                runtime,
+                &agent_id,
+                &agent_type,
+                &assignment,
+                &status,
+                final_result.as_ref(),
+                latest_checkpoint.as_ref(),
+                &messages,
+                steps,
+                duration_ms,
+                fork_context_enabled,
+            )
+            .await;
+            return Ok(SubAgentResult {
+                name: agent_id.clone(),
+                agent_id: agent_id.clone(),
+                context_mode: if fork_context_enabled {
+                    "forked"
+                } else {
+                    "fresh"
+                }
+                .to_string(),
+                fork_context: fork_context_enabled,
+                workspace: Some(runtime.context.workspace.clone()),
+                git_branch: current_git_branch(&runtime.context.workspace),
+                agent_type: agent_type.clone(),
+                assignment: assignment.clone(),
+                model: runtime.model.clone(),
+                nickname: None,
+                status,
+                worker_status: None,
+                parent_run_id: runtime.parent_agent_id.clone(),
+                spawn_depth: runtime.spawn_depth,
+                result: final_result.clone(),
+                steps_taken: steps,
+                checkpoint: latest_checkpoint.clone(),
+                needs_input: None,
+                duration_ms,
+                from_prior_session: false,
+            });
         }
 
         for block in &response.content {
@@ -5270,6 +5590,7 @@ async fn run_subagent(
                     &agent_id,
                     format!("{}: complete", format_step_counter(steps, max_steps)),
                 );
+                stopped_naturally = true;
                 break;
             }
             continue;
@@ -5371,11 +5692,28 @@ async fn run_subagent(
     }
 
     release_resident_leases_for(&agent_id);
-    let status = SubAgentStatus::Completed;
+    let has_final_summary = final_result
+        .as_deref()
+        .map(|text| !text.trim().is_empty())
+        .unwrap_or(false);
+    // #4050: only a natural stop with a final summary is a real success.
+    let status = if stopped_naturally {
+        if has_final_summary {
+            SubAgentStatus::Completed
+        } else {
+            SubAgentStatus::Failed(
+                "child stopped without returning a final summary (its last turn produced no assistant text)".to_string(),
+            )
+        }
+    } else {
+        SubAgentStatus::Failed(format!(
+            "child reached its step limit ({steps} steps) without returning a final summary"
+        ))
+    };
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     latest_checkpoint = Some(build_subagent_checkpoint(
         &agent_id,
-        "completed",
+        subagent_status_name(&status),
         &messages,
         steps,
         false,
@@ -5582,6 +5920,7 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         ));
     }
 
+    let agent_type_explicit = parsed_type.is_some() || parsed_role_type.is_some();
     let agent_type = parsed_type
         .or(parsed_role_type)
         .unwrap_or(SubAgentType::General);
@@ -5598,6 +5937,10 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         .and_then(normalize_role_alias)
         .or_else(|| type_input.and_then(normalize_role_alias))
         .map(str::to_string);
+
+    let profile = optional_input_str(input, &["profile", "fleet_profile", "roster_profile"])
+        .map(validate_profile_name)
+        .transpose()?;
 
     let allowed_tools = input
         .get("allowed_tools")
@@ -5617,29 +5960,25 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
 
     let cwd = parse_optional_cwd(input)?;
     let worktree = parse_optional_worktree_request(input)?;
-    if cwd.is_some() && worktree.is_some() {
-        return Err(ToolError::invalid_input(
-            "Use either cwd or worktree isolation, not both".to_string(),
-        ));
-    }
     let model = parse_optional_subagent_model(input, "model")?;
-    let model_strength = optional_input_str(input, &["model_strength", "modelStrength"])
+    let explicit_model_strength = optional_input_str(input, &["model_strength", "modelStrength"])
         .map(SubAgentModelStrength::parse)
-        .transpose()?
-        .unwrap_or_else(|| {
-            // Default model strength. `type: "explore"` defaults to Faster for
-            // bounded read-only lookup/search/status work — the cheap, fast
-            // same-family sibling is exactly the lossy-breadth job a child
-            // should run. Every other role (and any call that supplies an
-            // explicit `model`) stays conservative at Same. Explicit
-            // model_strength above already wins via .parse(); explicit `model`
-            // wins downstream in assignment_model_route regardless of strength.
-            if agent_type == SubAgentType::Explore && model.is_none() {
-                SubAgentModelStrength::Faster
-            } else {
-                SubAgentModelStrength::Same
-            }
-        });
+        .transpose()?;
+    let model_strength_explicit = explicit_model_strength.is_some();
+    let model_strength = explicit_model_strength.unwrap_or_else(|| {
+        // Default model strength. `type: "explore"` defaults to Faster for
+        // bounded read-only lookup/search/status work — the cheap, fast
+        // same-family sibling is exactly the lossy-breadth job a child
+        // should run. Every other role (and any call that supplies an
+        // explicit `model`) stays conservative at Same. Explicit
+        // model_strength above already wins via .parse(); explicit `model`
+        // wins downstream in assignment_model_route regardless of strength.
+        if agent_type == SubAgentType::Explore && model.is_none() {
+            SubAgentModelStrength::Faster
+        } else {
+            SubAgentModelStrength::Same
+        }
+    });
     let thinking = optional_input_str(input, &["thinking", "reasoning_effort", "reasoningEffort"])
         .map(SubAgentThinking::parse)
         .transpose()?
@@ -5681,10 +6020,13 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         session_name,
         prompt: prompt.clone(),
         agent_type,
+        agent_type_explicit,
+        profile,
         assignment: SubAgentAssignment::new(prompt, role),
         allowed_tools,
         model,
         model_strength,
+        model_strength_explicit,
         thinking,
         cwd,
         worktree,
@@ -5714,6 +6056,167 @@ fn validate_session_name(name: &str) -> Result<String, ToolError> {
         ));
     }
     Ok(trimmed.to_string())
+}
+
+/// Validate and normalize the `profile` spawn parameter: a bare roster member
+/// id token (same rule as fleet model/profile tokens — visible, no
+/// whitespace, quotes, backticks, or '='), lowercased for the roster's
+/// case-insensitive lookup.
+fn validate_profile_name(value: &str) -> Result<String, ToolError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ToolError::invalid_input("profile cannot be blank"));
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_graphic() && !matches!(ch, '"' | '\'' | '`' | '='))
+    {
+        return Err(ToolError::invalid_input(
+            "profile must be a bare roster member id without whitespace, quotes, backticks, or '='",
+        ));
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+/// Resolve the `profile` spawn parameter against the fleet roster and fold
+/// the member into the request: agent type (when not explicitly given),
+/// assignment role, and the profile instruction overlay on the child prompt.
+///
+/// Runs at spawn time — `parse_spawn_request` has no runtime access. Returns
+/// the resolved member so the spawn path can apply its model routing and
+/// delegation bounds. The member's `permissions` block is intentionally NOT
+/// consumed here: it defaults to the floor (no shell, no trust, approvals on)
+/// and the child's capability posture is governed by the member's
+/// `SubAgentType` via `WorkerRuntimeProfile::for_role` — applying the block
+/// here could only widen that posture.
+fn apply_spawn_profile(
+    request: &mut SpawnRequest,
+    roster: &crate::fleet::roster::FleetRoster,
+) -> Result<Option<crate::fleet::profile::AgentProfile>, ToolError> {
+    let Some(profile_id) = request.profile.as_deref() else {
+        return Ok(None);
+    };
+    let Some(member) = roster.get(profile_id) else {
+        let available = roster
+            .members()
+            .iter()
+            .map(|member| member.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ToolError::invalid_input(format!(
+            "Unknown profile '{profile_id}'. Available fleet roster members: {available}. See /fleet."
+        )));
+    };
+
+    let member_type = crate::fleet::worker_runtime::roster_member_agent_type(member);
+    if request.agent_type_explicit && request.agent_type != member_type {
+        return Err(ToolError::invalid_input(format!(
+            "profile '{}' implies type {}; conflicting explicit type '{}'",
+            member.id,
+            member_type.as_str(),
+            request.agent_type.as_str()
+        )));
+    }
+    request.agent_type = member_type;
+
+    // Surface the member's role in prompts and ledger records.
+    let role_name = member.profile.role.name.trim();
+    request.assignment.role = Some(if role_name.is_empty() {
+        member.id.clone()
+    } else {
+        role_name.to_string()
+    });
+
+    if let Some(overlay) = spawn_profile_prompt_overlay(member) {
+        request.prompt.push_str(&overlay);
+    }
+
+    Ok(Some(member.clone()))
+}
+
+/// Compact profile block appended to the child prompt, mirroring the fleet
+/// dispatcher's `fleet_task_prompt_with_profile` overlay. `None` when the
+/// member carries no description or instructions (built-ins: posture alone
+/// speaks through the type system prompt).
+fn spawn_profile_prompt_overlay(member: &crate::fleet::profile::AgentProfile) -> Option<String> {
+    let description = member.description.as_deref().map(str::trim);
+    let instructions = member.profile.role.instructions.as_deref().map(str::trim);
+    if description.is_none_or(str::is_empty) && instructions.is_none_or(str::is_empty) {
+        return None;
+    }
+    let mut overlay = String::new();
+    overlay.push_str("\n\nFleet profile: ");
+    overlay.push_str(&member.id);
+    if let Some(display_name) = member.display_name.as_deref() {
+        overlay.push_str(" (");
+        overlay.push_str(display_name);
+        overlay.push(')');
+    }
+    if let Some(description) = description.filter(|text| !text.is_empty()) {
+        overlay.push_str("\nProfile description:\n");
+        overlay.push_str(description);
+    }
+    if let Some(instructions) = instructions.filter(|text| !text.is_empty()) {
+        overlay.push_str("\nProfile instructions:\n");
+        overlay.push_str(instructions);
+    }
+    Some(overlay)
+}
+
+/// Requested model route for a spawn, honoring fleet profile precedence:
+/// explicit `model` param > explicit `model_strength` param > member model
+/// pin (Fixed) > member loadout > parse-time default. An explicit `model`
+/// still wins downstream via the configured-model path (which turns it into
+/// a Fixed route), as does a `role_models` override where one matches today.
+fn spawn_model_route(
+    request: &SpawnRequest,
+    member: Option<&crate::fleet::profile::AgentProfile>,
+) -> ModelRoute {
+    let Some(member) = member else {
+        return request.model_strength.model_route();
+    };
+    if request.model.is_some() || request.model_strength_explicit {
+        return request.model_strength.model_route();
+    }
+    if let Some(model) = member
+        .profile
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("auto"))
+    {
+        return ModelRoute::Fixed(model.to_string());
+    }
+    match member.profile.loadout {
+        codewhale_config::FleetLoadout::Fast => ModelRoute::Faster,
+        // Inherit and the richer loadout classes (strong/balanced/...) all
+        // inherit the parent model here. The fleet dispatcher maps those
+        // classes to Auto, but in this seam Auto routes to the cheap sibling —
+        // a silent downgrade for e.g. a "strong" member. Inheriting keeps the
+        // existing non-profile default behavior.
+        _ => ModelRoute::Inherit,
+    }
+}
+
+/// Effective absolute `max_spawn_depth` for a child, combining the inherited
+/// runtime budget, the caller's `max_depth` request, and a fleet profile's
+/// `delegation.max_spawn_depth` hint. An explicit request keeps its existing
+/// semantics (may widen up to the ceiling); a profile hint only narrows —
+/// either the request (min) or the inherited budget.
+fn child_max_spawn_depth_for_spawn(
+    inherited: u32,
+    child_spawn_depth: u32,
+    requested: Option<u32>,
+    profile_hint: Option<u32>,
+) -> u32 {
+    match (requested, profile_hint) {
+        (Some(requested), hint) => {
+            let depth = hint.map_or(requested, |hint| requested.min(hint));
+            clamp_child_max_spawn_depth(child_spawn_depth, depth)
+        }
+        (None, Some(hint)) => inherited.min(clamp_child_max_spawn_depth(child_spawn_depth, hint)),
+        (None, None) => inherited,
+    }
 }
 
 fn parse_optional_bool(input: &Value, names: &[&str]) -> Option<bool> {
@@ -5769,28 +6272,29 @@ pub(crate) fn normalize_requested_subagent_model(
     // #3018: Use provider-aware validation so non-DeepSeek providers can
     // accept their own model IDs instead of failing with "Expected a
     // DeepSeek model id".
-    crate::config::requested_model_for_provider(provider, trimmed).ok_or_else(|| {
-        let valid_names = crate::config::model_completion_names_for_provider(provider);
-        let valid_hint = if valid_names.is_empty() {
-            String::new()
-        } else {
-            format!(" (accepted: {})", valid_names.join(", "))
-        };
-        ToolError::invalid_input(format!(
-            "Invalid {field} '{trimmed}' for provider {}{valid_hint}",
-            provider_name_for_error(provider)
-        ))
-    })
+    let normalized =
+        crate::config::requested_model_for_provider(provider, trimmed).ok_or_else(|| {
+            let valid_names = crate::provider_lake::all_catalog_models_for_provider(provider);
+            let valid_hint = if valid_names.is_empty() {
+                String::new()
+            } else {
+                format!(" (accepted: {})", valid_names.join(", "))
+            };
+            ToolError::invalid_input(format!(
+                "Invalid {field} '{trimmed}' for provider {}{valid_hint}",
+                provider_name_for_error(provider)
+            ))
+        })?;
+    crate::config::validate_route(provider, &normalized).map_err(ToolError::invalid_input)?;
+    Ok(normalized)
 }
 
 fn provider_name_for_error(provider: crate::config::ApiProvider) -> &'static str {
-    match provider {
-        crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN => "DeepSeek",
-        crate::config::ApiProvider::Openai | crate::config::ApiProvider::OpenaiCodex => "OpenAI",
-        crate::config::ApiProvider::Moonshot => "Moonshot",
-        crate::config::ApiProvider::Ollama => "Ollama",
-        _ => "this provider",
-    }
+    // Reuse the canonical picker/status label so every provider is named
+    // concretely (DeepSeek, Sakana, Zhipu, …) instead of collapsing the long
+    // tail to "this provider", and so error copy stays in sync with the model
+    // picker labels (#4049).
+    provider.display_name()
 }
 
 pub(crate) fn configured_model_for_role_or_type(
@@ -5903,6 +6407,51 @@ fn fallback_subagent_assignment_route(
         prompt,
         &SubAgentType::General,
     )
+}
+
+/// Operator-visible model for the active provider when inherit/faster routing
+/// must not cross namespaces (#3227, subagent route validation 2026-07-07).
+///
+/// Enumerates through the catalog-backed [`crate::provider_lake`] facade rather
+/// than the raw legacy `model_completion_names_for_provider` table (#4116). The
+/// facade returns bundled+live catalog rows for the provider and, for providers
+/// with no catalog coverage, falls back to that same legacy table internally.
+/// This consumer only reads the first entry, and it already preferred the
+/// catalog facade before the migration — the removed raw-legacy tail only ran
+/// when the facade was empty, which never happens while the legacy table is
+/// non-empty. Dropping it is therefore behavior-preserving and never narrows
+/// the operator model chosen here.
+fn operator_model_for_subagent(runtime: &SubAgentRuntime) -> String {
+    let provider = runtime.client.api_provider();
+    if crate::config::validate_route(provider, &runtime.model).is_ok() {
+        return runtime.model.clone();
+    }
+    crate::provider_lake::all_catalog_models_for_provider(provider)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| runtime.model.clone())
+}
+
+/// Reject or remap a resolved sub-agent model so it matches the runtime
+/// provider before spawn. Explicit fixed pins fail fast; inherit/faster/auto
+/// fall back to the operator route instead of cross-wiring namespaces.
+pub(crate) fn ensure_subagent_model_for_provider(
+    runtime: &SubAgentRuntime,
+    model_route: &ModelRoute,
+    model: String,
+) -> Result<String, ToolError> {
+    let provider = runtime.client.api_provider();
+    if crate::config::validate_route(provider, &model).is_ok() {
+        return Ok(model);
+    }
+    match model_route {
+        ModelRoute::Inherit | ModelRoute::Faster | ModelRoute::Auto => {
+            Ok(operator_model_for_subagent(runtime))
+        }
+        ModelRoute::Fixed(_) => Err(ToolError::invalid_input(
+            crate::config::validate_route(provider, &model).unwrap_err(),
+        )),
+    }
 }
 
 fn worker_profile_subagent_assignment_route(
@@ -6090,18 +6639,28 @@ fn prepare_child_workspace(
     parent_workspace: &Path,
     request: &SpawnRequest,
 ) -> Result<Option<PathBuf>, ToolError> {
-    if let Some(requested_cwd) = request.cwd.as_ref() {
-        return validate_existing_child_cwd(parent_workspace, requested_cwd).map(Some);
-    }
+    let discovery_anchor = if let Some(requested_cwd) = request.cwd.as_ref() {
+        validate_existing_child_cwd(parent_workspace, requested_cwd)?
+    } else {
+        parent_workspace
+            .canonicalize()
+            .unwrap_or_else(|_| parent_workspace.to_path_buf())
+    };
+
     if let Some(worktree) = request.worktree.as_ref() {
         return create_isolated_worktree(
-            parent_workspace,
+            &discovery_anchor,
             worktree,
             request.session_name.as_deref(),
             &request.agent_type,
         )
         .map(Some);
     }
+
+    if request.cwd.is_some() {
+        return Ok(Some(discovery_anchor));
+    }
+
     Ok(None)
 }
 
@@ -6182,18 +6741,85 @@ fn create_isolated_worktree(
 }
 
 fn git_repo_root(workspace: &Path) -> Result<PathBuf, ToolError> {
-    let output = run_git_checked(
-        workspace,
-        &["rev-parse".to_string(), "--show-toplevel".to_string()],
-        "resolve git repository root",
-    )?;
-    let root = output.trim();
-    if root.is_empty() {
-        return Err(ToolError::invalid_input(
-            "worktree=true requires a git repository workspace".to_string(),
-        ));
+    const MAX_PARENT_LEVELS: usize = 4;
+    let start = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let mut paths_tried = Vec::new();
+    let mut current = Some(start.as_path());
+    let mut levels = 0usize;
+
+    while let Some(dir) = current {
+        paths_tried.push(dir.display().to_string());
+
+        if let Some(root) = try_git_toplevel(dir) {
+            return Ok(root);
+        }
+
+        if let Ok(entries) = fs::read_dir(dir) {
+            let mut nested_roots = Vec::new();
+            for entry in entries.flatten() {
+                let child = entry.path();
+                if !child.is_dir() || !path_looks_like_git_checkout(&child) {
+                    continue;
+                }
+                if child
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('.'))
+                {
+                    continue;
+                }
+                if let Some(root) = try_git_toplevel(&child) {
+                    nested_roots.push(root);
+                }
+            }
+            match nested_roots.len() {
+                0 => {}
+                1 => return Ok(nested_roots.into_iter().next().expect("single nested root")),
+                _ => {
+                    let repos = nested_roots
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(ToolError::invalid_input(format!(
+                        "Multiple git repositories found under {}. Specify cwd to disambiguate: {repos}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
+
+        levels += 1;
+        if levels > MAX_PARENT_LEVELS {
+            break;
+        }
+        current = dir.parent();
     }
-    Ok(PathBuf::from(root))
+
+    Err(ToolError::invalid_input(format!(
+        "worktree=true requires a git repository. Tried: {}",
+        paths_tried.join(", ")
+    )))
+}
+
+fn path_looks_like_git_checkout(path: &Path) -> bool {
+    let git_path = path.join(".git");
+    git_path.is_dir() || git_path.is_file()
+}
+
+fn try_git_toplevel(path: &Path) -> Option<PathBuf> {
+    let output = Git::output(&["rev-parse", "--show-toplevel"], path).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
 }
 
 fn validate_git_branch_name(repo_root: &Path, branch: &str) -> Result<(), ToolError> {
@@ -6850,17 +7476,42 @@ fn subagent_failure_message(err: &anyhow::Error) -> String {
     }
 }
 
+/// Human label for how a child's model was selected, so a launch failure can
+/// name the route that produced the failing model — inherited from the parent,
+/// a faster same-family sibling, or an explicit id (#4049).
+fn route_source_label(route: &ModelRoute) -> String {
+    match route {
+        ModelRoute::Inherit => "inherited from the parent/session model".to_string(),
+        ModelRoute::Faster => "faster same-family sibling of the parent model".to_string(),
+        ModelRoute::Auto => "auto (legacy route, treated as a faster sibling)".to_string(),
+        ModelRoute::Fixed(id) => format!("explicit model id `{id}`"),
+    }
+}
+
 /// When a child agent fails because its model is unavailable under the current
 /// access profile, a bare provider 403/404 (classified `Authorization` or
-/// `State`) is unactionable. Annotate it so the parent knows the likely cause
-/// and how to recover (#2653) without re-classifying the underlying error.
-fn annotate_child_model_error(err: &str, model: &str) -> String {
+/// `State`) is unactionable. Annotate it so the parent knows which provider and
+/// route produced the failing model and how to recover (#2653, #4049) without
+/// re-classifying the underlying error. Errors unrelated to model availability
+/// pass through unchanged.
+fn annotate_child_model_error(
+    err: &str,
+    model: &str,
+    provider: crate::config::ApiProvider,
+    route: &ModelRoute,
+) -> String {
+    let hint = || {
+        format!(
+            "{err}\n(provider `{}` · requested model `{model}` · route: {} — \
+             the model may be unavailable under the current access profile; remove the explicit \
+             child model override or adjust child-agent model config before retrying)",
+            provider_name_for_error(provider),
+            route_source_label(route),
+        )
+    };
     match crate::error_taxonomy::classify_error_message(err) {
         crate::error_taxonomy::ErrorCategory::Authorization
-        | crate::error_taxonomy::ErrorCategory::State => format!(
-            "{err}\n(child model `{model}` may be unavailable under the current access profile — \
-             remove the explicit child model override or adjust child-agent model config before retrying)"
-        ),
+        | crate::error_taxonomy::ErrorCategory::State => hint(),
         _ => {
             // #3020 (#2653): Provider rejections like "Model Not Exist" or
             // "does not exist or you do not have access" often classify as
@@ -6873,10 +7524,7 @@ fn annotate_child_model_error(err: &str, model: &str) -> String {
                 || lower.contains("no such model")
                 || lower.contains("invalid model")
             {
-                format!(
-                    "{err}\n(child model `{model}` may be unavailable under the current access profile — \
-                     remove the explicit child model override or adjust child-agent model config before retrying)"
-                )
+                hint()
             } else {
                 err.to_string()
             }
@@ -6942,10 +7590,15 @@ fn summarize_subagent_result(result: &SubAgentResult) -> String {
     }
     match (&result.status, result.result.as_ref()) {
         (SubAgentStatus::Completed, Some(text)) => text.clone(),
-        (SubAgentStatus::Completed, None) => "Completed (no output)".to_string(),
+        (SubAgentStatus::Completed, None) => "Completed (no final summary returned)".to_string(),
         (SubAgentStatus::Interrupted(error), _) => format!("Interrupted: {error}"),
         (SubAgentStatus::Cancelled, _) => "Cancelled".to_string(),
-        (SubAgentStatus::BudgetExhausted, _) => "Token budget exhausted".to_string(),
+        (SubAgentStatus::BudgetExhausted, Some(text)) => format!(
+            "Child token budget exhausted before finishing; partial output preserved below.\n{text}"
+        ),
+        (SubAgentStatus::BudgetExhausted, None) => {
+            "Child token budget exhausted before returning a final summary; retry with a smaller scoped task or split the work.".to_string()
+        }
         (SubAgentStatus::Failed(error), _) => format!("Failed: {error}"),
         (SubAgentStatus::Running, _) => "Running".to_string(),
     }
@@ -6990,11 +7643,11 @@ const PLAN_AGENT_INTRO: &str = concat!(
 );
 
 const REVIEW_AGENT_INTRO: &str = concat!(
-    "You are a trusted code review sub-agent (role: `review`). Your job is to find and report severity-scored issues, and stay strictly read-only.\n",
-    "Read the diff/files, grep sibling patterns/tests, then order EVIDENCE by severity.\n",
+    "You are an adversarial code review sub-agent (role: `review`). Assume the change is broken until the evidence proves otherwise: actively try to refute the claims made about it, and stay strictly read-only.\n",
+    "Read the diff/files, grep sibling patterns/tests, hunt regressions, missing tests, unhandled edge cases, and quiet behavior changes, then order EVIDENCE by severity.\n",
     "Use BLOCKER/MAJOR/MINOR/NIT and include path:line-range plus suggested fix.\n",
     "You may use more tool calls than quick exploration, but stop after decisive evidence instead of widening the review forever.\n",
-    "If no MAJOR+ issues exist, say so plainly in SUMMARY.\n",
+    "If nothing survives your attack, say plainly in SUMMARY that no MAJOR+ issues exist — a clean verdict earned adversarially is a real result, not a failure.\n",
     "CHANGES will almost always be \"None.\" for a reviewer.\n\n"
 );
 

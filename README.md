@@ -33,7 +33,7 @@ open an issue — that's how the project grows.
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.66
+codewhale --version   # 0.8.67
 ```
 
 The npm wrapper (Node 18+) downloads SHA-256-verified binaries from GitHub
@@ -62,17 +62,18 @@ nix run github:Hmbown/CodeWhale
 scoop install codewhale        # or the NSIS installer from GitHub Releases
 
 # CNB mirror for users who cannot reliably reach GitHub
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-cli --locked --force
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-tui --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.67 codewhale-cli --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.67 codewhale-tui --locked --force
 
 # Legacy Homebrew compatibility while the formula is renamed
 brew tap Hmbown/deepseek-tui
 brew install deepseek-tui
 ```
 
-Prebuilt archives for every platform — including Linux riscv64 — are attached
-to [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases). Checksums,
-China mirrors, Windows specifics, and troubleshooting live in
+Prebuilt archives for Linux x64/arm64, macOS x64/arm64, and Windows x64 are
+attached to [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases).
+Linux riscv64 prebuilts are temporarily paused while upstream QuickJS bindings
+catch up. Checksums, China mirrors, Windows specifics, and troubleshooting live in
 [docs/INSTALL.md](docs/INSTALL.md).
 
 **Upgrading from the legacy `deepseek-tui` package?** Your config, sessions,
@@ -222,6 +223,21 @@ product, not an afterthought.
 - **Embedded everywhere.** HTTP/SSE and ACP runtime APIs, a VS Code extension,
   and Telegram/Feishu bridges (Weixin experimental).
 
+## CodeWhale for VS Code — GUI frontend
+
+Prefer a graphical IDE experience over the terminal? [**CodeWhale for VS Code**](https://github.com/HengQuWorld/CodeWhale-VSCode) is a community-maintained GUI frontend that wraps the same CodeWhale engine into a native VS Code sidebar — chat, slash commands, threaded conversations, live diffs, task management, and a settings UI, all without leaving the editor.
+
+The GUI talks to the same local `codewhale` runtime over the [Runtime API](docs/RUNTIME_API.md), so sessions, providers, modes, and skills stay in sync between terminal and IDE. If you live in VS Code, give it a try:
+
+```bash
+npm install -g codewhale        # install the engine first
+# then search "CodeWhale" in the VS Code extensions panel
+```
+
+> The minimal scaffold under [`extensions/vscode/`](extensions/vscode/) in this
+> repo is a separate, read-only Phase 0 viewer. For the full chat experience,
+> use the linked GUI project above.
+
 ## How instructions are ranked
 
 As a project evolves, the instructions pile up and they inevitably conflict: the
@@ -276,7 +292,7 @@ The README is the short version. The rest is in docs and on
   output contract, and recovery behavior.
 - [Architecture](docs/ARCHITECTURE.md) — crate layout, runtime flow, tool system,
   extension points, and security model.
-- [WhaleFlow authoring](docs/WHALEFLOW_AUTHORING.md) · [MCP](docs/MCP.md) ·
+- [Workflow authoring](docs/WORKFLOW_AUTHORING.md) · [MCP](docs/MCP.md) ·
   [Runtime API](docs/RUNTIME_API.md) · [Model Lab](docs/MODEL_LAB.md)
 - [Keybindings](docs/KEYBINDINGS.md) · [Sandbox & approvals](docs/SANDBOX.md)
   · [Accessibility](docs/ACCESSIBILITY.md) · [Docker](docs/DOCKER.md)

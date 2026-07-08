@@ -41,6 +41,7 @@ impl Locale {
         }
     }
 
+    /// Every locale the TUI exposes in pickers and runtime resolution.
     #[allow(dead_code)]
     pub fn shipped() -> &'static [Self] {
         &[
@@ -52,6 +53,27 @@ impl Locale {
             Self::Es419,
             Self::Vi,
         ]
+    }
+
+    /// Complete UI packs held to `en.json` parity. `zh-Hant` is intentionally
+    /// excluded — it remains selectable but falls back to English for missing
+    /// keys until the pack catches up (#4057).
+    #[allow(dead_code)]
+    pub fn shipped_complete() -> &'static [Self] {
+        &[
+            Self::En,
+            Self::Ja,
+            Self::ZhHans,
+            Self::PtBr,
+            Self::Es419,
+            Self::Vi,
+        ]
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn is_partial_pack(self) -> bool {
+        matches!(self, Self::ZhHant)
     }
 }
 
@@ -202,6 +224,7 @@ pub enum MessageId {
     CmdStatusDescription,
     CmdStatuslineDescription,
     CmdFleetDescription,
+    CmdWorkflowDescription,
     CmdHotbarDescription,
     CmdSetupDescription,
     CmdSubagentsDescription,
@@ -276,6 +299,8 @@ pub enum MessageId {
     KbLiveTranscript,
     KbBacktrackMessage,
     KbCompleteCycleModes,
+    KbCycleThinking,
+    KbCyclePermissions,
     KbJumpPlanAgentYolo,
     KbAltJumpPlanAgentYolo,
     KbFocusSidebar,
@@ -331,10 +356,13 @@ pub enum MessageId {
     OnboardLanguageTitle,
     OnboardLanguageBlurb,
     OnboardLanguageFooter,
-    // Onboarding screens — API key entry.
+    OnboardProviderTitle,
+    OnboardProviderBlurb,
+    OnboardProviderFooter,
     OnboardApiKeyTitle,
     OnboardApiKeyStep1,
     OnboardApiKeyStep2,
+    OnboardApiKeyLocalHint,
     OnboardApiKeySavedHint,
     OnboardApiKeyFormatHint,
     OnboardApiKeyPlaceholder,
@@ -365,12 +393,17 @@ pub enum MessageId {
     SetupActionContinue,
     SetupActionSkip,
     SetupActionRetry,
+    SetupActionScrollBody,
     SetupActionGuided,
     SetupActionTuneGuided,
     SetupActionModelDraft,
+    SetupActionFreeform,
     SetupActionKeepExisting,
     SetupActionProvider,
     SetupActionModel,
+    SetupActionFleet,
+    SetupActionHotbar,
+    SetupActionRemote,
     SetupActionMode,
     SetupActionConfig,
     SetupActionRuntimePreset,
@@ -393,12 +426,16 @@ pub enum MessageId {
     SetupStepProviderModelWhy,
     SetupStepTrustSandboxTitle,
     SetupStepTrustSandboxWhy,
+    SetupStepOperateFleetTitle,
+    SetupStepOperateFleetWhy,
     SetupStepToolsMcpTitle,
     SetupStepToolsMcpWhy,
     SetupStepHotbarTitle,
     SetupStepHotbarWhy,
     SetupStepRemoteRuntimeTitle,
     SetupStepRemoteRuntimeWhy,
+    SetupStepPersistenceTitle,
+    SetupStepPersistenceWhy,
     SetupStepConstitutionTitle,
     SetupStepConstitutionWhy,
     SetupStepVerificationTitle,
@@ -410,11 +447,13 @@ pub enum MessageId {
     SetupCheckpointDeferred,
     SetupStepSkipped,
     SetupStepRetryRecorded,
+    SetupLanguageReviewed,
     SetupConstitutionChoiceLabel,
     SetupConstitutionSourceLabel,
     SetupConstitutionValidityLabel,
     SetupConstitutionPreviewLabel,
     SetupConstitutionExistingLabel,
+    SetupConstitutionExpertOverrideLabel,
     SetupConstitutionGuidedHint,
     SetupConstitutionGuidedAnswersHint,
     SetupConstitutionPurposeLabel,
@@ -433,6 +472,38 @@ pub enum MessageId {
     SetupCardTrustLabel,
     SetupCardSandboxLabel,
     SetupCardNetworkLabel,
+    SetupOperateRuntimeLabel,
+    SetupOperateRosterLabel,
+    SetupOperateConcurrencyLabel,
+    SetupOperateReadinessLabel,
+    SetupOperateReviewHint,
+    SetupOperateReviewed,
+    SetupOperateNeedsActionSaved,
+    SetupHotbarBindingsLabel,
+    SetupHotbarActionsLabel,
+    SetupHotbarReviewHint,
+    SetupHotbarReviewed,
+    SetupToolsMcpServersLabel,
+    SetupToolsMcpSkillsLabel,
+    SetupToolsMcpToolsLabel,
+    SetupToolsMcpPluginsLabel,
+    SetupToolsMcpReviewHint,
+    SetupToolsMcpReviewed,
+    SetupRemoteCloudsLabel,
+    SetupRemoteBridgesLabel,
+    SetupRemoteProvidersLabel,
+    SetupRemoteModeLabel,
+    SetupRemoteReviewHint,
+    SetupRemotePreviewTitle,
+    SetupRemoteReviewed,
+    SetupPersistenceHomeLabel,
+    SetupPersistenceConfigLabel,
+    SetupPersistenceStateLabel,
+    SetupPersistenceConstitutionLabel,
+    SetupPersistenceMemoryLabel,
+    SetupPersistenceNotesLabel,
+    SetupPersistenceReviewHint,
+    SetupPersistenceReviewed,
     SetupProviderModelReadyHint,
     SetupProviderModelNeedsActionHint,
     SetupProviderModelReviewed,
@@ -456,6 +527,7 @@ pub enum MessageId {
     SetupRuntimeProjectOverrideNone,
     SetupReportFirstRunLabel,
     SetupReportUpdateLabel,
+    SetupReportOperateLabel,
     SetupReportSourceLabel,
     SetupReportAutonomyLabel,
     SetupReportRuntimePostureLabel,
@@ -470,6 +542,7 @@ pub enum MessageId {
     SetupReportNextActionConstitution,
     SetupReportNextActionProvider,
     SetupReportNextActionRuntime,
+    SetupReportNextActionOperate,
     SetupReportNextActionRequired,
     SetupReportRecorded,
     // Context menu.
@@ -501,16 +574,19 @@ pub enum MessageId {
     // Agent fanout card.
     FanoutCounts,
 
-    // App mode picker (prompt, names, hints) and composer vim indicator.
-    ModePickerPrompt,
+    // App mode picker (names, hints) and composer vim indicator.
     AppModeAgent,
     AppModeAuto,
     AppModeYolo,
     AppModePlan,
+    AppModeMultitask,
+    AppModeOperate,
     AppModeAgentHint,
     AppModeAutoHint,
     AppModePlanHint,
     AppModeYoloHint,
+    AppModeMultitaskHint,
+    AppModeOperateHint,
     VimModeNormal,
     VimModeInsert,
     VimModeVisual,
@@ -775,6 +851,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdStatusDescription,
     MessageId::CmdStatuslineDescription,
     MessageId::CmdFleetDescription,
+    MessageId::CmdWorkflowDescription,
     MessageId::CmdHotbarDescription,
     MessageId::CmdSetupDescription,
     MessageId::CmdSubagentsDescription,
@@ -854,6 +931,8 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::KbLiveTranscript,
     MessageId::KbBacktrackMessage,
     MessageId::KbCompleteCycleModes,
+    MessageId::KbCycleThinking,
+    MessageId::KbCyclePermissions,
     MessageId::KbJumpPlanAgentYolo,
     MessageId::KbAltJumpPlanAgentYolo,
     MessageId::KbFocusSidebar,
@@ -908,9 +987,13 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::OnboardLanguageTitle,
     MessageId::OnboardLanguageBlurb,
     MessageId::OnboardLanguageFooter,
+    MessageId::OnboardProviderTitle,
+    MessageId::OnboardProviderBlurb,
+    MessageId::OnboardProviderFooter,
     MessageId::OnboardApiKeyTitle,
     MessageId::OnboardApiKeyStep1,
     MessageId::OnboardApiKeyStep2,
+    MessageId::OnboardApiKeyLocalHint,
     MessageId::OnboardApiKeySavedHint,
     MessageId::OnboardApiKeyFormatHint,
     MessageId::OnboardApiKeyPlaceholder,
@@ -938,12 +1021,17 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SetupActionContinue,
     MessageId::SetupActionSkip,
     MessageId::SetupActionRetry,
+    MessageId::SetupActionScrollBody,
     MessageId::SetupActionGuided,
     MessageId::SetupActionTuneGuided,
     MessageId::SetupActionModelDraft,
+    MessageId::SetupActionFreeform,
     MessageId::SetupActionKeepExisting,
     MessageId::SetupActionProvider,
     MessageId::SetupActionModel,
+    MessageId::SetupActionFleet,
+    MessageId::SetupActionHotbar,
+    MessageId::SetupActionRemote,
     MessageId::SetupActionMode,
     MessageId::SetupActionConfig,
     MessageId::SetupActionRuntimePreset,
@@ -966,12 +1054,16 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SetupStepProviderModelWhy,
     MessageId::SetupStepTrustSandboxTitle,
     MessageId::SetupStepTrustSandboxWhy,
+    MessageId::SetupStepOperateFleetTitle,
+    MessageId::SetupStepOperateFleetWhy,
     MessageId::SetupStepToolsMcpTitle,
     MessageId::SetupStepToolsMcpWhy,
     MessageId::SetupStepHotbarTitle,
     MessageId::SetupStepHotbarWhy,
     MessageId::SetupStepRemoteRuntimeTitle,
     MessageId::SetupStepRemoteRuntimeWhy,
+    MessageId::SetupStepPersistenceTitle,
+    MessageId::SetupStepPersistenceWhy,
     MessageId::SetupStepConstitutionTitle,
     MessageId::SetupStepConstitutionWhy,
     MessageId::SetupStepVerificationTitle,
@@ -983,11 +1075,13 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SetupCheckpointDeferred,
     MessageId::SetupStepSkipped,
     MessageId::SetupStepRetryRecorded,
+    MessageId::SetupLanguageReviewed,
     MessageId::SetupConstitutionChoiceLabel,
     MessageId::SetupConstitutionSourceLabel,
     MessageId::SetupConstitutionValidityLabel,
     MessageId::SetupConstitutionPreviewLabel,
     MessageId::SetupConstitutionExistingLabel,
+    MessageId::SetupConstitutionExpertOverrideLabel,
     MessageId::SetupConstitutionGuidedHint,
     MessageId::SetupConstitutionGuidedAnswersHint,
     MessageId::SetupConstitutionPurposeLabel,
@@ -1006,6 +1100,38 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SetupCardTrustLabel,
     MessageId::SetupCardSandboxLabel,
     MessageId::SetupCardNetworkLabel,
+    MessageId::SetupOperateRuntimeLabel,
+    MessageId::SetupOperateRosterLabel,
+    MessageId::SetupOperateConcurrencyLabel,
+    MessageId::SetupOperateReadinessLabel,
+    MessageId::SetupOperateReviewHint,
+    MessageId::SetupOperateReviewed,
+    MessageId::SetupOperateNeedsActionSaved,
+    MessageId::SetupHotbarBindingsLabel,
+    MessageId::SetupHotbarActionsLabel,
+    MessageId::SetupHotbarReviewHint,
+    MessageId::SetupHotbarReviewed,
+    MessageId::SetupToolsMcpServersLabel,
+    MessageId::SetupToolsMcpSkillsLabel,
+    MessageId::SetupToolsMcpToolsLabel,
+    MessageId::SetupToolsMcpPluginsLabel,
+    MessageId::SetupToolsMcpReviewHint,
+    MessageId::SetupToolsMcpReviewed,
+    MessageId::SetupRemoteCloudsLabel,
+    MessageId::SetupRemoteBridgesLabel,
+    MessageId::SetupRemoteProvidersLabel,
+    MessageId::SetupRemoteModeLabel,
+    MessageId::SetupRemoteReviewHint,
+    MessageId::SetupRemotePreviewTitle,
+    MessageId::SetupRemoteReviewed,
+    MessageId::SetupPersistenceHomeLabel,
+    MessageId::SetupPersistenceConfigLabel,
+    MessageId::SetupPersistenceStateLabel,
+    MessageId::SetupPersistenceConstitutionLabel,
+    MessageId::SetupPersistenceMemoryLabel,
+    MessageId::SetupPersistenceNotesLabel,
+    MessageId::SetupPersistenceReviewHint,
+    MessageId::SetupPersistenceReviewed,
     MessageId::SetupProviderModelReadyHint,
     MessageId::SetupProviderModelNeedsActionHint,
     MessageId::SetupProviderModelReviewed,
@@ -1029,6 +1155,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SetupRuntimeProjectOverrideNone,
     MessageId::SetupReportFirstRunLabel,
     MessageId::SetupReportUpdateLabel,
+    MessageId::SetupReportOperateLabel,
     MessageId::SetupReportSourceLabel,
     MessageId::SetupReportAutonomyLabel,
     MessageId::SetupReportRuntimePostureLabel,
@@ -1043,6 +1170,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SetupReportNextActionConstitution,
     MessageId::SetupReportNextActionProvider,
     MessageId::SetupReportNextActionRuntime,
+    MessageId::SetupReportNextActionOperate,
     MessageId::SetupReportNextActionRequired,
     MessageId::SetupReportRecorded,
     // Context menu.
@@ -1072,15 +1200,18 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CtxMenuHelp,
     MessageId::CtxMenuHelpDesc,
     MessageId::FanoutCounts,
-    MessageId::ModePickerPrompt,
     MessageId::AppModeAgent,
     MessageId::AppModeAuto,
     MessageId::AppModeYolo,
     MessageId::AppModePlan,
+    MessageId::AppModeMultitask,
+    MessageId::AppModeOperate,
     MessageId::AppModeAgentHint,
     MessageId::AppModeAutoHint,
     MessageId::AppModePlanHint,
     MessageId::AppModeYoloHint,
+    MessageId::AppModeMultitaskHint,
+    MessageId::AppModeOperateHint,
     MessageId::VimModeNormal,
     MessageId::VimModeInsert,
     MessageId::VimModeVisual,
@@ -1419,9 +1550,21 @@ mod tests {
             .collect()
     }
 
+    fn locale_json_source(locale: Locale) -> &'static str {
+        match locale {
+            Locale::En => include_str!("../locales/en.json"),
+            Locale::Ja => include_str!("../locales/ja.json"),
+            Locale::ZhHans => include_str!("../locales/zh-Hans.json"),
+            Locale::ZhHant => include_str!("../locales/zh-Hant.json"),
+            Locale::PtBr => include_str!("../locales/pt-BR.json"),
+            Locale::Es419 => include_str!("../locales/es-419.json"),
+            Locale::Vi => include_str!("../locales/vi.json"),
+        }
+    }
+
     #[test]
-    fn shipped_first_pack_has_no_missing_core_messages() {
-        for locale in Locale::shipped() {
+    fn shipped_complete_packs_have_no_missing_core_messages() {
+        for locale in Locale::shipped_complete() {
             assert!(
                 missing_message_ids(*locale).is_empty(),
                 "{} is missing messages",
@@ -1431,18 +1574,64 @@ mod tests {
     }
 
     #[test]
+    fn zh_hant_is_scoped_as_partial_pack() {
+        assert!(
+            Locale::ZhHant.is_partial_pack(),
+            "zh-Hant must be marked partial until it reaches en.json parity"
+        );
+        let en_keys = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            locale_json_source(Locale::En),
+        )
+        .expect("en locale json");
+        let zh_hant_keys = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            locale_json_source(Locale::ZhHant),
+        )
+        .expect("zh-Hant locale json");
+        assert!(
+            zh_hant_keys.len() < en_keys.len(),
+            "partial zh-Hant should not claim full parity"
+        );
+        assert!(
+            !Locale::shipped_complete().contains(&Locale::ZhHant),
+            "parity gates must exclude partial zh-Hant"
+        );
+    }
+
+    #[test]
+    fn shipped_setup_strings_are_explicitly_localized() {
+        let setup_keys = ALL_MESSAGE_IDS
+            .iter()
+            .map(|id| format!("{id:?}"))
+            .filter(|id| id.starts_with("Setup"))
+            .collect::<Vec<_>>();
+
+        for locale in Locale::shipped_complete() {
+            let messages = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                locale_json_source(*locale),
+            )
+            .unwrap_or_else(|err| panic!("{} locale json should parse: {err}", locale.tag()));
+            for key in &setup_keys {
+                assert!(
+                    messages.contains_key(key),
+                    "{} should define {key} explicitly",
+                    locale.tag()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn mode_picker_strings_are_translated_in_non_english_locales() {
-        // The picker prompt and the three mode hints are full sentences; every
-        // shipped non-English locale must provide a real translation rather than
-        // leaking the English string through the fallback chain.
+        // The mode hints are full sentences; every shipped non-English locale
+        // must provide a real translation rather than leaking the English
+        // string through the fallback chain.
         let sentences = [
-            MessageId::ModePickerPrompt,
             MessageId::AppModeAgentHint,
             MessageId::AppModeAutoHint,
             MessageId::AppModePlanHint,
             MessageId::AppModeYoloHint,
         ];
-        for locale in Locale::shipped() {
+        for locale in Locale::shipped_complete() {
             if *locale == Locale::En {
                 continue;
             }
@@ -1470,7 +1659,7 @@ mod tests {
 
     #[test]
     fn provider_description_is_present_for_all_locales() {
-        for locale in Locale::shipped() {
+        for locale in Locale::shipped_complete() {
             let description = tr(*locale, MessageId::CmdProviderDescription);
             assert!(
                 !description.is_empty(),

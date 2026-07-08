@@ -21,7 +21,7 @@ bằng `/restore` cho mọi lượt.
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.66
+codewhale --version   # 0.8.67
 ```
 
 Wrapper npm (Node 18+) tải binary đã xác minh SHA-256 từ GitHub Releases và
@@ -50,18 +50,19 @@ nix run github:Hmbown/CodeWhale
 scoop install codewhale        # hoặc trình cài NSIS từ GitHub Releases
 
 # CNB mirror cho người dùng khó truy cập GitHub ổn định
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-cli --locked --force
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-tui --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.67 codewhale-cli --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.67 codewhale-tui --locked --force
 
 # Homebrew legacy trong lúc formula đang được đổi tên
 brew tap Hmbown/deepseek-tui
 brew install deepseek-tui
 ```
 
-Archive dựng sẵn cho mọi nền tảng — bao gồm cả Linux riscv64 — được đính kèm
-trong [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases).
-Checksum, mirror Trung Quốc, chi tiết riêng cho Windows và troubleshooting nằm
-trong [docs/INSTALL.md](docs/INSTALL.md).
+Archive dựng sẵn cho Linux x64/arm64, macOS x64/arm64 và Windows x64 được đính
+kèm trong [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases).
+Linux riscv64 prebuilt tạm dừng trong lúc chờ upstream QuickJS bindings. Checksum,
+mirror Trung Quốc, chi tiết riêng cho Windows và troubleshooting nằm trong
+[docs/INSTALL.md](docs/INSTALL.md).
 
 ## Lần chạy đầu tiên
 
@@ -167,7 +168,7 @@ context dài hơn, tự chủ nhiều hơn. CodeWhale bắt đầu bằng việc
 nhiệm.
 
 (Đây là mission thiết kế đang được đưa vào phiên bản này; memory, cost,
-và remote orchestration vẫn đang lặp lại — xem v0.9.0 Track bên dưới.)
+và remote orchestration vẫn đang lặp lại — xem Track tiếp theo bên dưới.)
 
 Một agent sửa repo của bạn cần có một địa chỉ — terminal này, người dùng này,
 branch này, session này. Không phải một persona; một địa chỉ để truy hồi. Khi
@@ -230,14 +231,14 @@ trên [codewhale.net](https://codewhale.net/):
 - [Architecture](docs/ARCHITECTURE.md) — bố cục crate, luồng runtime, hệ
   thống công cụ, điểm mở rộng và mô hình bảo mật.
 
-## Track v0.9.0
+## Track tiếp theo
 
-v0.9.0 là làn tích hợp hiện tại. Những việc đang tụ về đó:
+Bản phát hành hiện tại là 0.8.67 (cải thiện khả dụng Fleet/Workflow). Những hướng dưới đây là công việc sau này, không nằm trong bản phát hành này:
 
 - bề mặt relay và handoff mạnh hơn giữa các session và agent;
 - transcript gọn gàng hơn cho các chuỗi công cụ dày đặc;
 - runtime API cho VS Code và các client GUI;
-- điều phối workflow branch/leaf với WhaleFlow.
+- điều phối workflow branch/leaf với Workflow.
 
 Chi tiết theo từng bản phát hành nằm trong [CHANGELOG.md](CHANGELOG.md).
 

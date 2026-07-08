@@ -190,7 +190,7 @@ fn normalize_domain_candidate(value: &str) -> Option<String> {
 }
 
 fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
-    matches!(tool_name, "rlm_eval")
+    matches!(tool_name, "rlm_eval" | "start_mcp_server")
 }
 
 impl Engine {
@@ -385,7 +385,7 @@ impl Engine {
                         // Only update if we got valid messages (never corrupt state)
                         if !result.messages.is_empty() || self.session.messages.is_empty() {
                             let auto_messages_after = result.messages.len();
-                            self.session.messages = result.messages.into();
+                            self.session.replace_messages(result.messages);
                             self.merge_compaction_summary(result.summary_prompt);
                             self.emit_session_updated().await;
                             let removed = auto_messages_before.saturating_sub(auto_messages_after);
@@ -685,7 +685,7 @@ impl Engine {
             // tool call except the last one in the batch.
             let mut current_tool_indices: std::collections::HashMap<u32, usize> =
                 std::collections::HashMap::new();
-            let mut in_tool_call_block = false;
+            let mut tool_call_filter = ToolCallDeltaFilterState::default();
             let mut fake_wrapper_notice_emitted = false;
             let mut pending_message_complete = false;
             let mut last_text_index: Option<usize> = None;
@@ -889,9 +889,11 @@ impl Engine {
                         ContentBlockStart::Text { text } => {
                             current_text_raw = text;
                             current_text_visible.clear();
-                            in_tool_call_block = false;
-                            let filtered =
-                                filter_tool_call_delta(&current_text_raw, &mut in_tool_call_block);
+                            tool_call_filter = ToolCallDeltaFilterState::default();
+                            let filtered = filter_tool_call_delta_with_state(
+                                &current_text_raw,
+                                &mut tool_call_filter,
+                            );
                             if !fake_wrapper_notice_emitted
                                 && filtered.len() < current_text_raw.len()
                                 && contains_fake_tool_wrapper(&current_text_raw)
@@ -964,10 +966,11 @@ impl Engine {
                         Delta::TextDelta { text } => {
                             stream_content_bytes = stream_content_bytes.saturating_add(text.len());
                             current_text_raw.push_str(&text);
-                            let filtered = filter_tool_call_delta(&text, &mut in_tool_call_block);
+                            let filtered =
+                                filter_tool_call_delta_with_state(&text, &mut tool_call_filter);
                             if !fake_wrapper_notice_emitted
                                 && filtered.len() < text.len()
-                                && contains_fake_tool_wrapper(&text)
+                                && contains_fake_tool_wrapper(&current_text_raw)
                             {
                                 let _ =
                                     self.tx_event.send(Event::status(FAKE_WRAPPER_NOTICE)).await;
@@ -1029,6 +1032,17 @@ impl Engine {
                         let stopped_kind = current_block_kind.take();
                         match stopped_kind {
                             Some(ContentBlockKind::Text) => {
+                                let flushed = flush_tool_call_delta_state(&mut tool_call_filter);
+                                if !flushed.is_empty() {
+                                    current_text_visible.push_str(&flushed);
+                                    let _ = self
+                                        .tx_event
+                                        .send(Event::MessageDelta {
+                                            index: index as usize,
+                                            content: flushed,
+                                        })
+                                        .await;
+                                }
                                 pending_message_complete = true;
                                 last_text_index = Some(index as usize);
                             }
@@ -1573,7 +1587,7 @@ impl Engine {
                 let mut read_only = false;
                 let mut detached_start = false;
                 let mut blocked_error: Option<ToolError> = None;
-                let mut guard_result: Option<ToolResult> = None;
+                let guard_result: Option<ToolResult> = None;
                 // #3026: set by a hook `ask` decision; applied AFTER the
                 // registry-based approval computation below so it cannot be
                 // clobbered by it.
@@ -1885,17 +1899,27 @@ impl Engine {
                         &mut deferred_tools_hydrated_this_batch,
                     )
                 {
+                    emit_tool_audit(json!({
+                        "event": "tool.schema_hydrated",
+                        "tool_id": tool_id.clone(),
+                        "tool_name": tool_name.clone(),
+                        "auto_retry_same_turn": true,
+                        "metadata": result.metadata,
+                    }));
                     if should_emit_hydration_status {
                         let status = if requested_tool_name == tool_name {
-                            format!("Auto-loaded deferred tool '{tool_name}' after model request.")
+                            format!(
+                                "Auto-loaded deferred tool '{tool_name}' and retrying the pending call in the same turn."
+                            )
                         } else {
                             format!(
-                                "Auto-loaded deferred tool '{tool_name}' after resolving '{requested_tool_name}'."
+                                "Auto-loaded deferred tool '{tool_name}' after resolving '{requested_tool_name}' and retrying in the same turn."
                             )
                         };
                         let _ = self.tx_event.send(Event::status(status)).await;
                     }
-                    guard_result = Some(result);
+                    // Do not set guard_result: the tool is activated for this batch
+                    // and will execute immediately with the model's original input.
                 }
 
                 plans.push(ToolExecutionPlan {
@@ -2456,10 +2480,19 @@ impl Engine {
             let mut step_error_tool_names: Vec<String> = Vec::new();
             let mut step_error_tool_inputs: Vec<serde_json::Value> = Vec::new();
             let mut stop_after_plan_tool = false;
+            // #dogfood 0.8.67: if the model mutates the goal mid-turn via
+            // create_goal/update_goal, push the change to the sidebar right after
+            // this tool batch instead of waiting for turn end — otherwise the
+            // sidebar "Goal:" line stays stale for the whole (possibly long)
+            // goal-loop turn while get_goal already reflects the new objective.
+            let mut goal_tool_ran = false;
 
             for outcome in outcomes.into_iter().flatten() {
                 let tool_input = outcome.input.clone();
                 let tool_name_for_ws = outcome.name.clone();
+                if matches!(outcome.name.as_str(), "create_goal" | "update_goal") {
+                    goal_tool_ran = true;
+                }
                 let should_stop_this_turn =
                     should_stop_after_plan_tool(mode, &outcome.name, &outcome.result);
 
@@ -2555,6 +2588,13 @@ impl Engine {
 
                 turn.record_tool_call();
                 stop_after_plan_tool |= should_stop_this_turn;
+            }
+
+            // Reflect a mid-turn goal change on the sidebar immediately (idempotent:
+            // emit_goal_updated only sends when an objective is set, and the UI
+            // applies it behind a `changed` guard).
+            if goal_tool_ran {
+                self.emit_goal_updated().await;
             }
 
             if stop_after_plan_tool {

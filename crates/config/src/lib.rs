@@ -169,6 +169,13 @@ pub struct ProvidersToml {
     pub deepinfra: ProviderConfigToml,
     #[serde(default, alias = "sakana-ai", alias = "sakana_ai", alias = "fugu")]
     pub sakana: ProviderConfigToml,
+    #[serde(
+        default,
+        alias = "long-cat",
+        alias = "meituan-longcat",
+        alias = "meituan"
+    )]
+    pub longcat: ProviderConfigToml,
     /// Catch-all table for the dynamic OpenAI-compatible custom provider
     /// identity (#1519). Arbitrary `[providers.<name>]` tables are handled by
     /// the tui-side flatten map; this named slot keeps the canonical
@@ -267,6 +274,7 @@ impl ProvidersToml {
             ProviderKind::Minimax => &self.minimax,
             ProviderKind::Deepinfra => &self.deepinfra,
             ProviderKind::Sakana => &self.sakana,
+            ProviderKind::LongCat => &self.longcat,
             ProviderKind::Custom => &self.custom,
         }
     }
@@ -302,6 +310,7 @@ impl ProvidersToml {
             ProviderKind::Minimax => &mut self.minimax,
             ProviderKind::Deepinfra => &mut self.deepinfra,
             ProviderKind::Sakana => &mut self.sakana,
+            ProviderKind::LongCat => &mut self.longcat,
             ProviderKind::Custom => &mut self.custom,
         }
     }
@@ -890,7 +899,8 @@ impl ProviderChain {
         self.providers
             .get(self.position)
             .copied()
-            .unwrap_or(self.providers[0])
+            .or_else(|| self.providers.first().copied())
+            .unwrap_or_default()
     }
 
     #[must_use]
@@ -919,6 +929,20 @@ impl ProviderChain {
     #[must_use]
     pub fn remaining(&self) -> usize {
         self.providers.len() - self.position
+    }
+}
+
+#[cfg(test)]
+mod provider_chain_tests {
+    use super::*;
+
+    #[test]
+    fn current_on_empty_chain_returns_default_provider() {
+        let chain = ProviderChain {
+            providers: vec![],
+            position: 0,
+        };
+        assert_eq!(chain.current(), ProviderKind::default());
     }
 }
 
@@ -1122,6 +1146,20 @@ pub struct FleetProfile {
     /// validates the executable provider/model/wire-model decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Optional explicit provider id for this profile's model (#4093).
+    ///
+    /// Present only when the profile was created against a specific,
+    /// credential-checked provider (e.g. via the Fleet setup model picker),
+    /// so a worker can be pinned to a route independent of the parent/current
+    /// session provider. `None` means "no route pin" (inherit), matching
+    /// `model: None`; a profile must never carry `provider` without `model`.
+    ///
+    /// EPIC #2608 explicit-config-only mandate: this field is the ONLY
+    /// authority for the profile's provider. It is never inferred by sniffing
+    /// a substring/prefix out of `model` — callers that need the provider for
+    /// this profile must read this field, not guess from the model id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// Permission defaults requested by the profile.
     #[serde(default)]
     pub permissions: FleetProfilePermissions,
@@ -1201,7 +1239,6 @@ pub enum FleetSlot {
     Implementer,
     Reviewer,
     Verifier,
-    ToolHeavy,
     Operator,
     Summarizer,
     #[default]
@@ -1218,7 +1255,6 @@ impl FleetSlot {
             Self::Implementer => "implementer",
             Self::Reviewer => "reviewer",
             Self::Verifier => "verifier",
-            Self::ToolHeavy => "tool-heavy",
             Self::Operator => "operator",
             Self::Summarizer => "summarizer",
             Self::General => "general",
@@ -1234,10 +1270,12 @@ impl FleetSlot {
             "implementer" | "builder" => Self::Implementer,
             "reviewer" => Self::Reviewer,
             "verifier" | "tester" => Self::Verifier,
-            "tool-heavy" | "tool_heavy" => Self::ToolHeavy,
             "operator" | "incident" | "incident-worker" => Self::Operator,
             "summarizer" | "reducer" => Self::Summarizer,
             "general" | "" => Self::General,
+            // Removed slots (e.g. the old "tool-heavy") and unknown names parse
+            // as Custom, which dispatches on the General surface — identical to
+            // the behavior the removed variants had.
             other => Self::Custom(other.to_string()),
         }
     }
@@ -1265,15 +1303,14 @@ impl<'de> Deserialize<'de> for FleetSlot {
 /// Model class or route-role hint for a profile.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum FleetLoadout {
+    /// Reuse the active session route (the operator's model). Default.
     #[default]
     Inherit,
-    Strong,
+    /// Route to the provider's faster/cheaper model class for wide fan-out.
     Fast,
-    Balanced,
-    DeepReasoning,
-    Code,
-    Review,
-    ToolHeavy,
+    /// Unrecognized loadout names parse here (including the retired
+    /// strong/balanced/deep-reasoning/code/review/tool-heavy tiers, which
+    /// never routed differently). Treated as auto routing.
     Custom(String),
 }
 
@@ -1282,13 +1319,7 @@ impl FleetLoadout {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Inherit => "inherit",
-            Self::Strong => "strong",
             Self::Fast => "fast",
-            Self::Balanced => "balanced",
-            Self::DeepReasoning => "deep-reasoning",
-            Self::Code => "code",
-            Self::Review => "review",
-            Self::ToolHeavy => "tool-heavy",
             Self::Custom(value) => value.as_str(),
         }
     }
@@ -1297,13 +1328,10 @@ impl FleetLoadout {
     pub fn from_name(value: &str) -> Self {
         match value.trim() {
             "inherit" | "default" | "auto" | "" => Self::Inherit,
-            "strong" => Self::Strong,
             "fast" => Self::Fast,
-            "balanced" => Self::Balanced,
-            "deep-reasoning" | "deep_reasoning" | "reasoning" => Self::DeepReasoning,
-            "code" | "coding" => Self::Code,
-            "review" | "reviewer" => Self::Review,
-            "tool-heavy" | "tool_heavy" => Self::ToolHeavy,
+            // Retired tiers (strong/balanced/deep-reasoning/code/review/
+            // tool-heavy) and unknown names parse as Custom → auto routing,
+            // exactly what those tiers resolved to before removal.
             other => Self::Custom(other.to_string()),
         }
     }
@@ -2006,6 +2034,7 @@ impl ConfigToml {
                 ProviderKind::Minimax => DEFAULT_MINIMAX_BASE_URL.to_string(),
                 ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL.to_string(),
                 ProviderKind::Sakana => DEFAULT_SAKANA_BASE_URL.to_string(),
+                ProviderKind::LongCat => DEFAULT_LONGCAT_BASE_URL.to_string(),
                 // The custom provider has no built-in endpoint; fall back to its
                 // descriptor placeholder so the lookup is total. Real custom
                 // routes always supply a configured base_url before this point.
@@ -2582,6 +2611,7 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Minimax => DEFAULT_MINIMAX_MODEL,
         ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_MODEL,
         ProviderKind::Sakana => DEFAULT_SAKANA_MODEL,
+        ProviderKind::LongCat => DEFAULT_LONGCAT_MODEL,
         // No built-in default model; the registry placeholder keeps this total.
         ProviderKind::Custom => provider.provider().default_model(),
     }
@@ -2618,6 +2648,7 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Minimax => DEFAULT_MINIMAX_BASE_URL,
         ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL,
         ProviderKind::Sakana => DEFAULT_SAKANA_BASE_URL,
+        ProviderKind::LongCat => DEFAULT_LONGCAT_BASE_URL,
         // No built-in default base URL; the registry placeholder keeps this total.
         ProviderKind::Custom => provider.provider().default_base_url(),
     }
@@ -3012,27 +3043,8 @@ impl ConfigStore {
             }
             write_one_time_config_backup(&path)?;
         }
-        #[cfg(unix)]
-        {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)
-                .with_context(|| format!("failed to write config at {}", path.display()))?;
-            file.write_all(body.as_bytes())
-                .with_context(|| format!("failed to write config at {}", path.display()))?;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .with_context(|| {
-                    format!("failed to set config permissions at {}", path.display())
-                })?;
-        }
-        #[cfg(not(unix))]
-        {
-            fs::write(&path, body)
-                .with_context(|| format!("failed to write config at {}", path.display()))?;
-        }
+        persistence::atomic_write(&path, body.as_bytes())
+            .with_context(|| format!("failed to write config at {}", path.display()))?;
         Ok(())
     }
 
@@ -4180,6 +4192,8 @@ struct EnvRuntimeOverrides {
     deepinfra_model: Option<String>,
     sakana_base_url: Option<String>,
     sakana_model: Option<String>,
+    longcat_base_url: Option<String>,
+    longcat_model: Option<String>,
 }
 
 impl EnvRuntimeOverrides {
@@ -4418,6 +4432,12 @@ impl EnvRuntimeOverrides {
             sakana_model: std::env::var("SAKANA_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            longcat_base_url: std::env::var("LONGCAT_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            longcat_model: std::env::var("LONGCAT_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         }
     }
 
@@ -4469,6 +4489,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::Minimax => self.minimax_base_url.clone(),
             ProviderKind::Deepinfra => self.deepinfra_base_url.clone(),
             ProviderKind::Sakana => self.sakana_base_url.clone(),
+            ProviderKind::LongCat => self.longcat_base_url.clone(),
             // No dedicated CODEWHALE_CUSTOM_BASE_URL env override: a custom
             // provider's base URL comes from its `[providers.<name>]` table.
             ProviderKind::Custom => None,
@@ -4499,6 +4520,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::Minimax => self.minimax_model.clone(),
             ProviderKind::Deepinfra => self.deepinfra_model.clone(),
             ProviderKind::Sakana => self.sakana_model.clone(),
+            ProviderKind::LongCat => self.longcat_model.clone(),
             _ => None,
         }?;
 

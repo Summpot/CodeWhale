@@ -42,6 +42,7 @@ pub mod remember;
 pub mod revert_turn;
 pub mod review;
 pub mod rlm;
+pub mod runtime_mcp;
 pub mod schema_canonicalize;
 pub mod schema_sanitize;
 pub mod search;
@@ -61,6 +62,7 @@ pub mod validate_data;
 pub mod verifier;
 pub mod web_run;
 pub mod web_search;
+pub mod workflow;
 
 pub use registry::{AgentToolSurfaceOptions, ToolRegistry, ToolRegistryBuilder};
 pub use review::ReviewOutput;

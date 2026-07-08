@@ -954,6 +954,21 @@ impl ToolRegistryBuilder {
         self
     }
 
+    /// Register the `start_mcp_server` tool for dynamically adding MCP servers
+    /// from conversation context. Does not register MCP tool adapters — those
+    /// are returned by `pool.to_api_tools()` in `engine.mcp_tools()`.
+    #[must_use]
+    pub fn with_runtime_mcp_tool(
+        mut self,
+        mcp_pool: std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>,
+    ) -> Self {
+        self.tools
+            .push(Arc::new(super::runtime_mcp::StartRuntimeMcpServer::new(
+                mcp_pool,
+            )));
+        self
+    }
+
     /// Include all agent tools (file tools + shell + note + search).
     ///
     /// Web and patch tools are NOT registered here — callers must add them
@@ -1125,10 +1140,6 @@ impl ToolRegistryBuilder {
             .with_tool(Arc::new(TodoAddTool::checklist(todo_list.clone())))
             .with_tool(Arc::new(TodoUpdateTool::checklist(todo_list.clone())))
             .with_tool(Arc::new(TodoListTool::checklist(todo_list.clone())))
-            .with_tool(Arc::new(TodoWriteTool::new(todo_list.clone())))
-            .with_tool(Arc::new(TodoAddTool::new(todo_list.clone())))
-            .with_tool(Arc::new(TodoUpdateTool::new(todo_list.clone())))
-            .with_tool(Arc::new(TodoListTool::new(todo_list)))
     }
 
     /// Include the plan tool with a shared `PlanState`.
@@ -1155,8 +1166,13 @@ impl ToolRegistryBuilder {
         runtime: super::subagent::SubAgentRuntime,
     ) -> Self {
         use super::subagent::AgentTool;
+        use super::workflow::WorkflowTool;
 
-        self.with_tool(Arc::new(AgentTool::new(manager, runtime)))
+        self.with_tool(Arc::new(WorkflowTool::new(
+            Arc::clone(&manager),
+            runtime.clone(),
+        )))
+        .with_tool(Arc::new(AgentTool::new(manager, runtime)))
     }
 
     /// Build the registry with the given context.
@@ -1249,7 +1265,7 @@ impl ToolSpec for McpToolAdapter {
             .call_tool(&self.name, input)
             .await
             .map_err(|e| ToolError::execution_failed(format!("MCP tool failed: {e}")))?;
-        let content = serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
+        let content = serde_json::to_string(&result).unwrap_or_else(|_| result.to_string());
         Ok(ToolResult::success(content))
     }
 }
@@ -1341,10 +1357,6 @@ mod tests {
             .with_todo_tool(crate::tools::todo::new_shared_todo_list())
             .build(ctx);
 
-        for alias in ["todo_write", "todo_add", "todo_update", "todo_list"] {
-            assert!(registry.contains(alias), "{alias} should remain callable");
-        }
-
         let api_names = registry
             .to_api_tools()
             .into_iter()
@@ -1360,12 +1372,6 @@ mod tests {
             assert!(
                 api_names.iter().any(|name| name == canonical),
                 "{canonical} should stay model-visible"
-            );
-        }
-        for alias in ["todo_write", "todo_add", "todo_update", "todo_list"] {
-            assert!(
-                api_names.iter().all(|name| name != alias),
-                "{alias} should be hidden from the model catalog"
             );
         }
     }

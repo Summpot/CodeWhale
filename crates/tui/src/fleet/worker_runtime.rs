@@ -15,7 +15,8 @@
 
 use anyhow::{Result, bail};
 use codewhale_protocol::fleet::{
-    FleetResolvedRoute, FleetTaskSpec, FleetTaskWorkerProfile, FleetWorkerSpec,
+    FleetEffectivePermissions, FleetResolvedRoute, FleetTaskSpec, FleetTaskWorkerProfile,
+    FleetWorkerSpec,
 };
 
 use super::profile::AgentProfile;
@@ -112,41 +113,50 @@ pub fn fleet_task_to_worker_spec_with_profiles(
 /// ([`resolve_route_candidate`]) so the persisted route reflects the same
 /// resolution semantics the runtime would use, then records only non-sensitive
 /// shape (provider id/kind, model ids, protocol) combined with the already
-/// computed effective role/loadout intent. `source` is `"resolver"`.
+/// computed effective role/loadout/model-class intent. `source` is
+/// `"resolver"`.
 ///
 /// Honesty rules:
 /// - `canonical_model` stays `None` when the resolver could not pin one.
-/// - The provider comes from the resolver default (the worker profile carries
-///   no provider authority); a task-level `model` selector is forwarded as the
-///   model selector. No reasoning/pricing fields are fabricated.
+/// - The provider comes from the resolved agent profile's own explicit
+///   `provider` field when it has one (#4093) — a Fleet worker profile can be
+///   pinned to a route independent of the parent/current session provider.
+///   Absent an explicit pin, the worker profile carries no provider authority
+///   and resolution falls back to the existing default scope. Either way, the
+///   provider is NEVER inferred by sniffing a substring/prefix out of `model`
+///   (EPIC #2608: explicit config only). A task-level `model` selector is
+///   forwarded as the model selector. No reasoning/pricing fields are
+///   fabricated.
 ///
 /// Returns `None` (never a fabricated route) when resolution fails, so callers
 /// degrade gracefully without inventing detail.
 pub(crate) fn resolve_fleet_route(
     task_spec: &FleetTaskSpec,
     agent_profiles: &[AgentProfile],
+    session_model: Option<&str>,
 ) -> Option<FleetResolvedRoute> {
     let agent_profile = resolve_task_agent_profile(task_spec, agent_profiles)
         .ok()
         .flatten();
     let worker_profile = task_spec.worker.as_ref();
-    let role = effective_fleet_role(worker_profile, agent_profile);
-    let loadout = effective_fleet_loadout(worker_profile, agent_profile);
+    let (role, role_source) = effective_fleet_role_with_source(worker_profile, agent_profile);
+    let (loadout, loadout_source) =
+        effective_fleet_loadout_with_source(worker_profile, agent_profile);
+    let (model_class, model_class_source) = task_model_class_with_source(worker_profile);
 
-    // A task-level explicit model is the only model selector the spec carries
-    // with provider-resolution intent; otherwise let the resolver pick the
-    // provider default. Provider authority belongs to route resolution, so we
-    // do not infer a provider here.
-    let model_selector = worker_profile
-        .and_then(|worker| worker.model.as_deref())
-        .map(str::trim)
-        .filter(|model| !model.is_empty() && *model != "auto");
+    // Task/profile model pins are visible route intent; next the session
+    // route (the operator's model) applies as the run-level fallback; only
+    // then does the resolver pick the provider default.
+    let (model_selector, model_source) =
+        fleet_route_model_selector_with_source(worker_profile, agent_profile, session_model);
+    let model_selector = model_selector.as_deref();
 
-    // The worker profile carries no provider authority, so resolve within the
-    // default provider scope (mirrors `ProviderKind::default()`). The resolver
-    // is fully offline/hermetic and never reads secrets, env, or config.
-    let candidate =
-        resolve_route_candidate(ApiProvider::Deepseek, model_selector, None, None, None).ok()?;
+    // Resolve within the profile's own explicit provider scope when it has
+    // one (#4093); otherwise fall back to the existing default scope (mirrors
+    // `ProviderKind::default()`). The resolver is fully offline/hermetic and
+    // never reads secrets, env, or config.
+    let provider = effective_fleet_provider(agent_profile);
+    let candidate = resolve_route_candidate(provider, model_selector, None, None, None).ok()?;
 
     Some(FleetResolvedRoute {
         provider_id: candidate.provider_id.as_str().to_string(),
@@ -159,6 +169,21 @@ pub(crate) fn resolve_fleet_route(
         protocol: route_protocol_label(candidate.protocol).to_string(),
         role,
         loadout: loadout_intent_label(&loadout),
+        model_class,
+        model_route: Some(
+            model_route_label(&fleet_model_route_for_loadout(
+                model_selector.unwrap_or("auto"),
+                &loadout,
+            ))
+            .to_string(),
+        ),
+        // The offline resolver path does not know the concrete sub-agent
+        // thinking tier. Leave it absent rather than fabricating one.
+        reasoning_effort: None,
+        role_source: role_source.map(str::to_string),
+        loadout_source: loadout_source.map(str::to_string),
+        model_class_source: model_class_source.map(str::to_string),
+        model_source: Some(model_source.to_string()),
         source: "resolver".to_string(),
     })
 }
@@ -179,6 +204,15 @@ fn loadout_intent_label(loadout: &codewhale_config::FleetLoadout) -> Option<Stri
         None
     } else {
         Some(loadout.as_str().to_string())
+    }
+}
+
+fn model_route_label(route: &ModelRoute) -> &'static str {
+    match route {
+        ModelRoute::Inherit => "inherit",
+        ModelRoute::Faster => "faster",
+        ModelRoute::Auto => "auto",
+        ModelRoute::Fixed(_) => "fixed",
     }
 }
 
@@ -299,27 +333,67 @@ fn effective_fleet_role(
     worker_profile: Option<&FleetTaskWorkerProfile>,
     agent_profile: Option<&AgentProfile>,
 ) -> Option<String> {
+    effective_fleet_role_with_source(worker_profile, agent_profile).0
+}
+
+fn effective_fleet_role_with_source(
+    worker_profile: Option<&FleetTaskWorkerProfile>,
+    agent_profile: Option<&AgentProfile>,
+) -> (Option<String>, Option<&'static str>) {
     worker_profile
         .and_then(|worker| worker.role.as_deref())
         .map(str::trim)
         .filter(|role| !role.is_empty())
         .map(str::to_string)
-        .or_else(|| agent_profile.map(|profile| profile.profile.role.name.clone()))
+        .map(|role| (Some(role), Some("task.role")))
+        .unwrap_or_else(|| {
+            agent_profile
+                .map(|profile| {
+                    (
+                        Some(profile.profile.role.name.clone()),
+                        Some("agent_profile.role"),
+                    )
+                })
+                .unwrap_or((None, None))
+        })
 }
 
 fn effective_fleet_loadout(
     worker_profile: Option<&FleetTaskWorkerProfile>,
     agent_profile: Option<&AgentProfile>,
 ) -> codewhale_config::FleetLoadout {
-    worker_profile
-        .and_then(|worker| worker.model_class.as_deref().or(worker.loadout.as_deref()))
-        .map(codewhale_config::FleetLoadout::from_name)
-        .or_else(|| {
-            agent_profile
-                .map(|profile| profile.profile.loadout.clone())
-                .filter(|loadout| *loadout != codewhale_config::FleetLoadout::Inherit)
-        })
-        .unwrap_or_default()
+    effective_fleet_loadout_with_source(worker_profile, agent_profile).0
+}
+
+fn effective_fleet_loadout_with_source(
+    worker_profile: Option<&FleetTaskWorkerProfile>,
+    agent_profile: Option<&AgentProfile>,
+) -> (codewhale_config::FleetLoadout, Option<&'static str>) {
+    if let Some(model_class) = worker_profile
+        .and_then(|worker| worker.model_class.as_deref())
+        .and_then(non_empty_trimmed)
+    {
+        return (
+            codewhale_config::FleetLoadout::from_name(model_class),
+            Some("task.model_class"),
+        );
+    }
+    if let Some(loadout) = worker_profile
+        .and_then(|worker| worker.loadout.as_deref())
+        .and_then(non_empty_trimmed)
+    {
+        return (
+            codewhale_config::FleetLoadout::from_name(loadout),
+            Some("task.loadout"),
+        );
+    }
+    if let Some(loadout) = agent_profile
+        .map(|profile| profile.profile.loadout.clone())
+        .filter(|loadout| *loadout != codewhale_config::FleetLoadout::Inherit)
+    {
+        return (loadout, Some("agent_profile.loadout"));
+    }
+    (codewhale_config::FleetLoadout::Inherit, None)
 }
 
 fn effective_fleet_model(
@@ -327,20 +401,125 @@ fn effective_fleet_model(
     worker_profile: Option<&FleetTaskWorkerProfile>,
     agent_profile: Option<&AgentProfile>,
 ) -> String {
-    worker_profile
+    effective_fleet_model_with_source(run_model, worker_profile, agent_profile).0
+}
+
+fn effective_fleet_model_with_source(
+    run_model: &str,
+    worker_profile: Option<&FleetTaskWorkerProfile>,
+    agent_profile: Option<&AgentProfile>,
+) -> (String, &'static str) {
+    if let Some(model) = worker_profile
         .and_then(|worker| worker.model.as_deref())
         .and_then(non_empty_trimmed)
-        .or_else(|| {
-            agent_profile
-                .and_then(|profile| profile.profile.model.as_deref())
-                .and_then(non_empty_trimmed)
-        })
-        .unwrap_or(run_model)
-        .to_string()
+    {
+        return (model.to_string(), "task.model");
+    }
+    if let Some(model) = agent_profile
+        .and_then(|profile| profile.profile.model.as_deref())
+        .and_then(non_empty_trimmed)
+    {
+        return (model.to_string(), "agent_profile.model");
+    }
+    (run_model.to_string(), "run.model")
+}
+
+/// The provider this task's resolved route should use (#4093).
+///
+/// Only an explicit `provider` field on the resolved agent profile ever
+/// selects a provider here — EPIC #2608 forbids inferring one by sniffing a
+/// substring/prefix out of `model`. Absent an explicit pin (no profile, or a
+/// profile that never named a provider), the worker profile carries no
+/// provider authority and resolution falls back to the existing default
+/// scope, unchanged from prior behavior.
+fn effective_fleet_provider(agent_profile: Option<&AgentProfile>) -> ApiProvider {
+    explicit_fleet_provider(agent_profile).unwrap_or(ApiProvider::Deepseek)
+}
+
+/// The provider a resolved agent profile EXPLICITLY pins, if any (#4093).
+///
+/// Unlike [`effective_fleet_provider`], this returns `None` (never the DeepSeek
+/// default) when no profile names a provider, so the launch path can leave
+/// `--provider` off the worker argv and preserve today's behavior for
+/// profile-less / provider-less workers (they resolve their provider from
+/// their own session default). EPIC #2608: never inferred from `model`.
+///
+/// `pub(crate)` so the interactive-TUI in-process spawn path
+/// (`tools::subagent`) resolves the pinned provider from the SAME
+/// explicit-only source as the headless `codewhale exec` launch route (#4193),
+/// instead of re-deriving it and risking a second, divergent policy.
+pub(crate) fn explicit_fleet_provider(agent_profile: Option<&AgentProfile>) -> Option<ApiProvider> {
+    agent_profile
+        .and_then(|profile| profile.profile.provider.as_deref())
+        .and_then(ApiProvider::parse)
+}
+
+/// The route (model selector + optional explicit provider id) that a fleet
+/// worker's actual `codewhale exec` subprocess should launch on (#4093 AC #4).
+///
+/// This is the launch-side twin of [`resolve_fleet_route`] (the receipt): both
+/// read the worker's model from the same task/profile/run precedence
+/// ([`effective_fleet_model`]) and the provider from the same explicit-only
+/// source ([`explicit_fleet_provider`]), so a worker whose profile is pinned to
+/// provider B launches on provider B even when the parent session is on
+/// provider A.
+///
+/// - `model`: never empty in practice — falls back to `run_model` when neither
+///   the task nor the profile pins a model, matching pre-#4093 dispatch.
+/// - `provider`: `Some(canonical_id)` ONLY when the resolved agent profile
+///   explicitly pins a provider. `None` means "no provider authority" — the
+///   caller omits `--provider` and the worker keeps its own session default,
+///   preserving today's behavior for profile-less workers. The id is
+///   [`ApiProvider::as_str`], which round-trips through `ApiProvider::parse` on
+///   the worker's `--provider` flag.
+pub(crate) fn fleet_worker_launch_route(
+    task_spec: &FleetTaskSpec,
+    agent_profiles: &[AgentProfile],
+    run_model: &str,
+) -> (String, Option<String>) {
+    let agent_profile = resolve_task_agent_profile(task_spec, agent_profiles)
+        .ok()
+        .flatten();
+    let worker_profile = task_spec.worker.as_ref();
+    let model = effective_fleet_model(run_model, worker_profile, agent_profile);
+    let provider =
+        explicit_fleet_provider(agent_profile).map(|provider| provider.as_str().to_string());
+    (model, provider)
+}
+
+fn task_model_class_with_source(
+    worker_profile: Option<&FleetTaskWorkerProfile>,
+) -> (Option<String>, Option<&'static str>) {
+    worker_profile
+        .and_then(|worker| worker.model_class.as_deref())
+        .and_then(non_empty_trimmed)
+        .map(|model_class| (Some(model_class.to_string()), Some("task.model_class")))
+        .unwrap_or((None, None))
+}
+
+fn fleet_route_model_selector_with_source(
+    worker_profile: Option<&FleetTaskWorkerProfile>,
+    agent_profile: Option<&AgentProfile>,
+    session_model: Option<&str>,
+) -> (Option<String>, &'static str) {
+    // The session route (operator model) is the run-level fallback, matching
+    // the dispatch path where FleetManager::run_model() feeds
+    // `effective_fleet_model_with_source`. Empty/"auto" stays resolver-default.
+    let run_model = session_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or("auto");
+    let (model, source) =
+        effective_fleet_model_with_source(run_model, worker_profile, agent_profile);
+    if model.trim().is_empty() || model.eq_ignore_ascii_case("auto") {
+        (None, "resolver.default")
+    } else {
+        (Some(model), source)
+    }
 }
 
 /// Map a fleet role name to a `SubAgentType`. Unknown roles default to `General`.
-fn fleet_role_to_agent_type(role: Option<&str>) -> SubAgentType {
+pub(crate) fn fleet_role_to_agent_type(role: Option<&str>) -> SubAgentType {
     match role {
         Some("smoke-runner") => SubAgentType::Verifier,
         Some("scout") => SubAgentType::Explore,
@@ -350,11 +529,32 @@ fn fleet_role_to_agent_type(role: Option<&str>) -> SubAgentType {
         Some("verifier") | Some("tester") => SubAgentType::Verifier,
         Some("planner") => SubAgentType::Plan,
         Some("explorer") => SubAgentType::Explore,
+        // Coordination happens through delegation, which needs the full
+        // General surface (#fleet-roster cutover (v0.8.67)). The operator is
+        // the helm of the whole operation (it assigns managers to workflows);
+        // the manager is the middle manager of one workflow. Both coordinate,
+        // so both get the General surface — explicitly, not by fall-through.
+        Some("manager") | Some("coordinator") | Some("operator") => SubAgentType::General,
+        // Synthesis is read-only, no shell: it must never fall through to
+        // General's full-write posture (#fleet-roster cutover (v0.8.67)).
+        Some("synthesizer") | Some("summarizer") | Some("reducer") => SubAgentType::Plan,
         Some("general") | None => SubAgentType::General,
         Some(other) => {
             // Try parsing as a SubAgentType directly
             SubAgentType::from_str(other).unwrap_or(SubAgentType::General)
         }
+    }
+}
+
+/// Runtime agent type for a roster member: role name first, falling back to
+/// the org-chart slot name when the role name is empty (#fleet-roster cutover
+/// (v0.8.67)).
+pub(crate) fn roster_member_agent_type(member: &AgentProfile) -> SubAgentType {
+    let role_name = member.profile.role.name.trim();
+    if role_name.is_empty() {
+        fleet_role_to_agent_type(Some(member.profile.slot.as_str()))
+    } else {
+        fleet_role_to_agent_type(Some(role_name))
     }
 }
 
@@ -412,7 +612,7 @@ fn non_empty_trimmed(value: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-fn fleet_model_route_for_loadout(
+pub(crate) fn fleet_model_route_for_loadout(
     model: &str,
     loadout: &codewhale_config::FleetLoadout,
 ) -> ModelRoute {
@@ -423,13 +623,7 @@ fn fleet_model_route_for_loadout(
     match loadout {
         codewhale_config::FleetLoadout::Inherit => ModelRoute::Inherit,
         codewhale_config::FleetLoadout::Fast => ModelRoute::Faster,
-        codewhale_config::FleetLoadout::Strong
-        | codewhale_config::FleetLoadout::Balanced
-        | codewhale_config::FleetLoadout::DeepReasoning
-        | codewhale_config::FleetLoadout::Code
-        | codewhale_config::FleetLoadout::Review
-        | codewhale_config::FleetLoadout::ToolHeavy
-        | codewhale_config::FleetLoadout::Custom(_) => ModelRoute::Auto,
+        codewhale_config::FleetLoadout::Custom(_) => ModelRoute::Auto,
     }
 }
 
@@ -469,6 +663,68 @@ pub fn apply_exec_hardening(
     }
 
     spec
+}
+
+pub(crate) fn fleet_effective_permissions_from_worker_spec(
+    spec: &AgentWorkerSpec,
+) -> FleetEffectivePermissions {
+    fleet_effective_permissions_from_runtime_profile(&spec.runtime_profile, None)
+}
+
+pub(crate) fn fleet_effective_permissions_for_task(
+    task_spec: &FleetTaskSpec,
+    agent_profiles: &[AgentProfile],
+    spec: &AgentWorkerSpec,
+) -> FleetEffectivePermissions {
+    let agent_profile = resolve_task_agent_profile(task_spec, agent_profiles)
+        .ok()
+        .flatten();
+    fleet_effective_permissions_from_runtime_profile(&spec.runtime_profile, agent_profile)
+}
+
+fn fleet_effective_permissions_from_runtime_profile(
+    profile: &WorkerRuntimeProfile,
+    agent_profile: Option<&AgentProfile>,
+) -> FleetEffectivePermissions {
+    FleetEffectivePermissions {
+        write: profile.permissions.write,
+        network: profile.permissions.network,
+        shell: shell_policy_label(profile.shell).to_string(),
+        tool_scope: tool_scope_label(&profile.tools).to_string(),
+        tools: match &profile.tools {
+            ToolScope::Inherit => Vec::new(),
+            ToolScope::Explicit(tools) => tools.clone(),
+        },
+        background: profile.background,
+        max_spawn_depth: profile.max_spawn_depth,
+        profile_id: agent_profile.map(|profile| profile.id.clone()),
+        profile_origin: agent_profile
+            .map(|profile| profile_origin_label(profile.origin).to_string()),
+        source: "worker_runtime_profile".to_string(),
+    }
+}
+
+fn profile_origin_label(origin: crate::fleet::roster::ProfileOrigin) -> &'static str {
+    match origin {
+        crate::fleet::roster::ProfileOrigin::BuiltIn => "built_in",
+        crate::fleet::roster::ProfileOrigin::Config => "config",
+        crate::fleet::roster::ProfileOrigin::Workspace => "workspace",
+    }
+}
+
+fn shell_policy_label(shell: crate::worker_profile::ShellPolicy) -> &'static str {
+    match shell {
+        crate::worker_profile::ShellPolicy::None => "none",
+        crate::worker_profile::ShellPolicy::ReadOnly => "read_only",
+        crate::worker_profile::ShellPolicy::Full => "full",
+    }
+}
+
+fn tool_scope_label(tools: &ToolScope) -> &'static str {
+    match tools {
+        ToolScope::Inherit => "inherit",
+        ToolScope::Explicit(_) => "explicit",
+    }
 }
 
 /// Filter a tool profile against allowed/disallowed lists.
@@ -566,10 +822,12 @@ mod tests {
                 },
                 loadout,
                 model: None,
+                provider: None,
                 permissions: codewhale_config::FleetProfilePermissions::default(),
                 delegation: codewhale_config::FleetDelegationHints::default(),
             },
             source: std::path::PathBuf::from(format!("{id}.toml")),
+            origin: crate::fleet::roster::ProfileOrigin::Workspace,
         }
     }
 
@@ -611,6 +869,66 @@ mod tests {
     }
 
     #[test]
+    fn fleet_role_manager_and_coordinator_map_to_general() {
+        assert_eq!(
+            fleet_role_to_agent_type(Some("manager")),
+            SubAgentType::General
+        );
+        assert_eq!(
+            fleet_role_to_agent_type(Some("coordinator")),
+            SubAgentType::General
+        );
+    }
+
+    #[test]
+    fn fleet_role_operator_maps_to_general_explicitly() {
+        // The operator coordinates the whole operation (assigns managers to
+        // workflows), so it needs the full General surface — by an explicit
+        // match arm, not the unknown-role fall-through.
+        assert_eq!(
+            fleet_role_to_agent_type(Some("operator")),
+            SubAgentType::General
+        );
+    }
+
+    #[test]
+    fn fleet_role_synthesizer_family_maps_to_read_only_plan() {
+        // A synthesizer must never fall through to General's full-write
+        // posture; Plan is read-only with no shell.
+        for role in ["synthesizer", "summarizer", "reducer"] {
+            assert_eq!(
+                fleet_role_to_agent_type(Some(role)),
+                SubAgentType::Plan,
+                "role {role}"
+            );
+        }
+    }
+
+    #[test]
+    fn roster_member_agent_type_uses_role_then_slot() {
+        let member = agent_profile(
+            "synthesizer",
+            "synthesizer",
+            None,
+            codewhale_config::FleetLoadout::Fast,
+        );
+        assert_eq!(roster_member_agent_type(&member), SubAgentType::Plan);
+
+        let mut slot_only = agent_profile(
+            "custom-summarizer",
+            "summarizer",
+            None,
+            codewhale_config::FleetLoadout::Inherit,
+        );
+        slot_only.profile.role.name = String::new();
+        assert_eq!(
+            slot_only.profile.slot,
+            codewhale_config::FleetSlot::Summarizer
+        );
+        assert_eq!(roster_member_agent_type(&slot_only), SubAgentType::Plan);
+    }
+
+    #[test]
     fn unknown_role_maps_to_general() {
         assert_eq!(
             fleet_role_to_agent_type(Some("nonexistent-role")),
@@ -631,7 +949,8 @@ mod tests {
                 vec!["read_file"],
             )),
         );
-        let route = resolve_fleet_route(&task, &[]).expect("default route should resolve offline");
+        let route =
+            resolve_fleet_route(&task, &[], None).expect("default route should resolve offline");
 
         // Honest, non-empty route shape from the resolver.
         assert!(!route.provider_id.is_empty());
@@ -640,6 +959,13 @@ mod tests {
         assert_eq!(route.protocol, "chat_completions");
         assert_eq!(route.role.as_deref(), Some("builder"));
         assert_eq!(route.loadout.as_deref(), Some("fast"));
+        assert_eq!(route.model_class, None);
+        assert_eq!(route.model_route.as_deref(), Some("faster"));
+        assert_eq!(route.reasoning_effort, None);
+        assert_eq!(route.role_source.as_deref(), Some("task.role"));
+        assert_eq!(route.loadout_source.as_deref(), Some("task.loadout"));
+        assert_eq!(route.model_class_source, None);
+        assert_eq!(route.model_source.as_deref(), Some("resolver.default"));
         assert_eq!(route.source, "resolver");
 
         // No-secrets: the serialized snapshot carries no credential markers.
@@ -682,9 +1008,50 @@ mod tests {
                 vec!["read_file"],
             )),
         );
-        let route = resolve_fleet_route(&task, &[]).expect("route should resolve");
+        let route = resolve_fleet_route(&task, &[], None).expect("route should resolve");
         assert_eq!(route.role.as_deref(), Some("scout"));
         assert!(route.loadout.is_none());
+        assert_eq!(route.loadout_source, None);
+        assert_eq!(route.model_route.as_deref(), Some("inherit"));
+        assert_eq!(route.model_source.as_deref(), Some("resolver.default"));
+    }
+
+    #[test]
+    fn resolve_fleet_route_records_model_class_and_profile_sources() {
+        let mut profile = agent_profile(
+            "audit",
+            "reviewer",
+            None,
+            codewhale_config::FleetLoadout::Inherit,
+        );
+        profile.profile.model = Some("deepseek-v4-flash".to_string());
+        let task = fleet_task(
+            "route-profile",
+            Some(worker_profile(
+                Some("audit"),
+                None,
+                None,
+                Some("balanced"),
+                None,
+                vec!["read_file"],
+            )),
+        );
+        let route =
+            resolve_fleet_route(&task, &[profile], None).expect("profile route should resolve");
+
+        assert_eq!(route.role.as_deref(), Some("reviewer"));
+        assert_eq!(route.role_source.as_deref(), Some("agent_profile.role"));
+        assert_eq!(route.loadout.as_deref(), Some("balanced"));
+        assert_eq!(route.loadout_source.as_deref(), Some("task.model_class"));
+        assert_eq!(route.model_class.as_deref(), Some("balanced"));
+        assert_eq!(
+            route.model_class_source.as_deref(),
+            Some("task.model_class")
+        );
+        assert_eq!(route.model_source.as_deref(), Some("agent_profile.model"));
+        assert_eq!(route.model_route.as_deref(), Some("fixed"));
+        assert_eq!(route.wire_model_id, "deepseek-v4-flash");
+        assert_eq!(route.reasoning_effort, None);
     }
 
     #[test]
@@ -763,7 +1130,7 @@ mod tests {
             "reviewer",
             "reviewer",
             Some("Focus on regressions and missing tests."),
-            codewhale_config::FleetLoadout::Balanced,
+            codewhale_config::FleetLoadout::Custom("balanced".to_string()),
         );
         let task = fleet_task(
             "review",
@@ -786,6 +1153,7 @@ mod tests {
             max_concurrent_tasks: None,
         };
 
+        let profiles = vec![profile];
         let spec = fleet_task_to_worker_spec_with_profiles(
             "worker-1",
             "run-1",
@@ -793,7 +1161,7 @@ mod tests {
             &worker,
             "auto",
             std::path::Path::new("/tmp"),
-            &[profile],
+            &profiles,
             None,
         )
         .unwrap();
@@ -811,6 +1179,279 @@ mod tests {
         );
         assert_eq!(spec.runtime_profile.role, SubAgentType::Review);
         assert_eq!(spec.runtime_profile.model, ModelRoute::Auto);
+
+        let permissions = fleet_effective_permissions_for_task(&task, &profiles, &spec);
+        assert_eq!(permissions.profile_id.as_deref(), Some("reviewer"));
+        assert_eq!(permissions.profile_origin.as_deref(), Some("workspace"));
+        assert_eq!(permissions.source, "worker_runtime_profile");
+    }
+
+    #[test]
+    fn fleet_worker_spec_inherits_session_run_model_when_unpinned() {
+        // No task-level model, no roster profile model: the run model (the
+        // session route — the operator's model) must flow through to the
+        // worker spec, so the model picked in /model is the model that runs.
+        let task = fleet_task("build", None);
+        let worker = FleetWorkerSpec {
+            id: "worker-1".to_string(),
+            name: "Worker".to_string(),
+            host: FleetHostSpec::Local,
+            trust_level: None,
+            labels: Default::default(),
+            capabilities: vec![],
+            max_concurrent_tasks: None,
+        };
+
+        let spec = fleet_task_to_worker_spec_with_profiles(
+            "worker-1",
+            "run-1",
+            &task,
+            &worker,
+            "deepseek-v4-flash",
+            std::path::Path::new("/tmp"),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(spec.model, "deepseek-v4-flash");
+
+        // Legacy headless callers with no session still get the auto sentinel.
+        let legacy = fleet_task_to_worker_spec_with_profiles(
+            "worker-1",
+            "run-1",
+            &task,
+            &worker,
+            "auto",
+            std::path::Path::new("/tmp"),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(legacy.model, "auto");
+    }
+
+    #[test]
+    fn resolve_fleet_route_uses_session_model_as_run_fallback() {
+        // Route receipts must agree with dispatch: when neither the task nor
+        // a roster profile pins a model, the session route is the run-level
+        // fallback and the receipt records it came from `run.model`.
+        let task = fleet_task("route-session", None);
+        let route = resolve_fleet_route(&task, &[], Some("deepseek-v4-flash"))
+            .expect("session-model route should resolve offline");
+        assert_eq!(route.model_source.as_deref(), Some("run.model"));
+        assert_eq!(route.wire_model_id, "deepseek-v4-flash");
+
+        // Task/profile pins still win over the session route.
+        let mut profile = agent_profile(
+            "audit",
+            "reviewer",
+            None,
+            codewhale_config::FleetLoadout::Inherit,
+        );
+        profile.profile.model = Some("deepseek-v4-pro".to_string());
+        let pinned_task = fleet_task(
+            "route-pinned",
+            Some(worker_profile(
+                Some("audit"),
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            )),
+        );
+        let pinned = resolve_fleet_route(&pinned_task, &[profile], Some("deepseek-v4-flash"))
+            .expect("pinned route should resolve");
+        assert_eq!(pinned.model_source.as_deref(), Some("agent_profile.model"));
+        assert_eq!(pinned.wire_model_id, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn resolve_fleet_route_honors_explicit_profile_provider_not_the_default() {
+        // EPIC #2608 / #4093: the resolved provider must come ONLY from the
+        // profile's explicit `provider` field — never inferred from a
+        // provider-shaped substring in `model`, and never the parent/session
+        // route's provider. `deepseek-v4-flash` is deliberately DeepSeek-shaped
+        // while the profile pins `openrouter`.
+        let mut profile = agent_profile(
+            "cross-provider",
+            "scout",
+            None,
+            codewhale_config::FleetLoadout::Inherit,
+        );
+        profile.profile.model = Some("deepseek-v4-flash".to_string());
+        profile.profile.provider = Some("openrouter".to_string());
+        let task = fleet_task(
+            "route-cross-provider",
+            Some(worker_profile(
+                Some("cross-provider"),
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            )),
+        );
+
+        // The "parent"/session route is a completely different provider's
+        // model, proving the resolved route does not fall back to it.
+        let route = resolve_fleet_route(&task, &[profile], Some("deepseek-v4-pro"))
+            .expect("cross-provider profile route should resolve");
+
+        assert_eq!(route.model_source.as_deref(), Some("agent_profile.model"));
+
+        // Resolving `openrouter` directly with the same selector is the
+        // ground truth for what this route SHOULD produce — comparing
+        // against it (rather than hardcoding a wire id) proves the profile's
+        // provider actually drove resolution, whatever wire id/aggregator
+        // mapping the resolver's catalog assigns.
+        let openrouter_candidate = resolve_route_candidate(
+            ApiProvider::Openrouter,
+            Some("deepseek-v4-flash"),
+            None,
+            None,
+            None,
+        )
+        .expect("openrouter should resolve the pinned model directly");
+        assert_eq!(
+            route.wire_model_id,
+            openrouter_candidate.wire_model_id.as_str()
+        );
+        assert_eq!(route.provider_id, openrouter_candidate.provider_id.as_str());
+        assert_eq!(
+            route.provider_kind,
+            openrouter_candidate.provider_kind.as_str()
+        );
+        // Differs from DeepSeek — the pre-#4093 hardcoded default AND the
+        // parent/session's provider.
+        assert_ne!(route.provider_id, "deepseek");
+    }
+
+    #[test]
+    fn cross_provider_profile_saves_reloads_and_resolves_to_its_own_provider() {
+        // Required cross-provider save/load/launch coverage for #4093: create
+        // a Fleet profile whose provider differs from the parent/session
+        // provider, save it to a real TOML file, reload it from disk through
+        // the same loader Fleet uses, then resolve its route and confirm the
+        // resolved provider+model are the SAVED ones — never the parent's.
+        let draft = crate::fleet::profile::FleetProfileDraft {
+            id: "scout-openrouter".to_string(),
+            display_name: Some("Scout".to_string()),
+            description: Some("Cross-provider scout profile.".to_string()),
+            role_hint: "scout".to_string(),
+            model_class_hint: None,
+            model: Some("deepseek-v4-flash".to_string()),
+            provider: Some("openrouter".to_string()),
+            instructions: None,
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(draft.file_name()), draft.render_toml()).unwrap();
+        let profiles = crate::fleet::profile::load_agent_profiles_from_dir(dir.path())
+            .expect("rendered profile TOML loads");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].profile.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            profiles[0].profile.model.as_deref(),
+            Some("deepseek-v4-flash")
+        );
+
+        let task = fleet_task(
+            "route-saved-profile",
+            Some(worker_profile(
+                Some("scout-openrouter"),
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            )),
+        );
+
+        // "Parent"/session route: a different provider's model entirely, so a
+        // fallback to it would be an obvious, loud test failure.
+        let route = resolve_fleet_route(&task, &profiles, Some("deepseek-v4-pro"))
+            .expect("saved cross-provider profile route should resolve");
+
+        let openrouter_candidate = resolve_route_candidate(
+            ApiProvider::Openrouter,
+            Some("deepseek-v4-flash"),
+            None,
+            None,
+            None,
+        )
+        .expect("openrouter should resolve the saved model directly");
+        assert_eq!(
+            route.wire_model_id,
+            openrouter_candidate.wire_model_id.as_str()
+        );
+        assert_eq!(route.provider_id, openrouter_candidate.provider_id.as_str());
+        assert_ne!(route.provider_id, "deepseek");
+    }
+
+    #[test]
+    fn fleet_worker_launch_route_is_explicit_provider_only() {
+        // The LAUNCH resolver (twin of the receipt) must emit a provider ONLY
+        // when the profile explicitly pins one, and NEVER infer it from a
+        // provider-shaped model id (EPIC #2608).
+
+        // 1) Explicit cross-provider pin: model + provider both come from the
+        //    profile, not the parent/session model.
+        let mut pinned = agent_profile(
+            "cross",
+            "scout",
+            None,
+            codewhale_config::FleetLoadout::Inherit,
+        );
+        pinned.profile.model = Some("glm-5.2".to_string());
+        pinned.profile.provider = Some("openrouter".to_string());
+        let pinned_task = fleet_task(
+            "launch-pinned",
+            Some(worker_profile(
+                Some("cross"),
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            )),
+        );
+        let (model, provider) =
+            fleet_worker_launch_route(&pinned_task, &[pinned], "deepseek-v4-pro");
+        assert_eq!(model, "glm-5.2");
+        assert_eq!(provider.as_deref(), Some("openrouter"));
+
+        // 2) A DeepSeek-shaped model with NO explicit provider must NOT infer a
+        //    provider — provider stays None so the worker keeps its own session
+        //    default, and no `--provider` is emitted.
+        let mut model_only = agent_profile(
+            "modelonly",
+            "scout",
+            None,
+            codewhale_config::FleetLoadout::Inherit,
+        );
+        model_only.profile.model = Some("deepseek-v4-flash".to_string());
+        let model_only_task = fleet_task(
+            "launch-model-only",
+            Some(worker_profile(
+                Some("modelonly"),
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            )),
+        );
+        let (model, provider) =
+            fleet_worker_launch_route(&model_only_task, &[model_only], "deepseek-v4-pro");
+        assert_eq!(model, "deepseek-v4-flash");
+        assert_eq!(provider, None);
+
+        // 3) No profile at all: run-level model, no provider (unchanged).
+        let bare = fleet_task("launch-bare", None);
+        let (model, provider) = fleet_worker_launch_route(&bare, &[], "deepseek-v4-pro");
+        assert_eq!(model, "deepseek-v4-pro");
+        assert_eq!(provider, None);
     }
 
     #[test]
@@ -842,7 +1483,7 @@ mod tests {
             "reviewer",
             "reviewer",
             Some("Focus on regressions and missing tests."),
-            codewhale_config::FleetLoadout::Balanced,
+            codewhale_config::FleetLoadout::Inherit,
         );
         profile.profile.model = Some("glm-5.2".to_string());
         let worker = FleetWorkerSpec {
@@ -963,6 +1604,16 @@ mod tests {
         );
         assert_eq!(spec.runtime_profile.model, ModelRoute::Faster);
         assert_eq!(spec.max_spawn_depth, 1);
+
+        let permissions = fleet_effective_permissions_from_worker_spec(&spec);
+        assert!(!permissions.write);
+        assert!(!permissions.network);
+        assert_eq!(permissions.shell, "read_only");
+        assert_eq!(permissions.tool_scope, "explicit");
+        assert_eq!(permissions.tools, vec!["read_file".to_string()]);
+        assert!(permissions.background);
+        assert_eq!(permissions.max_spawn_depth, 1);
+        assert_eq!(permissions.source, "worker_runtime_profile");
     }
 
     #[test]
@@ -1166,14 +1817,17 @@ mod tests {
             ModelRoute::Inherit,
         );
         assert_eq!(
-            fleet_model_route_for_loadout("auto", &codewhale_config::FleetLoadout::Strong),
+            fleet_model_route_for_loadout(
+                "auto",
+                &codewhale_config::FleetLoadout::Custom("strong".to_string())
+            ),
             ModelRoute::Auto,
         );
         // An explicit model always pins to a Fixed route, regardless of loadout.
         assert_eq!(
             fleet_model_route_for_loadout(
                 "deepseek-v4-flash",
-                &codewhale_config::FleetLoadout::Strong
+                &codewhale_config::FleetLoadout::Custom("strong".to_string())
             ),
             ModelRoute::Fixed("deepseek-v4-flash".to_string()),
         );

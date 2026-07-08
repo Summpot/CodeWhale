@@ -82,6 +82,83 @@ fn render_spillover_annotation_omitted_in_transcript_mode() {
 }
 
 #[test]
+fn workflow_tool_renders_run_card_instead_of_generic_oneliner() {
+    let output = serde_json::json!({
+        "run_id": "workflow_2400c600",
+        "status": "completed",
+        "workflow_goal": "audit the FLEET and WORKFLOW docs",
+        "child_ids": ["a1", "a2", "a3"],
+        "progress": ["phase: Scan", "log: 3 findings"],
+        "schema_errors": [],
+    })
+    .to_string();
+    let cell = GenericToolCell {
+        name: "workflow".to_string(),
+        status: ToolStatus::Success,
+        input_summary: Some("action: run".to_string()),
+        output: Some(output),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+    let joined: String = cell
+        .lines_with_mode(120, true, super::RenderMode::Live)
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .collect();
+    assert!(joined.contains("workflow_2400c600"), "run_id: {joined:?}");
+    // Copy dedupe (Wave 5c #7): the header owns the lifecycle label; the body
+    // no longer repeats it as a `status:` KV row.
+    assert!(joined.contains("done"), "header lifecycle: {joined:?}");
+    assert!(
+        !joined.contains("status:"),
+        "body must not repeat the header lifecycle: {joined:?}"
+    );
+    assert!(joined.contains("audit the FLEET"), "goal: {joined:?}");
+    assert!(joined.contains("children: 3"), "child count: {joined:?}");
+    assert!(
+        joined.contains("log: 3 findings"),
+        "last progress: {joined:?}"
+    );
+}
+
+#[test]
+fn workflow_tool_renders_status_list_card() {
+    let output = serde_json::json!({
+        "action": "status",
+        "count": 2,
+        "runs": [
+            {"run_id": "workflow_aaa", "status": "running", "child_count": 4},
+            {"run_id": "workflow_bbb", "status": "completed", "child_count": 1},
+        ],
+    })
+    .to_string();
+    let cell = GenericToolCell {
+        name: "workflow".to_string(),
+        status: ToolStatus::Success,
+        input_summary: Some("action: status".to_string()),
+        output: Some(output),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+    let joined: String = cell
+        .lines_with_mode(120, true, super::RenderMode::Live)
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .collect();
+    assert!(joined.contains("2 run(s)"), "count header: {joined:?}");
+    assert!(joined.contains("workflow_aaa"), "first run row: {joined:?}");
+    assert!(joined.contains("running"), "run status: {joined:?}");
+    assert!(
+        joined.contains("workflow_bbb"),
+        "second run row: {joined:?}"
+    );
+}
+
+#[test]
 fn render_spillover_annotation_omitted_when_no_path_set() {
     // The common case: most tool results don't trigger spillover.
     let cell = GenericToolCell {
@@ -305,10 +382,7 @@ fn agent_renders_single_compact_line_in_live_mode() {
 }
 
 #[test]
-fn agent_pending_render_uses_placeholder_id() {
-    // No output yet → use the … placeholder so the user still sees a
-    // header line during the brief gap between tool-call-started and
-    // the spawn returning the agent_id.
+fn agent_pending_render_uses_fallback_token() {
     let cell = GenericToolCell {
         name: "agent".to_string(),
         status: ToolStatus::Running,
@@ -319,10 +393,13 @@ fn agent_pending_render_uses_placeholder_id() {
         output_summary: None,
         is_diff: false,
     };
-    let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
-    assert_eq!(lines.len(), 1);
-    let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-    assert!(rendered.contains('\u{2026}'), "{rendered:?}"); // …
+    let rendered: String = cell.lines_with_mode(80, true, super::RenderMode::Live)[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(rendered.contains("do-thing"), "{rendered:?}");
+    assert!(!rendered.contains('\u{2026}'), "{rendered:?}");
 }
 
 #[test]
@@ -361,6 +438,67 @@ fn other_tools_are_unaffected_by_agent_compact_path() {
     };
     let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
     assert_eq!(lines.len(), 1, "live tools should use compact rows");
+}
+
+#[test]
+fn agent_compact_header_omits_unknown_child_fallback() {
+    // #4148: an agent whose identity can't be resolved must not leak the raw
+    // internal "unknown child" token into the default transcript.
+    let cell = GenericToolCell {
+        name: "agent".to_string(),
+        status: ToolStatus::Running,
+        input_summary: Some("agent_type: delegate".to_string()),
+        output: None,
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+    let rendered: String = cell.lines_with_mode(80, true, super::RenderMode::Live)[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(
+        !rendered.contains("unknown child"),
+        "raw fallback token must not leak: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("subagent"),
+        "friendly fallback label should be shown: {rendered:?}"
+    );
+}
+
+#[test]
+fn agent_compact_header_does_not_duplicate_delegate_verb() {
+    // #4148: when the resolved identity collapses to the "delegate" verb, the
+    // compact header must not render a redundant "delegate · delegate".
+    let cell = GenericToolCell {
+        name: "agent".to_string(),
+        status: ToolStatus::Running,
+        input_summary: Some("role: delegate".to_string()),
+        output: None,
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+    let rendered: String = cell.lines_with_mode(80, true, super::RenderMode::Live)[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(
+        !rendered.contains("delegate delegate"),
+        "no adjacent duplicate: {rendered:?}"
+    );
+    // The verb sits before the status; the redundant summary tail is dropped,
+    // so "delegate" appears exactly once.
+    assert_eq!(
+        rendered.matches("delegate").count(),
+        1,
+        "verb must not be echoed by the summary: {rendered:?}"
+    );
 }
 
 // ---- #403 concise todo / checklist update rendering ----
@@ -1069,8 +1207,8 @@ fn assistant_glyph_holds_full_brightness_when_idle() {
     // source sky — pulse only fires when actively streaming.
     let idle = assistant_label_style_for(false, false);
     let low_motion = assistant_label_style_for(true, true);
-    assert_eq!(idle.fg, Some(palette::DEEPSEEK_SKY));
-    assert_eq!(low_motion.fg, Some(palette::DEEPSEEK_SKY));
+    assert_eq!(idle.fg, Some(palette::WHALE_INFO));
+    assert_eq!(low_motion.fg, Some(palette::WHALE_INFO));
 }
 
 #[test]
@@ -1084,8 +1222,8 @@ fn assistant_glyph_pulses_when_streaming_and_motion_allowed() {
     let mut saw_dimmed = false;
     for _ in 0..50 {
         if let Some(Color::Rgb(_, _, b)) = assistant_label_style_for(true, false).fg {
-            let Color::Rgb(_, _, src_b) = palette::DEEPSEEK_SKY else {
-                panic!("DEEPSEEK_SKY must be RGB");
+            let Color::Rgb(_, _, src_b) = palette::WHALE_INFO else {
+                panic!("WHALE_INFO must be RGB");
             };
             if b < src_b {
                 saw_dimmed = true;
@@ -1161,8 +1299,40 @@ fn exec_cell_header_includes_compact_command_summary() {
         .collect::<String>();
     assert!(visible.contains("run running"));
     assert!(
-        visible.contains("cargo test --workspace --all-features"),
-        "header should expose command target: {visible:?}"
+        visible.contains("Ctrl+B"),
+        "foreground wait header should expose Ctrl+B hint, not command: {visible:?}"
+    );
+    assert!(
+        !visible.contains("cargo test"),
+        "foreground wait live header must not repeat command target: {visible:?}"
+    );
+
+    let transcript_visible: String = HistoryCell::Tool(ToolCell::Exec(ExecCell {
+        command: "cargo test --workspace --all-features".to_string(),
+        status: ToolStatus::Running,
+        output: None,
+        live_output: None,
+        shell_task_id: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        started_at: None,
+        duration_ms: None,
+        source: ExecSource::Assistant,
+        interaction: None,
+        output_summary: None,
+    }))
+    .transcript_lines(80)[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        transcript_visible.contains("Ctrl+B"),
+        "transcript compact wait should expose Ctrl+B hint: {transcript_visible:?}"
+    );
+    assert!(
+        !transcript_visible.contains("cargo test --workspace --all-features"),
+        "transcript compact wait must not repeat command target: {transcript_visible:?}"
     );
 }
 
@@ -1221,6 +1391,56 @@ fn generic_tool_cell_renders_rlm_with_rlm_label_not_swarm() {
     assert!(
         !header_visible.contains("swarm"),
         "RLM card must not use removed swarm wording: {header_visible:?}"
+    );
+}
+
+#[test]
+fn exploring_card_search_reads_as_find_not_read() {
+    // #4145: a completed grep grouped under the exploration card must not
+    // render `read done · Searching …`; the header verb has to agree with the
+    // `Searching for …` label.
+    let cell = super::ExploringCell {
+        entries: vec![super::ExploringEntry {
+            label: "Searching for `TranscriptScroll`".to_string(),
+            status: ToolStatus::Success,
+        }],
+    };
+    let header: String = cell.lines_with_motion(80, true)[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        header.contains("find done"),
+        "search card header should read `find done`: {header:?}"
+    );
+    assert!(
+        !header.contains("read done"),
+        "search card must not pair `read done` with a search label: {header:?}"
+    );
+    assert!(
+        header.contains("Searching for `TranscriptScroll`"),
+        "search label should remain intact: {header:?}"
+    );
+}
+
+#[test]
+fn exploring_card_read_keeps_read_verb() {
+    // The fix only re-verbs search-only cards — a plain read stays `read`.
+    let cell = super::ExploringCell {
+        entries: vec![super::ExploringEntry {
+            label: "Reading src/foo.rs".to_string(),
+            status: ToolStatus::Success,
+        }],
+    };
+    let header: String = cell.lines_with_motion(80, true)[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        header.contains("read done"),
+        "read card header should read `read done`: {header:?}"
     );
 }
 
@@ -1538,12 +1758,26 @@ fn exec_cell_renders_live_shell_output_before_final_output() {
         output_summary: None,
     };
 
-    let text = lines_text(&cell.lines_with_motion(80, true));
+    let live_text = lines_text(&cell.lines_with_motion(80, true));
+    assert!(
+        !live_text.contains("running line 1"),
+        "foreground shell live output belongs in sidebar/jobs, not main transcript: {live_text}"
+    );
+    assert!(
+        live_text.contains("Ctrl+B"),
+        "compact foreground wait must keep Ctrl+B hint: {live_text}"
+    );
+    assert!(!live_text.contains("command:"));
+    assert!(!live_text.contains("Ctrl+B backgrounds this command"));
+    assert!(!live_text.contains("Ctrl+B moves this shell wait to /jobs"));
 
-    assert!(text.contains("running line 1"));
-    assert!(text.contains("running line 2"));
-    assert!(!text.contains("Ctrl+B backgrounds this command"));
-    assert!(!text.contains("Ctrl+B moves this shell wait to /jobs"));
+    let transcript_text = lines_text(&HistoryCell::Tool(ToolCell::Exec(cell)).transcript_lines(80));
+    assert!(
+        !transcript_text.contains("running line 1"),
+        "foreground shell live output belongs in sidebar/jobs, not transcript: {transcript_text}"
+    );
+    assert!(!transcript_text.contains("command:"));
+    assert!(transcript_text.contains("Ctrl+B"));
 }
 
 #[test]
@@ -1668,6 +1902,62 @@ fn completed_short_thinking_without_summary_stays_visible_in_live_view() {
     assert!(
         !live_text.contains("Full reasoning in Ctrl+O"),
         "complete short reasoning should not need the detail affordance: {live_text}"
+    );
+}
+
+#[test]
+fn completed_reasoning_receipt_hides_internal_function_names_until_expanded() {
+    // #4146/#4148: a completed-reasoning receipt in the default (collapsed)
+    // transcript must not expose internal function names; the full body —
+    // identifiers intact — stays reachable on expand and in the transcript.
+    let cell = HistoryCell::Thinking {
+        content: "I will call refresh_catalog_cache to refresh the model list.".to_string(),
+        streaming: false,
+        duration_secs: Some(1.0),
+    };
+
+    // Default collapsed view: identifier scrubbed, prose preserved, and the
+    // expand affordance offered.
+    let collapsed = cell.lines_with_options(
+        80,
+        TranscriptRenderOptions {
+            low_motion: true,
+            ..TranscriptRenderOptions::default()
+        },
+    );
+    let collapsed_text = lines_text(&collapsed);
+    assert!(
+        !collapsed_text.contains("refresh_catalog_cache"),
+        "internal function name must not leak by default: {collapsed_text}"
+    );
+    assert!(
+        collapsed_text.contains("refresh the model list"),
+        "surrounding prose must still read: {collapsed_text}"
+    );
+    assert!(
+        collapsed_text.contains("Full reasoning in Ctrl+O"),
+        "collapsed receipt must offer the expand affordance: {collapsed_text}"
+    );
+
+    // Expanded view (Space toggles the fold relative to the default): the full
+    // identifier is restored.
+    let expanded = cell.lines_with_options_folded(
+        80,
+        TranscriptRenderOptions {
+            low_motion: true,
+            ..TranscriptRenderOptions::default()
+        },
+        true,
+    );
+    assert!(
+        lines_text(&expanded).contains("refresh_catalog_cache"),
+        "expanded reasoning must restore the full identifier"
+    );
+
+    // Transcript / pager / clipboard keeps the full, un-redacted body.
+    assert!(
+        lines_text(&cell.transcript_lines(80)).contains("refresh_catalog_cache"),
+        "transcript must keep the full identifier"
     );
 }
 

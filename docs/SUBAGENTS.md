@@ -19,7 +19,7 @@ backoff inside the child runtime before the worker is marked interrupted; if the
 retry budget is exhausted, CodeWhale preserves a checkpoint and returns a
 continuation handle instead of leaving the parent to infer what happened. For
 work that must survive process restarts, sleep, or remote execution, prefer
-Fleet or a WhaleFlow-backed fleet run.
+Fleet or a Workflow-backed fleet run.
 
 Sub-agents inherit the parent's tool registry by default, but child agents are
 leaf workers: they do not receive `agent` or nested lifecycle tools. `agent`
@@ -207,9 +207,9 @@ the next turn.
 
 ## Concurrency cap
 
-Up to **20** sub-agents can run concurrently by default (configurable via
-`[subagents].max_concurrent` in `~/.codewhale/config.toml`; the default equals
-the hard instantaneous-concurrency ceiling of 20). The session admits a bounded
+Up to **64** sub-agents run concurrently by default (`DEFAULT_MAX_SUBAGENTS`),
+configurable via `[subagents].max_concurrent` in `~/.codewhale/config.toml` up to
+the hard ceiling of **128** (`MAX_SUBAGENTS`). The session admits a bounded
 queue of up to **200** running plus queued sub-agents by default, so a turn can
 request broad fan-out and let the manager drain it without creating an
 unbounded population.

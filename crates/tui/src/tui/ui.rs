@@ -176,12 +176,14 @@ const TURN_STALL_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(300);
 const TURN_STALL_WATCHDOG_GRACE: Duration = Duration::from_secs(30);
 /// Running tools can legitimately exceed the silent-turn timeout, but a tool
 /// with no progress heartbeat or output beyond this ceiling is treated as hung.
-const TOOL_HANG_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(900);
+// Must stay comfortably above `turn_stall_watchdog_timeout` so a running tool
+// gets extra grace beyond the turn-stall threshold (#1862 trimmed 15m → 10m).
+const TOOL_HANG_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(600);
 // Forced repaint cadence while a turn is live (model loading, compacting,
 // sub-agents running). Drives the footer water-spout animation as well as
-// the per-tool spinner pulse — keep this fast enough that the spout reads as
-// motion (~12 fps) instead of teleport-frames.
-const UI_STATUS_ANIMATION_MS: u64 = 80;
+// the per-tool spinner pulse — keep this fast enough that the whale-spout
+// braille pattern reads as continuous motion instead of teleport-frames.
+const UI_STATUS_ANIMATION_MS: u64 = crate::tui::spinner::BRAILLE_SPINNER_FRAME_MS;
 pub(crate) const SIDEBAR_VISIBLE_MIN_WIDTH: u16 = 64;
 const DEFAULT_TERMINAL_PROBE_TIMEOUT_MS: u64 = 500;
 const PERIODIC_FULL_REPAINT_EVERY_N: u64 = 50;
@@ -317,9 +319,9 @@ enum TranslationEvent {
 // plus ratatui's `terminal.clear()` are sufficient to repaint cleanly.
 const TERMINAL_ORIGIN_RESET: &[u8] = b"\x1b[r\x1b[?6l\x1b[H";
 // Xterm alternate-scroll mode keeps wheel events inside the alternate-screen
-// viewport. Crossterm's mouse-capture command does not enable this DEC private
-// mode, so terminals can still scroll the host scrollback if mouse capture is
-// disabled, dropped during focus changes, or unavailable in the host.
+// viewport when mouse capture is requested but unavailable or temporarily
+// dropped. Leave it off with `--no-mouse-capture` so the host terminal owns
+// raw mouse selection behavior end-to-end.
 const ENABLE_ALT_SCROLL_MODE: &[u8] = b"\x1b[?1007h";
 const DISABLE_ALT_SCROLL_MODE: &[u8] = b"\x1b[?1007l";
 /// Begin synchronized update (DEC 2026): tell the terminal to defer
@@ -338,7 +340,12 @@ const TERMINAL_INPUT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_INPUT_RECOVERY_COOLDOWN: Duration = Duration::from_secs(10);
 const TERMINAL_INPUT_CHILD_PAUSE_TIMEOUT: Duration = Duration::from_millis(500);
 const TERMINAL_INPUT_CHILD_PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(5);
-const MAX_ENGINE_EVENTS_PER_DRAIN: usize = 128;
+/// Upper bound on engine events processed before yielding to terminal input.
+const MAX_ENGINE_EVENTS_PER_DRAIN: usize = 16;
+/// Wall-clock budget for one engine drain batch (#1830 / #2317 input fairness).
+const ENGINE_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(8);
+/// Throttled in-progress checkpoint while a turn is live (#1830 progress loss).
+const RECOVERY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(45);
 
 enum TerminalInputMessage {
     Event(Event),
@@ -523,18 +530,36 @@ impl TerminalInputPump {
         self.mark_alive();
     }
 
-    #[cfg(target_os = "windows")]
+    /// Replace a wedged pump thread with a freshly spawned one.
+    ///
+    /// The old thread may be blocked forever inside crossterm's blocking
+    /// `event::read` (a stalled Windows console poll, or a Unix tty that
+    /// stopped delivering bytes), so it can never be joined. Instead it is
+    /// detached: `stop` is flagged and the `JoinHandle` dropped, so if the
+    /// thread ever wakes it exits on its own (its send fails once `rx` is
+    /// replaced, and the stop flag covers the poll loop).
     fn restart_detached(&mut self) -> io::Result<()> {
+        self.detach_current_thread();
+        let parts = Self::spawn_parts()?;
+        self.install_parts(parts);
+        Ok(())
+    }
+
+    /// Flag the current pump thread to stop and drop its handle without
+    /// joining (the thread may be wedged in a blocking terminal read).
+    fn detach_current_thread(&mut self) {
         self.stop.store(true, Ordering::Release);
         let _ = self.handle.take();
-        let parts = Self::spawn_parts()?;
+    }
+
+    /// Adopt freshly spawned pump parts and reset the liveness clock.
+    fn install_parts(&mut self, parts: TerminalInputPumpParts) {
         self.rx = parts.rx;
         self.stop = parts.stop;
         self.paused = parts.paused;
         self.paused_ack = parts.paused_ack;
         self.handle = Some(parts.handle);
         self.last_alive_at.set(Instant::now());
-        Ok(())
     }
 }
 
@@ -582,9 +607,34 @@ fn drain_terminal_input_queue(
     Ok(())
 }
 
+fn collect_pending_terminal_events(
+    input: &TerminalInputPump,
+    pending: &mut VecDeque<Event>,
+) -> io::Result<()> {
+    while let Some(event) = input.try_recv()? {
+        pending.push_back(event);
+    }
+    Ok(())
+}
+
+fn engine_drain_budget_exhausted(events_drained: usize, started: Instant, now: Instant) -> bool {
+    events_drained >= MAX_ENGINE_EVENTS_PER_DRAIN
+        || now.saturating_duration_since(started) >= ENGINE_DRAIN_TIME_BUDGET
+}
+
 fn open_setup_checkpoint_if_due(app: &mut App, config: &Config, skip_onboarding: bool) -> bool {
-    if skip_onboarding
-        || app.onboarding != crate::tui::app::OnboardingState::None
+    if skip_onboarding {
+        if crate::tui::setup::should_open_update_checkpoint(app, config)
+            && let Err(err) = crate::tui::setup::defer_update_checkpoint_for_app(app, config)
+        {
+            tracing::warn!(
+                target: "tui::setup",
+                "failed to record deferred setup checkpoint: {err}"
+            );
+        }
+        return false;
+    }
+    if app.onboarding != crate::tui::app::OnboardingState::None
         || app.view_stack.top_kind() == Some(ModalKind::SetupWizard)
         || !crate::tui::setup::should_open_update_checkpoint(app, config)
     {
@@ -617,9 +667,14 @@ fn complete_trust_directory_onboarding(app: &mut App, config: &Config) -> Result
 }
 
 fn back_from_api_key_onboarding(app: &mut App) {
-    app.onboarding = OnboardingState::Language;
+    app.onboarding = OnboardingState::Provider;
     app.api_key_input.clear();
     app.api_key_cursor = 0;
+    app.status_message = None;
+}
+
+fn back_from_provider_onboarding(app: &mut App) {
+    app.onboarding = OnboardingState::Language;
     app.status_message = None;
 }
 
@@ -671,10 +726,26 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
             .unwrap_or(osc8_default_on),
     );
 
-    // Terminal probe with timeout to prevent hanging on unresponsive terminals
+    // Terminal probe with timeout to prevent hanging on unresponsive terminals.
+    //
+    // The blocking task cannot be cancelled once the timeout fires, so a slow
+    // `enable_raw_mode` may still succeed *after* we've bailed out, leaking
+    // raw mode. Both sides run `raw_mode_probe_handshake`; whichever observes
+    // the other's flag disables raw mode again.
     let probe_timeout = terminal_probe_timeout(config);
+    let probe_abandoned = Arc::new(AtomicBool::new(false));
+    let probe_enabled = Arc::new(AtomicBool::new(false));
+    let task_abandoned = Arc::clone(&probe_abandoned);
+    let task_enabled = Arc::clone(&probe_enabled);
     let enable_raw = tokio::task::spawn_blocking(move || {
-        enable_raw_mode().map_err(|e| anyhow::anyhow!("Failed to enable raw mode: {e}"))
+        let result =
+            enable_raw_mode().map_err(|e| anyhow::anyhow!("Failed to enable raw mode: {e}"));
+        if result.is_ok() && raw_mode_probe_handshake(&task_enabled, &task_abandoned) {
+            // The probe timed out while we were blocked; the caller already
+            // gave up, so undo the late enable instead of leaking raw mode.
+            let _ = disable_raw_mode();
+        }
+        result
     });
 
     match tokio::time::timeout(probe_timeout, enable_raw).await {
@@ -682,6 +753,11 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
             inner_result??; // propagate both join and raw-mode errors
         }
         Err(_) => {
+            if raw_mode_probe_handshake(&probe_abandoned, &probe_enabled) {
+                // The blocking task finished enabling raw mode right as the
+                // timeout fired and may have missed the abandoned flag.
+                let _ = disable_raw_mode();
+            }
             tracing::warn!(
                 "Terminal probe timed out after {}ms - terminal may be unresponsive",
                 probe_timeout.as_millis()
@@ -1039,6 +1115,20 @@ fn resume_hint_text() -> &'static str {
     "To continue this session, execute codewhale run --continue"
 }
 
+/// One side of the raw-mode probe abandonment handshake between the startup
+/// probe timeout and the blocking `enable_raw_mode` task finishing late.
+///
+/// Each side publishes its own flag (`publish`), then checks whether the
+/// other side's flag (`check`) is already up; a `true` return means this
+/// side must disable raw mode again. `SeqCst` ordering guarantees that when
+/// both sides run, at least one observes the other's flag, so a raw-mode
+/// enable landing after the probe timeout is always undone. Both sides
+/// observing each other is fine — a duplicate `disable_raw_mode` is a no-op.
+fn raw_mode_probe_handshake(publish: &AtomicBool, check: &AtomicBool) -> bool {
+    publish.store(true, Ordering::SeqCst);
+    check.load(Ordering::SeqCst)
+}
+
 fn terminal_probe_timeout(config: &Config) -> Duration {
     let timeout_ms = config
         .tui
@@ -1377,7 +1467,9 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         max_admitted_subagents: config
             .max_admitted_subagents_for_provider(provider)
             .max(max_subagents),
-        launch_concurrency: config.launch_concurrency_for_provider(provider),
+        launch_concurrency: config
+            .launch_concurrency_for_provider(provider)
+            .max(app.mode.mode_delegation_launch_floor()),
         subagents_enabled: config.subagents_enabled_for_provider(provider),
         features: config.features(),
         auto_review_policy: config.auto_review_policy(),
@@ -1408,6 +1500,10 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             .map(crate::config::LspConfigToml::into_runtime),
         runtime_services: app.runtime_services.clone(),
         subagent_model_overrides: config.subagent_model_overrides(),
+        fleet_roster: std::sync::Arc::new(crate::fleet::roster::FleetRoster::load(
+            &config.fleet_config(),
+            &app.workspace,
+        )),
         subagent_api_timeout: Duration::from_secs(
             config.subagent_api_timeout_secs_for_provider(provider),
         ),
@@ -1832,14 +1928,12 @@ async fn run_event_loop(
     let mut last_focus_recovery = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
-    #[cfg(target_os = "windows")]
     let mut terminal_input = TerminalInputPump::spawn()?;
-    #[cfg(not(target_os = "windows"))]
-    let terminal_input = TerminalInputPump::spawn()?;
     let mut pending_terminal_events: VecDeque<Event> = VecDeque::new();
     let mut last_terminal_input_recovery = Instant::now()
         .checked_sub(TERMINAL_INPUT_RECOVERY_COOLDOWN)
         .unwrap_or_else(Instant::now);
+    let mut last_recovery_snapshot_at: Option<Instant> = None;
 
     // Fire-and-forget version check — runs once per session in the
     // background. On success, a short status toast advertises the update
@@ -2010,10 +2104,10 @@ async fn run_event_loop(
             .try_lock()
             .ok()
             .and_then(|mut guard| guard.take());
-        if let Some((draft_gen, model_label, outcome)) = fleet_draft_delivery {
-            if draft_gen == app.current_draft_gen() {
-                deliver_fleet_draft_result(app, model_label, outcome, app.ui_locale);
-            }
+        if let Some((draft_gen, model_label, picked_route, outcome)) = fleet_draft_delivery
+            && draft_gen == app.current_draft_gen()
+        {
+            deliver_fleet_draft_result(app, model_label, picked_route, outcome, app.ui_locale);
         }
 
         // Poll the constitution model-draft cell (same background pattern).
@@ -2022,11 +2116,15 @@ async fn run_event_loop(
             .try_lock()
             .ok()
             .and_then(|mut guard| guard.take());
-        if let Some((draft_gen, model_label, draft_locale, outcome)) = constitution_draft_delivery {
-            if draft_gen == app.current_draft_gen() {
-                deliver_constitution_draft_result(app, model_label, draft_locale, outcome);
-            }
+        if let Some((draft_gen, model_label, draft_locale, outcome)) = constitution_draft_delivery
+            && draft_gen == app.current_draft_gen()
+        {
+            deliver_constitution_draft_result(app, model_label, draft_locale, outcome);
         }
+
+        // #1830/#2317: service any already-arrived terminal keys before a
+        // potentially long engine batch so composer/modal input stays live.
+        collect_pending_terminal_events(&terminal_input, &mut pending_terminal_events)?;
 
         // First, poll for engine events (non-blocking)
         let mut received_engine_event = false;
@@ -2042,7 +2140,14 @@ async fn run_event_loop(
         {
             let mut rx = engine_handle.rx_event.write().await;
             let mut progress_redraw_agents: HashSet<String> = HashSet::new();
-            for _ in 0..MAX_ENGINE_EVENTS_PER_DRAIN {
+            let drain_started = Instant::now();
+            let mut events_drained = 0usize;
+            loop {
+                if events_drained > 0
+                    && engine_drain_budget_exhausted(events_drained, drain_started, Instant::now())
+                {
+                    break;
+                }
                 let event = match rx.try_recv() {
                     Ok(event) => event,
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -2968,6 +3073,15 @@ async fn run_event_loop(
                         // observed — assign the stable label on first sight.
                         let label = app.ensure_agent_label(&id);
                         app.status_message = Some(format!("{label}: {display}"));
+                        // A progress-first agent (its AgentSpawned was dropped
+                        // under channel pressure) exists only in agent_progress
+                        // until a ListSubAgents refresh promotes it into
+                        // subagent_cache. Request that refresh like the
+                        // AgentSpawned arm does, so the sidebar row survives
+                        // reconciliation instead of flickering out.
+                        if !app.subagent_cache.iter().any(|agent| agent.agent_id == id) {
+                            subagent_list_refresh_requested = true;
+                        }
                         // #3033: Throttle redraws from rapid AgentProgress events.
                         // When 4+ sub-agents are running concurrently, each firing
                         // progress events, the per-event `needs_redraw = true` saturates
@@ -3024,9 +3138,15 @@ async fn run_event_loop(
                         ));
                         let should_recapture_terminal =
                             !has_other_running_subagents && app.use_alt_screen;
-                        if !has_other_running_subagents
-                            && let Some((method, threshold, include_summary)) =
-                                notifications::settings(config)
+                        let subagent_notification_mode =
+                            config.notifications_config().subagent_completion;
+                        let workflow_tool_running = workflow_tool_is_running(app);
+                        if should_notify_subagent_completion(
+                            subagent_notification_mode,
+                            has_other_running_subagents,
+                            workflow_tool_running,
+                        ) && let Some((method, threshold, include_summary)) =
+                            notifications::settings(config)
                         {
                             let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
                             let msg = notifications::subagent_completion_message(
@@ -3192,6 +3312,7 @@ async fn run_event_loop(
                         }
                     }
                     EngineEvent::UserInputRequired { id, request } => {
+                        app.pending_user_input_prompt = Some((id.clone(), request.clone()));
                         app.view_stack.push(UserInputView::new(id.clone(), request));
                         if let Some((method, _, _)) = crate::tui::notifications::settings(config) {
                             let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
@@ -3272,6 +3393,7 @@ async fn run_event_loop(
                         }
                     }
                 }
+                events_drained = events_drained.saturating_add(1);
             }
         }
         if let Some(previous_provider) = fallback_after_engine_error {
@@ -3388,9 +3510,16 @@ async fn run_event_loop(
         if reconcile_turn_liveness(app, Instant::now(), has_running_agents) {
             app.needs_redraw = true;
         }
-        if (app.is_loading || has_running_agents || app.is_compacting || app.is_purging)
-            && last_status_frame.elapsed()
-                >= Duration::from_millis(status_animation_interval_ms(app))
+        maybe_throttled_recovery_snapshot(app, Instant::now(), &mut last_recovery_snapshot_at);
+        let history_has_live_motion = history_has_live_motion(&app.history);
+        let active_cell_has_live_motion = active_cell_has_live_motion(app);
+        if should_tick_status_animation(
+            app,
+            has_running_agents,
+            history_has_live_motion,
+            active_cell_has_live_motion,
+        ) && last_status_frame.elapsed()
+            >= Duration::from_millis(status_animation_interval_ms(app))
         {
             if streaming_thinking::animate_pending_translation(
                 app,
@@ -3398,7 +3527,7 @@ async fn run_event_loop(
             ) {
                 app.mark_history_updated();
             }
-            if !app.low_motion && history_has_live_motion(&app.history) {
+            if !app.low_motion && (history_has_live_motion || active_cell_has_live_motion) {
                 app.mark_history_updated();
             }
             app.needs_redraw = true;
@@ -3546,11 +3675,14 @@ async fn run_event_loop(
                     app.use_mouse_capture,
                     app.use_bracketed_paste,
                 );
-                #[cfg(target_os = "windows")]
                 match terminal_input.restart_detached() {
                     Ok(()) => {
                         app.push_status_toast(
-                            "Recovered terminal input after a stalled Windows console poll.",
+                            if cfg!(target_os = "windows") {
+                                "Recovered terminal input after a stalled Windows console poll."
+                            } else {
+                                "Recovered terminal input after a stalled terminal read."
+                            },
                             StatusToastLevel::Warning,
                             None,
                         );
@@ -3564,16 +3696,14 @@ async fn run_event_loop(
                         );
                     }
                 }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    app.push_status_toast(
-                        "Terminal input heartbeat stalled; terminal modes were refreshed.",
-                        StatusToastLevel::Warning,
-                        None,
-                    );
-                }
                 terminal_input.mark_alive();
                 last_terminal_input_recovery = now;
+                if app.is_loading
+                    || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
+                {
+                    persist_recovery_snapshot(app);
+                    last_recovery_snapshot_at = Some(now);
+                }
                 force_terminal_repaint = true;
                 app.needs_redraw = true;
             }
@@ -3765,6 +3895,11 @@ async fn run_event_loop(
             let mapped = crate::tui::composer_ui::normalize_macos_modifiers(key.modifiers);
             key.modifiers = mapped;
 
+            // Normalize the raw Ctrl+C control byte (0x03) delivered in
+            // PTY/raw-mode — and by some kitty-keyboard-protocol terminals —
+            // to canonical Ctrl+C so the quit-arm flow always runs (#4090).
+            normalize_raw_ctrl_c(&mut key);
+
             // Decision card keyboard routing (v0.8.43 truth-surface).
             // When a card is active, number keys 1-9 select options,
             // j/k or Up/Down navigate, and Enter confirms.
@@ -3821,6 +3956,9 @@ async fn run_event_loop(
                     KeyCode::Esc if app.onboarding == OnboardingState::ApiKey => {
                         back_from_api_key_onboarding(app);
                     }
+                    KeyCode::Esc if app.onboarding == OnboardingState::Provider => {
+                        back_from_provider_onboarding(app);
+                    }
                     KeyCode::Esc if app.onboarding == OnboardingState::Language => {
                         app.onboarding = OnboardingState::Welcome;
                         app.status_message = None;
@@ -3854,6 +3992,22 @@ async fn run_event_loop(
                             }
                         }
                     }
+                    KeyCode::Char(c)
+                        if app.onboarding == OnboardingState::Provider && c.is_ascii_digit() =>
+                    {
+                        if let Some((_, provider)) = onboarding::ONBOARDING_PROVIDER_OPTIONS
+                            .iter()
+                            .find(|(hotkey, _)| *hotkey == c)
+                        {
+                            onboarding::select_onboarding_provider(app, *provider);
+                        }
+                    }
+                    KeyCode::Up if app.onboarding == OnboardingState::Provider => {
+                        onboarding::move_onboarding_provider_selection(app, -1);
+                    }
+                    KeyCode::Down if app.onboarding == OnboardingState::Provider => {
+                        onboarding::move_onboarding_provider_selection(app, 1);
+                    }
                     KeyCode::Enter => match app.onboarding {
                         OnboardingState::Welcome => {
                             onboarding::advance_onboarding_from_welcome(app);
@@ -3862,6 +4016,9 @@ async fn run_event_loop(
                             // Enter without a digit pick keeps the existing
                             // setting (which defaults to "auto").
                             onboarding::advance_onboarding_after_language(app);
+                        }
+                        OnboardingState::Provider => {
+                            onboarding::advance_onboarding_from_provider(app);
                         }
                         OnboardingState::ApiKey => {
                             let key = app.api_key_input.trim().to_string();
@@ -3886,38 +4043,22 @@ async fn run_event_loop(
                                         Some(4_000),
                                     );
                                     app.status_message = None;
-                                    // Recreate the engine so it picks up the newly saved key
-                                    // without requiring a full process restart.
-                                    let _ = engine_handle.send(Op::Shutdown).await;
-                                    // Stamp the new key on the long-lived
-                                    // `Config` reference so any future clone
-                                    // (e.g. a subsequent /provider switch)
-                                    // sees it; the explicit-override path
-                                    // in `deepseek_api_key` (#343) makes
-                                    // this win immediately.
-                                    config.api_key = Some(key.clone());
-                                    let mut refreshed_config = config.clone();
-                                    refreshed_config.api_key = Some(key);
-                                    let engine_config = build_engine_config(app, &refreshed_config);
-                                    engine_handle = spawn_engine(engine_config, &refreshed_config);
+                                    mirror_saved_api_key_in_config(
+                                        config,
+                                        app.onboarding_provider,
+                                        key.clone(),
+                                    );
+                                    switch_provider(
+                                        app,
+                                        &mut engine_handle,
+                                        config,
+                                        app.onboarding_provider,
+                                        None,
+                                    )
+                                    .await;
                                     app.offline_mode = false;
-                                    app.api_key_env_only = false;
 
-                                    if !app.api_messages.is_empty() {
-                                        let _ = engine_handle
-                                            .send(Op::SyncSession {
-                                                session_id: app.current_session_id.clone(),
-                                                messages: app.api_messages.clone(),
-                                                system_prompt: app.system_prompt.clone(),
-                                                system_prompt_override: false,
-                                                model: app.model.clone(),
-                                                workspace: app.workspace.clone(),
-                                                mode: app.mode,
-                                            })
-                                            .await;
-                                    }
-
-                                    onboarding::advance_onboarding_after_language(app);
+                                    onboarding::advance_onboarding_after_api_key(app);
                                 }
                                 Err(e) => {
                                     app.status_message = Some(e.to_string());
@@ -3925,10 +4066,16 @@ async fn run_event_loop(
                             }
                         }
                         OnboardingState::TrustDirectory => {
-                            if let Err(err) = complete_trust_directory_onboarding(app, config) {
-                                app.status_message =
-                                    Some(format!("Failed to trust workspace: {err}"));
-                            }
+                            // Trusting a workspace is a security boundary, so it
+                            // must be a deliberate choice. Enter — the "advance"
+                            // key on every other onboarding screen — must NOT
+                            // grant trust by reflex (accidental-trust risk). Nor
+                            // is it a silent dead key: point the user at the
+                            // explicit keys the footer advertises.
+                            app.status_message = Some(
+                                "Press 1 or Y to trust this workspace, or 2 or N to exit."
+                                    .to_string(),
+                            );
                         }
                         OnboardingState::Tips => {
                             app.finish_onboarding_without_feature_intro();
@@ -4334,6 +4481,13 @@ async fn run_event_loop(
                 KeyCode::Char('t') | KeyCode::Char('T')
                     if key.modifiers == KeyModifiers::CONTROL =>
                 {
+                    app.cycle_effort();
+                    continue;
+                }
+                KeyCode::Char('t') | KeyCode::Char('T')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
                     toggle_live_transcript_overlay(app);
                     continue;
                 }
@@ -4728,7 +4882,9 @@ async fn run_event_loop(
                     }
                 }
                 KeyCode::BackTab => {
-                    app.cycle_effort();
+                    if app.cycle_approval_posture() {
+                        sync_mode_update(app, &engine_handle).await;
+                    }
                 }
                 // Transcript-nav shortcuts now require Alt, leaving most bare
                 // letters free to insert as text. Before v0.8.30, bare `g`,
@@ -4819,15 +4975,7 @@ async fn run_event_loop(
                             } else {
                                 build_queued_message(app, input)
                             };
-                            if let Err(err) =
-                                steer_user_message(app, &engine_handle, queued.clone()).await
-                            {
-                                app.queue_message(queued);
-                                app.status_message = Some(format!(
-                                    "Steer failed ({err}); {} queued follow-up(s) — /queue send <n>",
-                                    app.queued_message_count()
-                                ));
-                            }
+                            attempt_steer_with_queue_fallback(app, &engine_handle, queued).await;
                         }
                     }
                 }
@@ -4880,15 +5028,12 @@ async fn run_event_loop(
                             };
                             if app.is_loading {
                                 // Engine is busy — steer into the current turn.
-                                if let Err(err) =
-                                    steer_user_message(app, &engine_handle, queued.clone()).await
-                                {
-                                    app.queue_message(queued);
-                                    app.status_message = Some(format!(
-                                        "Steer failed ({err}); {} queued follow-up(s) — /queue send <n>",
-                                        app.queued_message_count()
-                                    ));
-                                }
+                                attempt_steer_with_queue_fallback(
+                                    app,
+                                    &engine_handle,
+                                    queued.clone(),
+                                )
+                                .await;
                             } else {
                                 // Engine is idle — send as a regular message
                                 // so the content is not lost to rx_steer's
@@ -5460,6 +5605,7 @@ async fn handle_setup_constitution_model_draft(
     app: &mut App,
     config: &Config,
     draft: crate::tui::setup::GuidedConstitutionDraft,
+    freeform_note: Option<String>,
     locale: crate::localization::Locale,
 ) {
     // Spawn the draft off the event loop (same pattern as the fleet drafter,
@@ -5503,6 +5649,7 @@ async fn handle_setup_constitution_model_draft(
                 &client,
                 &request_model,
                 draft,
+                freeform_note,
                 locale,
             ),
         )
@@ -5563,9 +5710,17 @@ async fn handle_fleet_profile_model_draft(
     app: &mut App,
     config: &Config,
     role: String,
-    model_class: String,
+    model: String,
+    provider: Option<String>,
     locale: crate::localization::Locale,
 ) {
+    // The route the operator actually picked at `m`-press time (#4093). A
+    // model draft always comes back `provider: None` (the untrusted gate
+    // strips any provider), so this captured `(provider, model)` is what the
+    // ratified profile is pinned to — immune to the model omitting/altering
+    // the route AND to the selection changing while the draft is in flight.
+    // `None` for an `inherit` pick (no concrete route to keep).
+    let picked_route = provider.map(|provider| (provider, model.clone()));
     // Do NOT await the network call on the event loop — that parks the whole
     // TUI for up to the timeout (#3757 review). Spawn it into the shared
     // fleet_draft_cell and let the loop poll + deliver the result, keeping
@@ -5578,6 +5733,7 @@ async fn handle_fleet_profile_model_draft(
             deliver_fleet_draft_result(
                 app,
                 model_label.clone(),
+                picked_route.clone(),
                 Err(format!("provider not ready: {err:#}")),
                 locale,
             );
@@ -5588,6 +5744,7 @@ async fn handle_fleet_profile_model_draft(
     let cell = app.fleet_draft_cell.clone();
     let spawn_label = model_label.clone();
     let request_gen = app.next_draft_gen();
+    let workspace = app.workspace.clone();
     app.status_message = Some(match locale {
         crate::localization::Locale::ZhHans => {
             format!(
@@ -5602,14 +5759,24 @@ async fn handle_fleet_profile_model_draft(
     });
     app.needs_redraw = true;
     tokio::spawn(async move {
+        // Redacted, bounded workspace fingerprint (manifest names, test
+        // commands, branch + dirty count — no contents, secrets, or absolute
+        // paths). Computed off the event loop; the untrusted-output gate on
+        // the reply is unchanged.
+        let fingerprint = tokio::task::spawn_blocking(move || {
+            crate::tui::setup::workspace_fingerprint(&workspace)
+        })
+        .await
+        .unwrap_or_default();
         let outcome = match tokio::time::timeout(
             DRAFT_TIMEOUT,
             crate::tui::setup::draft_fleet_profile_with_model(
                 &client,
                 &request_model,
                 &role,
-                &model_class,
+                &model,
                 locale,
+                &fingerprint,
             ),
         )
         .await
@@ -5618,18 +5785,24 @@ async fn handle_fleet_profile_model_draft(
             Ok(result) => result,
         };
         if let Ok(mut guard) = cell.lock() {
-            *guard = Some((request_gen, spawn_label, outcome));
+            *guard = Some((request_gen, spawn_label, picked_route, outcome));
         }
     });
 }
 
 /// Install a completed fleet-profile draft into the wizard (if it is still on
-/// top) and open its preview, or surface a failure. Called from the event
-/// loop when the background draft lands, and directly on the pre-spawn
+/// top), or surface a failure. Called from the event loop when the
+/// background draft lands, and directly on the pre-spawn
 /// provider-construction failure.
+///
+/// The preview renders inline on the wizard's own Review step — deliberately
+/// NOT in a separate pager (#4093): a standalone pager view owns its own
+/// `g`/`G` scroll bindings and would swallow the ratify keypress, forcing an
+/// Esc-then-g round trip before the user could actually save.
 fn deliver_fleet_draft_result(
     app: &mut App,
     model_label: String,
+    picked_route: Option<(String, String)>,
     outcome: Result<Box<crate::fleet::profile::FleetProfileDraft>, String>,
     locale: crate::localization::Locale,
 ) {
@@ -5638,19 +5811,21 @@ fn deliver_fleet_draft_result(
             if app.view_stack.top_kind() == Some(ModalKind::FleetSetup)
                 && let Some(mut boxed) = app.view_stack.pop()
             {
-                let preview = boxed
+                let installed = boxed
                     .as_any_mut()
                     .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
-                    .map(|wizard| wizard.install_model_draft(draft, model_label.clone()));
+                    .map(|wizard| {
+                        wizard.install_model_draft(draft, model_label.clone(), picked_route.clone())
+                    })
+                    .is_some();
                 app.view_stack.push_boxed(boxed);
-                if let Some((title, content)) = preview {
-                    open_text_pager(app, title, content);
+                if installed {
                     app.status_message = Some(match locale {
                         crate::localization::Locale::ZhHans => {
-                            format!("{model_label} 已起草配置。请查看 TOML，然后按 g 批准。")
+                            format!("{model_label} 已起草配置。请查看下方 TOML，然后按 g 批准。")
                         }
                         _ => format!(
-                            "{model_label} drafted the profile. Review the TOML, then press g to ratify."
+                            "{model_label} drafted the profile. Review the TOML below, then press g to ratify."
                         ),
                     });
                 }
@@ -5684,6 +5859,7 @@ fn build_session_snapshot(app: &App, manager: &SessionManager) -> SavedSession {
             app.system_prompt.as_ref(),
         );
         updated.metadata.model = model;
+        updated.metadata.model_provider = app.api_provider.as_str().to_string();
         updated.metadata.mode = Some(app.mode.as_setting().to_string());
         app.sync_cost_to_metadata(&mut updated.metadata);
         updated.context_references = app.session_context_references.clone();
@@ -5710,6 +5886,7 @@ fn build_session_snapshot(app: &App, manager: &SessionManager) -> SavedSession {
                 Some(app.mode.as_setting()),
             )
         };
+        session.metadata.model_provider = app.api_provider.as_str().to_string();
         app.sync_cost_to_metadata(&mut session.metadata);
         session.context_references = app.session_context_references.clone();
         session.artifacts = app.session_artifacts.clone();
@@ -5816,7 +5993,7 @@ fn reconcile_turn_liveness(app: &mut App, now: Instant, has_running_agents: bool
     {
         recover_stalled_runtime_turn(
             app,
-            "Tool stalled with no progress for 15m — recovered; the command may still be running in the background. Use exec_shell_cancel or retry.",
+            "Tool stalled with no progress for 10m — recovered; the command may still be running in the background. Use exec_shell_cancel or retry.",
             StatusToastLevel::Error,
         );
         return true;
@@ -5844,6 +6021,28 @@ fn persist_recovery_snapshot(app: &mut App) {
         }
         persistence_actor::persist(PersistRequest::SessionSnapshot(session));
     }
+}
+
+fn maybe_throttled_recovery_snapshot(
+    app: &mut App,
+    now: Instant,
+    last_snapshot_at: &mut Option<Instant>,
+) {
+    if !app.is_loading && !matches!(app.runtime_turn_status.as_deref(), Some("in_progress")) {
+        return;
+    }
+    if last_snapshot_at
+        .is_some_and(|last| now.saturating_duration_since(last) < RECOVERY_SNAPSHOT_INTERVAL)
+    {
+        return;
+    }
+    persist_recovery_snapshot(app);
+    *last_snapshot_at = Some(now);
+}
+
+fn enqueue_offline_message(app: &mut App, message: QueuedMessage) {
+    app.queue_message(message);
+    persist_offline_queue_state(app);
 }
 
 fn recover_stalled_runtime_turn(app: &mut App, message: &str, level: StatusToastLevel) {
@@ -6118,7 +6317,8 @@ fn rollback_provider_after_auth_failure(app: &mut App, config: &mut Config) -> O
     app.onboarding_needs_api_key = previous_onboarding_needs_api_key;
     app.api_key_env_only = previous_api_key_env_only;
 
-    let persistence_error = (|| -> anyhow::Result<()> {
+    let mut persistence_errors = Vec::new();
+    if let Err(err) = (|| -> anyhow::Result<()> {
         crate::config_persistence::persist_root_string_key(
             app.config_path.as_deref(),
             "provider",
@@ -6138,9 +6338,20 @@ fn rollback_provider_after_auth_failure(app: &mut App, config: &mut Config) -> O
         }
         settings.save()?;
         Ok(())
-    })()
-    .err()
-    .map(|err| format!("provider rollback not fully persisted: {err}"));
+    })() {
+        persistence_errors.push(err.to_string());
+    }
+    if let Err(err) = crate::tui::setup::record_provider_model_setup_state_for_app(app, config) {
+        persistence_errors.push(format!("setup state was not saved: {err}"));
+    }
+    let persistence_error = if persistence_errors.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "provider rollback not fully persisted: {}",
+            persistence_errors.join("; ")
+        ))
+    };
 
     Some(match persistence_error {
         Some(warning) => format!(
@@ -6455,11 +6666,13 @@ fn queue_current_draft_for_next_turn(app: &mut App) -> bool {
     } else {
         build_queued_message(app, input)
     };
-    app.queue_message(queued);
-    app.status_message = Some(format!(
-        "{} queued follow-up(s) — ↑ edit last, /queue send <n>",
+    enqueue_offline_message(app, queued);
+    let toast = format!(
+        "{} queued follow-up(s) — sends after current output; ↑ edit last, /queue send <n>",
         app.queued_message_count()
-    ));
+    );
+    app.status_message = Some(toast.clone());
+    app.push_status_toast(toast, StatusToastLevel::Info, Some(3_000));
     true
 }
 
@@ -6973,6 +7186,19 @@ pub(crate) fn apply_goal_snapshot_to_app(app: &mut App, snapshot: &GoalSnapshot)
     if objective_changed || app.hunt.started_at.is_none() {
         app.hunt.started_at = Some(Instant::now());
     }
+    // Freeze the elapsed timer the first time a goal leaves the active state.
+    // Paused (Wounded) goals freeze too — usage snapshots keep arriving while
+    // paused, and clearing here would silently un-freeze a timer the user just
+    // paused (matching close_hunt, which records the pause instant). Only an
+    // explicit resume back to Hunting re-arms the timer.
+    match verdict {
+        HuntVerdict::Hunted | HuntVerdict::Escaped | HuntVerdict::Wounded => {
+            if app.hunt.finished_at.is_none() {
+                app.hunt.finished_at = Some(Instant::now());
+            }
+        }
+        HuntVerdict::Hunting => app.hunt.finished_at = None,
+    }
     true
 }
 
@@ -7285,11 +7511,15 @@ async fn apply_model_picker_choice(
         ),
         (false, false) => unreachable!(),
     };
+    let persisted = persist_warning.is_none();
     if let Some(warning) = persist_warning {
         summary.push(' ');
         summary.push_str(&warning);
     }
     app.status_message = Some(summary);
+    if model_changed && persisted {
+        record_provider_model_setup_progress(app, config);
+    }
 }
 
 async fn apply_picker_effort_choice(
@@ -7518,10 +7748,14 @@ async fn switch_provider(
     });
 
     let mut status_message = format!("Provider: {} via {}", target.as_str(), new_endpoint);
+    let persisted = persist_warning.is_none();
     if persist_warning.is_some() {
         status_message.push_str(" (not fully persisted)");
     }
     app.status_message = Some(status_message);
+    if persisted {
+        record_provider_model_setup_progress(app, config);
+    }
 }
 
 fn provider_persistence_key(config: &Config, provider: ApiProvider) -> String {
@@ -8052,6 +8286,20 @@ async fn apply_command_result(
                     );
                 }
             }
+            AppAction::OpenProviderSetup { provider } => {
+                if app.view_stack.top_kind() != Some(ModalKind::ProviderPicker) {
+                    let runtime_status = query_provider_runtime_status(engine_handle).await;
+                    app.view_stack.push(
+                        crate::tui::provider_picker::ProviderPickerView::new_for_setup(
+                            app.api_provider,
+                            provider,
+                            config,
+                            runtime_status,
+                        ),
+                    );
+                    app.status_message = Some("Provider setup catalog opened.".to_string());
+                }
+            }
             AppAction::OpenModePicker => {
                 if app.view_stack.top_kind() != Some(ModalKind::ModePicker) {
                     app.view_stack
@@ -8086,6 +8334,14 @@ async fn apply_command_result(
                     let original = app.theme_id.name().to_string();
                     app.view_stack
                         .push(crate::tui::theme_picker::ThemePickerView::new(original));
+                }
+            }
+            AppAction::OpenFleetRoster => {
+                if app.view_stack.top_kind() != Some(ModalKind::FleetRoster) {
+                    app.view_stack
+                        .push(crate::tui::views::fleet_roster::FleetRosterView::new(
+                            app, config,
+                        ));
                 }
             }
             AppAction::OpenFleetSetup => {
@@ -8556,6 +8812,9 @@ async fn handle_mcp_ui_action(
             // (#502).
             app.mcp_configured_count = snapshot.servers.len();
             app.mcp_snapshot = Some(snapshot.clone());
+            // #2068: keep the hotbar's MCP-tool actions in sync with the tools
+            // that are actually loaded; the hotbar never connects on its own.
+            app.hotbar_actions.replace_mcp_tools(Some(&snapshot));
             open_mcp_manager_pager(app, &snapshot);
         }
         Err(err) => add_mcp_message(app, format!("MCP snapshot failed: {err}")),
@@ -8730,6 +8989,7 @@ async fn steer_user_message(
     engine_handle: &EngineHandle,
     message: QueuedMessage,
 ) -> Result<()> {
+    let paused_snapshot = snapshot_steer_paused_state(app);
     let paused_note = prepare_paused_command_message(app, engine_handle, &message.display);
     let cwd = std::env::current_dir().ok();
     let references = crate::tui::file_mention::context_references_from_input(
@@ -8743,7 +9003,11 @@ async fn steer_user_message(
     }
     let message_index = app.api_messages.len();
 
-    engine_handle.steer(content.clone()).await?;
+    if let Err(err) = engine_handle.steer(content.clone()).await {
+        restore_steer_paused_state(app, &paused_snapshot);
+        engine_handle.set_paused(paused_snapshot.paused);
+        return Err(err);
+    }
     app.last_submitted_prompt = Some(message.display.clone());
 
     // Flush any streaming thinking/tool content into history before
@@ -8769,17 +9033,76 @@ async fn steer_user_message(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct SteerPausedSnapshot {
+    paused: bool,
+    pausable: bool,
+    paused_quarry: Option<String>,
+    quarry: Option<String>,
+    tokens_used: u64,
+    time_used_seconds: u64,
+    continuation_count: u32,
+}
+
+fn snapshot_steer_paused_state(app: &App) -> SteerPausedSnapshot {
+    SteerPausedSnapshot {
+        paused: app.paused,
+        pausable: app.pausable,
+        paused_quarry: app.paused_quarry.clone(),
+        quarry: app.hunt.quarry.clone(),
+        tokens_used: app.hunt.tokens_used,
+        time_used_seconds: app.hunt.time_used_seconds,
+        continuation_count: app.hunt.continuation_count,
+    }
+}
+
+fn restore_steer_paused_state(app: &mut App, snapshot: &SteerPausedSnapshot) {
+    app.paused = snapshot.paused;
+    app.pausable = snapshot.pausable;
+    app.paused_quarry = snapshot.paused_quarry.clone();
+    app.hunt.quarry = snapshot.quarry.clone();
+    app.hunt.tokens_used = snapshot.tokens_used;
+    app.hunt.time_used_seconds = snapshot.time_used_seconds;
+    app.hunt.continuation_count = snapshot.continuation_count;
+}
+
+async fn attempt_steer_with_queue_fallback(
+    app: &mut App,
+    engine_handle: &EngineHandle,
+    message: QueuedMessage,
+) {
+    match steer_user_message(app, engine_handle, message.clone()).await {
+        Ok(()) => {
+            app.push_status_toast(
+                "Steering into current turn",
+                StatusToastLevel::Info,
+                Some(1_500),
+            );
+        }
+        Err(err) => {
+            enqueue_offline_message(app, message);
+            let status = format!(
+                "Steer failed ({err}); {} queued follow-up(s) — /queue send <n>",
+                app.queued_message_count()
+            );
+            app.status_message = Some(status.clone());
+            app.push_status_toast(status, StatusToastLevel::Warning, Some(4_000));
+        }
+    }
+}
+
 /// Park a draft on the queued-messages bucket for dispatch after TurnComplete.
 /// Unlike a steer, the message is NOT forwarded immediately — it waits for
 /// the current turn to finish, then dispatches as a normal user message.
 async fn queue_follow_up(app: &mut App, message: QueuedMessage) -> Result<()> {
     let display = message.display.clone();
-    app.queue_message(message);
-    app.status_message = Some(format!(
-        "Queued: {} ({} total) — ↑ to edit",
-        display,
+    enqueue_offline_message(app, message);
+    let toast = format!(
+        "Queued: {display} ({} total) — sends after current output; ↑ to edit",
         app.queued_message_count()
-    ));
+    );
+    app.status_message = Some(toast.clone());
+    app.push_status_toast(toast, StatusToastLevel::Info, Some(3_000));
     Ok(())
 }
 
@@ -8789,40 +9112,37 @@ async fn submit_or_steer_message(
     engine_handle: &EngineHandle,
     message: QueuedMessage,
 ) -> Result<()> {
-    match app.decide_submit_disposition() {
+    match app
+        .enter_with_double_tap()
+        .unwrap_or(SubmitDisposition::Immediate)
+    {
         SubmitDisposition::Immediate => {
             dispatch_user_message(app, config, engine_handle, message).await
         }
         SubmitDisposition::Queue => {
             let count = app.queued_message_count().saturating_add(1);
-            app.queue_message(message);
-            if app.offline_mode {
-                app.status_message = Some(format!(
-                    "Offline: {count} queued follow-up(s) — ↑ edit last, /queue send <n>"
-                ));
+            enqueue_offline_message(app, message);
+            let (status, toast) = if app.offline_mode {
+                (
+                    format!("Offline: {count} queued follow-up(s) — ↑ edit last, /queue send <n>"),
+                    format!("Offline: queued follow-up ({count} total)"),
+                )
             } else {
-                app.status_message = Some(format!(
-                    "{count} queued follow-up(s) — ↑ edit last, /queue send <n>"
-                ));
-            }
+                (
+                    format!(
+                        "{count} queued follow-up(s) — sends after current output; ↑ edit last, /queue send <n>"
+                    ),
+                    format!("Queued follow-up ({count} total) — sends after current output"),
+                )
+            };
+            app.status_message = Some(status);
+            app.push_status_toast(toast, StatusToastLevel::Info, Some(3_000));
             Ok(())
         }
         // Steer: reached via Enter when busy-but-waiting (v0.8.44), or
         // via Ctrl+Enter override in any busy state.
         SubmitDisposition::Steer => {
-            if let Err(err) = steer_user_message(app, engine_handle, message.clone()).await {
-                app.queue_message(message);
-                app.status_message = Some(format!(
-                    "Steer failed ({err}); {} queued follow-up(s) — /queue send <n>",
-                    app.queued_message_count()
-                ));
-            } else {
-                app.push_status_toast(
-                    "Steering into current turn",
-                    StatusToastLevel::Info,
-                    Some(1_500),
-                );
-            }
+            attempt_steer_with_queue_fallback(app, engine_handle, message).await;
             Ok(())
         }
         SubmitDisposition::QueueFollowUp => queue_follow_up(app, message).await,
@@ -9155,6 +9475,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
             crate::config::ApiProvider::Stepfun => Some("StepFun"),
             crate::config::ApiProvider::Minimax => Some("MiniMax"),
             crate::config::ApiProvider::Sakana => Some("Sakana"),
+            crate::config::ApiProvider::LongCat => Some("Meituan LongCat"),
             crate::config::ApiProvider::Custom => Some("Custom"),
         };
         let status_indicator_started_at = if app.low_motion {
@@ -9292,7 +9613,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
                     .fg(palette::TEXT_MUTED)
             } else {
                 Style::default()
-                    .bg(palette::DEEPSEEK_SLATE)
+                    .bg(palette::WHALE_PANEL)
                     .fg(palette::TEXT_MUTED)
             };
 
@@ -9549,7 +9870,7 @@ fn open_backtrack_overlay(app: &mut App) {
     app.needs_redraw = true;
 }
 
-/// Toggle the live transcript overlay on `Ctrl+T`. Closes the overlay if it's
+/// Toggle the live transcript overlay on `Ctrl+Shift+T`. Closes the overlay if it's
 /// already on top; otherwise pushes a fresh one in sticky-tail mode.
 fn toggle_live_transcript_overlay(app: &mut App) {
     if app.view_stack.top_kind() == Some(ModalKind::LiveTranscript) {
@@ -9608,6 +9929,19 @@ fn apply_hotbar_setup_saved(
         }
     }
     app.needs_redraw = true;
+}
+
+fn record_provider_model_setup_progress(app: &mut App, config: &Config) {
+    if let Err(err) = crate::tui::setup::record_provider_model_setup_state_for_app(app, config) {
+        let note = format!("Setup provider/model state was not saved: {err}");
+        if let Some(status) = app.status_message.as_mut() {
+            status.push_str(" · ");
+            status.push_str(&note);
+        } else {
+            app.status_message = Some(note.clone());
+        }
+        app.add_message(HistoryCell::System { content: note });
+    }
 }
 
 fn use_bundled_constitution(app: &mut App, config: &Config) {
@@ -9813,7 +10147,27 @@ async fn handle_view_events(
                 }
             }
             ViewEvent::UserInputSubmitted { tool_id, response } => {
-                let _ = engine_handle.submit_user_input(tool_id, response).await;
+                match engine_handle
+                    .submit_user_input(tool_id.clone(), response)
+                    .await
+                {
+                    Ok(()) => {
+                        app.pending_user_input_prompt = None;
+                    }
+                    Err(err) => {
+                        tracing::warn!(tool_id = %tool_id, error = %err, "user input submit failed");
+                        if let Some((id, request)) = app.pending_user_input_prompt.clone() {
+                            app.view_stack.push(UserInputView::new(id, request));
+                        }
+                        app.push_status_toast(
+                            format!("Failed to submit response: {err}"),
+                            StatusToastLevel::Error,
+                            None,
+                        );
+                        app.status_message =
+                            Some(format!("Failed to submit response: {err} — try again"));
+                    }
+                }
             }
             ViewEvent::UserInputCancelled { tool_id } => {
                 let _ = engine_handle.cancel_user_input(tool_id).await;
@@ -10005,15 +10359,32 @@ async fn handle_view_events(
                         Some(format!("User constitution could not be saved: {err}"));
                 }
             },
-            ViewEvent::SetupConstitutionModelDraftRequested { draft, locale } => {
-                handle_setup_constitution_model_draft(app, config, draft, locale).await;
+            ViewEvent::SetupConstitutionModelDraftRequested {
+                draft,
+                freeform_note,
+                locale,
+            } => {
+                handle_setup_constitution_model_draft(app, config, draft, freeform_note, locale)
+                    .await;
             }
             ViewEvent::FleetProfileModelDraftRequested {
                 role,
-                model_class,
+                model,
+                provider,
                 locale,
             } => {
-                handle_fleet_profile_model_draft(app, config, role, model_class, locale).await;
+                handle_fleet_profile_model_draft(app, config, role, model, provider, locale).await;
+            }
+            ViewEvent::FleetRosterOpenSetupRequested => {
+                // The roster view hands off to the authoring wizard (same
+                // path as AppAction::OpenFleetSetup).
+                if app.view_stack.top_kind() != Some(ModalKind::FleetSetup) {
+                    let _ = app.next_draft_gen();
+                    app.view_stack
+                        .push(crate::tui::views::fleet_setup::FleetSetupView::new(
+                            app, config,
+                        ));
+                }
             }
             ViewEvent::FleetProfileDraftCommitRequested { draft } => {
                 // The TOML is rendered deterministically from the validated
@@ -10069,6 +10440,36 @@ async fn handle_view_events(
                     app.needs_redraw = true;
                     continue;
                 }
+                // #4093 AC #5: a profile may only pin a provider the operator
+                // has actually configured/credentialed. The picker already
+                // offers models only from configured providers, but a
+                // model-drafted or hand-edited route (or credentials removed
+                // after the pick) could still name an unconfigured one — which
+                // would fail loudly at launch. Catch it at save time with a
+                // clear message, reusing the SAME predicate the picker uses.
+                if let Some(provider_id) = draft.provider.as_deref()
+                    && let Some(provider) = crate::config::ApiProvider::parse(provider_id)
+                    && !crate::config::provider_is_configured_for_active(
+                        config,
+                        provider,
+                        app.api_provider,
+                    )
+                {
+                    let zh = app.ui_locale == crate::localization::Locale::ZhHans;
+                    app.status_message = Some(if zh {
+                        format!(
+                            "配置指定的 provider `{provider_id}` 尚未配置凭据（{}）；请先在 /provider 中设置，再保存。",
+                            provider.env_vars_label()
+                        )
+                    } else {
+                        format!(
+                            "Profile pins provider `{provider_id}`, which has no configured credentials ({}); set it up in /provider before saving.",
+                            provider.env_vars_label()
+                        )
+                    });
+                    app.needs_redraw = true;
+                    continue;
+                }
                 let mut txn = codewhale_config::persistence::SetupTransaction::new();
                 txn.stage(target.clone(), draft.render_toml().into_bytes());
                 match txn.commit() {
@@ -10115,8 +10516,9 @@ async fn handle_view_events(
                 if app.view_stack.top_kind() != Some(ModalKind::ProviderPicker) {
                     let runtime_status = query_provider_runtime_status(engine_handle).await;
                     app.view_stack.push(
-                        crate::tui::provider_picker::ProviderPickerView::new_with_runtime_status(
+                        crate::tui::provider_picker::ProviderPickerView::new_for_setup(
                             app.api_provider,
+                            Some(app.api_provider),
                             config,
                             runtime_status,
                         ),
@@ -10127,10 +10529,28 @@ async fn handle_view_events(
             }
             ViewEvent::SetupOpenModelRequested => {
                 if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
-                    app.view_stack
-                        .push(crate::tui::model_picker::ModelPickerView::new(app, config));
+                    open_model_picker_for_provider(app, config, app.api_provider);
                     app.status_message =
                         Some("Model route picker opened from /setup readiness.".to_string());
+                }
+            }
+            ViewEvent::SetupOpenFleetRequested => {
+                if app.view_stack.top_kind() != Some(ModalKind::FleetSetup) {
+                    let _ = app.next_draft_gen();
+                    app.view_stack
+                        .push(crate::tui::views::fleet_setup::FleetSetupView::new(
+                            app, config,
+                        ));
+                    app.status_message =
+                        Some("Fleet setup opened from /setup Operate/Fleet readiness.".to_string());
+                }
+            }
+            ViewEvent::SetupOpenHotbarRequested => {
+                if app.view_stack.top_kind() != Some(ModalKind::HotbarSetup) {
+                    app.view_stack
+                        .push(crate::tui::hotbar::setup::HotbarSetupView::new(app, config));
+                    app.status_message =
+                        Some("Hotbar setup opened from /setup Hotbar readiness.".to_string());
                 }
             }
             ViewEvent::SetupOpenModeRequested => {
@@ -10767,62 +11187,60 @@ async fn apply_provider_picker_api_key(
         }
     }
 
-    // Mirror the saved key into the in-memory config so the engine sees it
-    // immediately without a reload — `save_api_key_for` only touches disk.
+    mirror_saved_api_key_in_config(config, provider, api_key);
+    switch_provider(app, engine_handle, config, provider, None).await;
+}
+
+fn mirror_saved_api_key_in_config(config: &mut Config, provider: ApiProvider, api_key: String) {
     if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
         config.api_key = Some(api_key);
-    } else {
-        // Capture the custom entry key before borrowing `providers` (#1519).
-        let custom_key = (provider == ApiProvider::Custom).then(|| {
-            config
-                .provider
-                .clone()
-                .unwrap_or_else(|| "__custom__".to_string())
-        });
-        let providers = config
-            .providers
-            .get_or_insert_with(ProvidersConfig::default);
-        let entry: &mut ProviderConfig = match provider {
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
-                // Guarded by the outer `if` above; safety net against refactors.
-                return;
-            }
-            ApiProvider::Custom => providers
-                .custom
-                .entry(custom_key.expect("custom key captured for custom provider"))
-                .or_default(),
-            ApiProvider::DeepseekAnthropic => &mut providers.deepseek_anthropic,
-            ApiProvider::NvidiaNim => &mut providers.nvidia_nim,
-            ApiProvider::Openai => &mut providers.openai,
-            ApiProvider::Atlascloud => &mut providers.atlascloud,
-            ApiProvider::WanjieArk => &mut providers.wanjie_ark,
-            ApiProvider::Volcengine => &mut providers.volcengine,
-            ApiProvider::Openrouter => &mut providers.openrouter,
-            ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
-            ApiProvider::Novita => &mut providers.novita,
-            ApiProvider::Fireworks => &mut providers.fireworks,
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &mut providers.siliconflow,
-            ApiProvider::Arcee => &mut providers.arcee,
-            ApiProvider::Moonshot => &mut providers.moonshot,
-            ApiProvider::Sglang => &mut providers.sglang,
-            ApiProvider::Vllm => &mut providers.vllm,
-            ApiProvider::Ollama => &mut providers.ollama,
-            ApiProvider::Huggingface => &mut providers.huggingface,
-            ApiProvider::Deepinfra => &mut providers.deepinfra,
-            ApiProvider::Together => &mut providers.together,
-            ApiProvider::Qianfan => &mut providers.qianfan,
-            ApiProvider::OpenaiCodex => &mut providers.openai_codex,
-            ApiProvider::Anthropic => &mut providers.anthropic,
-            ApiProvider::Openmodel => &mut providers.openmodel,
-            ApiProvider::Zai => &mut providers.zai,
-            ApiProvider::Stepfun => &mut providers.stepfun,
-            ApiProvider::Minimax => &mut providers.minimax,
-            ApiProvider::Sakana => &mut providers.sakana,
-        };
-        entry.api_key = Some(api_key);
+        return;
     }
-
-    switch_provider(app, engine_handle, config, provider, None).await;
+    let custom_key = (provider == ApiProvider::Custom).then(|| {
+        config
+            .provider
+            .clone()
+            .unwrap_or_else(|| "__custom__".to_string())
+    });
+    let providers = config
+        .providers
+        .get_or_insert_with(ProvidersConfig::default);
+    let entry: &mut ProviderConfig = match provider {
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN => return,
+        ApiProvider::Custom => providers
+            .custom
+            .entry(custom_key.expect("custom key captured for custom provider"))
+            .or_default(),
+        ApiProvider::DeepseekAnthropic => &mut providers.deepseek_anthropic,
+        ApiProvider::NvidiaNim => &mut providers.nvidia_nim,
+        ApiProvider::Openai => &mut providers.openai,
+        ApiProvider::Atlascloud => &mut providers.atlascloud,
+        ApiProvider::WanjieArk => &mut providers.wanjie_ark,
+        ApiProvider::Volcengine => &mut providers.volcengine,
+        ApiProvider::Openrouter => &mut providers.openrouter,
+        ApiProvider::XiaomiMimo => &mut providers.xiaomi_mimo,
+        ApiProvider::Novita => &mut providers.novita,
+        ApiProvider::Fireworks => &mut providers.fireworks,
+        ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => &mut providers.siliconflow,
+        ApiProvider::Arcee => &mut providers.arcee,
+        ApiProvider::Moonshot => &mut providers.moonshot,
+        ApiProvider::Sglang => &mut providers.sglang,
+        ApiProvider::Vllm => &mut providers.vllm,
+        ApiProvider::Ollama => &mut providers.ollama,
+        ApiProvider::Huggingface => &mut providers.huggingface,
+        ApiProvider::Deepinfra => &mut providers.deepinfra,
+        ApiProvider::Together => &mut providers.together,
+        ApiProvider::Qianfan => &mut providers.qianfan,
+        ApiProvider::OpenaiCodex => &mut providers.openai_codex,
+        ApiProvider::Anthropic => &mut providers.anthropic,
+        ApiProvider::Openmodel => &mut providers.openmodel,
+        ApiProvider::Zai => &mut providers.zai,
+        ApiProvider::Stepfun => &mut providers.stepfun,
+        ApiProvider::Minimax => &mut providers.minimax,
+        ApiProvider::Sakana => &mut providers.sakana,
+        ApiProvider::LongCat => &mut providers.longcat,
+    };
+    entry.api_key = Some(api_key);
 }
 
 async fn apply_provider_picker_auth_mode(
@@ -10898,11 +11316,12 @@ fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, 
         ApiProvider::Stepfun => &mut providers.stepfun,
         ApiProvider::Minimax => &mut providers.minimax,
         ApiProvider::Sakana => &mut providers.sakana,
+        ApiProvider::LongCat => &mut providers.longcat,
     };
     entry.auth_mode = Some(auth_mode);
 }
 
-fn apply_loaded_session(app: &mut App, config: &Config, session: &SavedSession) -> bool {
+fn apply_loaded_session(app: &mut App, config: &mut Config, session: &SavedSession) -> bool {
     let (messages, recovered_draft) = recover_interrupted_user_tail(&session.messages);
     app.api_messages = messages;
     app.clear_history();
@@ -10947,7 +11366,12 @@ fn apply_loaded_session(app: &mut App, config: &Config, session: &SavedSession) 
     app.sync_context_references_from_session(&session.context_references, &message_to_cell);
     app.mark_history_updated();
     app.viewport.transcript_selection.clear();
+    restore_loaded_session_provider(app, config, &session.metadata.model_provider);
     app.set_model_selection(session.metadata.model.clone());
+    app.provider_models.insert(
+        app.api_provider.as_str().to_string(),
+        app.model_selection_for_persistence(),
+    );
     app.update_model_compaction_budget();
     apply_workspace_runtime_state(app, config, session.metadata.workspace.clone());
     if let Some(mode) = session.metadata.mode.as_deref().and_then(AppMode::parse) {
@@ -11010,28 +11434,83 @@ fn apply_loaded_session(app: &mut App, config: &Config, session: &SavedSession) 
     recovered
 }
 
+fn restore_loaded_session_provider(app: &mut App, config: &mut Config, model_provider: &str) {
+    let Some(provider) = ApiProvider::parse(model_provider) else {
+        return;
+    };
+
+    app.api_provider = provider;
+    config.provider = Some(provider.as_str().to_string());
+    app.max_subagents = config
+        .max_subagents_for_provider(provider)
+        .clamp(1, crate::config::MAX_SUBAGENTS);
+    app.provider_chain = provider
+        .kind()
+        .map(|kind| codewhale_config::ProviderChain::new(kind, &config.fallback_providers))
+        .filter(|chain| chain.providers().len() > 1);
+    app.last_fallback_reason = None;
+    app.model_ids_passthrough = config.model_ids_pass_through();
+    app.reasoning_effort = app.reasoning_effort.normalize_for_provider(provider);
+    app.set_active_context_window_override(config.context_window_for_provider_config(provider));
+    app.active_route_limits = app.context_window_override_limits();
+}
+
 /// Derive a short display title from the API message list.
-/// Skips the `<turn_meta>` block prepended by the engine and takes the first
-/// real user-text block, truncated to 32 characters.
+///
+/// Tries several strategies in order:
+/// 1. If the first user message starts with a known slash command (`/goal`,
+///    `/fleet`, `/workflow`, etc.), use the command + first argument.
+/// 2. Otherwise, take the first meaningful line and cut it at a natural
+///    phrase boundary (period, comma, colon, or word boundary) within
+///    `SESSION_TITLE_MAX_CHARS`, never splitting mid-word.
+///
+/// Never leaks raw prompt text — the result is always a concise label.
 fn derive_session_title(messages: &[Message]) -> Option<String> {
-    messages.iter().find(|m| m.role == "user").and_then(|m| {
+    let text = messages.iter().find(|m| m.role == "user").and_then(|m| {
         m.content.iter().find_map(|block| match block {
             ContentBlock::Text { text, .. } if !text.starts_with(TURN_META_PREFIX) => {
-                let first_line = text.trim().lines().next().unwrap_or("").trim();
-                if first_line.is_empty() {
-                    return None;
-                }
-                let char_count = first_line.chars().count();
-                let chars: String = first_line.chars().take(SESSION_TITLE_MAX_CHARS).collect();
-                if char_count > SESSION_TITLE_MAX_CHARS {
-                    Some(format!("{chars}…"))
-                } else {
-                    Some(chars)
-                }
+                Some(text.trim().to_string())
             }
             _ => None,
         })
-    })
+    })?;
+
+    let first_line = text.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        return None;
+    }
+
+    // Slash command: extract command name + first reasonable argument.
+    if let Some(rest) = first_line.strip_prefix('/') {
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        return match parts.as_slice() {
+            [] => None,
+            [cmd] => Some(format!("/{cmd}")),
+            [cmd, arg, ..] => {
+                let arg_short = short_title_truncate(arg, 24);
+                Some(format!("/{cmd} {arg_short}"))
+            }
+        };
+    }
+
+    Some(short_title_truncate(first_line, SESSION_TITLE_MAX_CHARS))
+}
+
+/// Truncate `text` to at most `max_chars` characters, cutting at the last
+/// natural phrase boundary (`.`, `,`, `:`, `;`, `—`, `-`, or whitespace)
+/// so words are never split. Appends `…` only when text was actually cut.
+pub(crate) fn short_title_truncate(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    // Look for a natural boundary within the allowed range.
+    let candidate: String = text.chars().take(max_chars).collect();
+    let boundary = candidate
+        .rfind(['.', ',', ':', ';', '—', '-'])
+        .or_else(|| candidate.rfind(' '))
+        .unwrap_or(max_chars.min(candidate.len()).saturating_sub(1));
+    let cut: String = text.chars().take(boundary.max(1)).collect();
+    format!("{cut}…")
 }
 
 fn recover_interrupted_user_tail(messages: &[Message]) -> (Vec<Message>, Option<QueuedMessage>) {
@@ -11332,9 +11811,13 @@ pub(crate) fn recover_terminal_modes<W: Write>(
 
     pop_keyboard_enhancement_flags(writer);
     push_keyboard_enhancement_flags(writer);
-    enable_alternate_scroll_mode(writer);
-    if use_mouse_capture && let Err(err) = execute!(writer, EnableMouseCapture) {
-        tracing::debug!(?err, "EnableMouseCapture ignored");
+    if use_mouse_capture {
+        enable_alternate_scroll_mode(writer);
+        if let Err(err) = execute!(writer, EnableMouseCapture) {
+            tracing::debug!(?err, "EnableMouseCapture ignored");
+        }
+    } else {
+        disable_alternate_scroll_mode(writer);
     }
     if use_bracketed_paste {
         try_enable_bracketed_paste_mode(writer);
@@ -11366,7 +11849,7 @@ fn terminal_event_needs_viewport_recapture(evt: &Event) -> bool {
 
 pub(crate) fn status_color(level: StatusToastLevel) -> ratatui::style::Color {
     match level {
-        StatusToastLevel::Info => palette::DEEPSEEK_SKY,
+        StatusToastLevel::Info => palette::WHALE_INFO,
         StatusToastLevel::Success => palette::STATUS_SUCCESS,
         StatusToastLevel::Warning => palette::STATUS_WARNING,
         StatusToastLevel::Error => palette::STATUS_ERROR,
@@ -11717,26 +12200,70 @@ fn clamp_event_poll_timeout(timeout: Duration) -> Duration {
     timeout.max(MIN_EVENT_POLL_TIMEOUT)
 }
 
+/// True while a `workflow` tool is executing in the foreground (active cell)
+/// or still shown as running in history. Used to keep per-subagent completion
+/// notifications quiet during a workflow run under `final-only`.
+fn workflow_tool_is_running(app: &App) -> bool {
+    fn is_running_workflow(cell: &HistoryCell) -> bool {
+        matches!(
+            cell,
+            HistoryCell::Tool(ToolCell::Generic(tool))
+                if tool.name == "workflow" && tool.status == ToolStatus::Running
+        )
+    }
+    app.history.iter().any(is_running_workflow)
+        || app
+            .active_cell
+            .as_ref()
+            .is_some_and(|active| active.entries().iter().any(is_running_workflow))
+}
+
+/// Decide whether an `AgentComplete` event should fire a subagent-completion
+/// desktop notification, per the `[notifications].subagent_completion` mode.
+/// `settings()` still has the final say (method=off / condition=never).
+fn should_notify_subagent_completion(
+    mode: crate::config::SubagentCompletionNotification,
+    has_other_running_subagents: bool,
+    workflow_tool_running: bool,
+) -> bool {
+    use crate::config::SubagentCompletionNotification as Mode;
+    match mode {
+        Mode::Off => false,
+        Mode::Always => true,
+        Mode::FinalOnly => !has_other_running_subagents && !workflow_tool_running,
+    }
+}
+
+fn should_tick_status_animation(
+    app: &App,
+    has_running_agents: bool,
+    history_has_live_motion: bool,
+    active_cell_has_live_motion: bool,
+) -> bool {
+    app.is_loading
+        || has_running_agents
+        || app.is_compacting
+        || app.is_purging
+        || history_has_live_motion
+        || active_cell_has_live_motion
+}
+
+fn active_cell_has_live_motion(app: &App) -> bool {
+    app.active_cell.as_ref().is_some_and(|active| {
+        active.entries().iter().any(|cell| match cell {
+            HistoryCell::Thinking { streaming, .. } => *streaming,
+            HistoryCell::Tool(tool) => tool_cell_is_running(tool),
+            _ => false,
+        })
+    })
+}
+
 fn history_has_live_motion(history: &[HistoryCell]) -> bool {
     use crate::tui::history::SubAgentCell;
     use crate::tui::widgets::agent_card::AgentLifecycle;
     history.iter().any(|cell| match cell {
         HistoryCell::Thinking { streaming, .. } => *streaming,
-        HistoryCell::Tool(tool) => match tool {
-            ToolCell::Exec(cell) => cell.status == ToolStatus::Running,
-            ToolCell::Exploring(cell) => cell
-                .entries
-                .iter()
-                .any(|entry| entry.status == ToolStatus::Running),
-            ToolCell::PlanUpdate(cell) => cell.status == ToolStatus::Running,
-            ToolCell::PatchSummary(cell) => cell.status == ToolStatus::Running,
-            ToolCell::Review(cell) => cell.status == ToolStatus::Running,
-            ToolCell::DiffPreview(_) => false,
-            ToolCell::Mcp(cell) => cell.status == ToolStatus::Running,
-            ToolCell::ViewImage(_) => false,
-            ToolCell::WebSearch(cell) => cell.status == ToolStatus::Running,
-            ToolCell::Generic(cell) => cell.status == ToolStatus::Running,
-        },
+        HistoryCell::Tool(tool) => tool_cell_is_running(tool),
         HistoryCell::SubAgent(SubAgentCell::Delegate(card)) => matches!(
             card.status,
             AgentLifecycle::Pending | AgentLifecycle::Running
@@ -12655,7 +13182,7 @@ fn version_hint_from_latest_tag(tag: &str, current: &str) -> Option<String> {
     }
 
     Some(format!(
-        "v{latest} available - run `codewhale update` and restart"
+        "v{latest} available - run `codewhale update` and restart, then /change for what's new"
     ))
 }
 

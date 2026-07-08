@@ -27,7 +27,6 @@
 //! happen *before* the view is constructed (see `tui/ui.rs`); this
 //! module always assumes the user is being asked.
 
-use crate::command_safety::is_parallel_readonly_command;
 use crate::localization::Locale;
 use crate::sandbox::SandboxPolicy;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
@@ -37,6 +36,12 @@ use crossterm::event::{KeyCode, KeyEvent};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+pub mod policy;
+
+pub use policy::{
+    ApprovalStakes, RiskLevel, ToolCategory, classify_risk, classify_stakes, get_tool_category,
+};
 
 /// Determines when tool executions require user approval
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -53,6 +58,9 @@ pub enum ApprovalMode {
 }
 
 impl ApprovalMode {
+    /// Shift+Tab permission cycle order (#0.8.68 M2).
+    pub const PERMISSION_CYCLE: [Self; 3] = [Self::Suggest, Self::Auto, Self::Bypass];
+
     pub fn label(self) -> &'static str {
         match self {
             ApprovalMode::Auto => "AUTO",
@@ -72,6 +80,24 @@ impl ApprovalMode {
             _ => None,
         }
     }
+
+    #[must_use]
+    pub fn cycle_permission_next(self) -> Self {
+        let Some(index) = Self::PERMISSION_CYCLE.iter().position(|mode| *mode == self) else {
+            return Self::Suggest;
+        };
+        Self::PERMISSION_CYCLE[(index + 1) % Self::PERMISSION_CYCLE.len()]
+    }
+
+    #[must_use]
+    pub fn permission_chip_label(self) -> &'static str {
+        match self {
+            Self::Suggest => "Ask",
+            Self::Auto => "Auto-Review",
+            Self::Bypass => "Full Access",
+            Self::Never => "Never",
+        }
+    }
 }
 
 /// User's decision for a pending approval
@@ -85,42 +111,6 @@ pub enum ReviewDecision {
     Denied,
     /// Abort the entire turn
     Abort,
-}
-
-/// Categorizes tools by cost/risk level
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolCategory {
-    /// Free, read-only operations (`list_dir`, `read_file`, todo_*)
-    Safe,
-    /// File modifications (`write_file`, `edit_file`)
-    FileWrite,
-    /// Shell execution (`exec_shell`)
-    Shell,
-    /// Network-oriented built-in tools
-    Network,
-    /// Read-only MCP discovery and resource access
-    McpRead,
-    /// MCP actions that may change remote state
-    McpAction,
-    /// Sub-agent lifecycle (`agent` start/status/peek/cancel); the child's
-    /// own tool gates govern what it may actually do
-    Agent,
-    /// Unknown or unclassified tool surface
-    Unknown,
-}
-
-/// Stakes-based variant for the takeover modal.
-///
-/// `RiskLevel::Benign` lets a single keystroke commit the approval.
-/// `RiskLevel::Destructive` keeps stronger warning copy and styling
-/// around approvals that can touch files, shell, or remote state.
-///
-/// Routing rules live in [`classify_risk`] — when in doubt, route to
-/// `Destructive`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RiskLevel {
-    Benign,
-    Destructive,
 }
 
 /// Request for user approval of a tool execution
@@ -307,14 +297,12 @@ impl ApprovalRequest {
             .map(|mut detail| {
                 let is_preview = detail.label == "Preview";
                 detail.label = localize_detail_label(&detail.label, locale).to_string();
-                if is_preview {
-                    if let Some(lines) = detail.shell_lines.as_mut() {
-                        for line in lines.iter_mut() {
-                            *line = localize_preview_shell_line(&self.tool_name, line, locale)
-                                .to_string();
-                        }
-                        detail.value = lines.join("\n");
+                if is_preview && let Some(lines) = detail.shell_lines.as_mut() {
+                    for line in lines.iter_mut() {
+                        *line =
+                            localize_preview_shell_line(&self.tool_name, line, locale).to_string();
                     }
+                    detail.value = lines.join("\n");
                 }
                 detail
             })
@@ -451,156 +439,6 @@ fn build_apply_patch_ask_rules(params: &Value, workspace: &Path) -> Vec<ToolAskR
     }
 
     rules
-}
-
-/// Get the category for a tool by name
-pub fn get_tool_category(name: &str) -> ToolCategory {
-    if name == "agent" {
-        ToolCategory::Agent
-    } else if matches!(name, "write_file" | "edit_file" | "apply_patch") {
-        ToolCategory::FileWrite
-    } else if matches!(
-        name,
-        "web_run" | "web_search" | "fetch_url" | "wait_for_dev_server"
-    ) {
-        ToolCategory::Network
-    } else if matches!(
-        name,
-        "exec_shell"
-            | "task_shell_start"
-            | "task_shell_wait"
-            | "exec_shell_wait"
-            | "exec_shell_interact"
-            | "exec_wait"
-            | "exec_interact"
-    ) {
-        ToolCategory::Shell
-    } else if name.starts_with("list_mcp_")
-        || name.starts_with("read_mcp_")
-        || name.starts_with("get_mcp_")
-    {
-        ToolCategory::McpRead
-    } else if name.starts_with("mcp_") {
-        ToolCategory::McpAction
-    } else if matches!(
-        name,
-        "read_file"
-            | "list_dir"
-            | "todo_write"
-            | "todo_read"
-            | "note"
-            | "update_plan"
-            | "search"
-            | "file_search"
-            | "project"
-            | "diagnostics"
-    ) || name.starts_with("read_")
-        || name.starts_with("list_")
-        || name.starts_with("get_")
-    {
-        ToolCategory::Safe
-    } else {
-        ToolCategory::Unknown
-    }
-}
-
-/// Presentation-level stakes for the approval prompt (#3883 follow-up).
-///
-/// `RiskLevel` drives keymaps and stays conservative ("not provably
-/// read-only" is `Destructive`), but rendering everything in that bucket
-/// as a red DESTRUCTIVE takeover made routine file edits and build
-/// commands read like emergencies. Stakes split presentation three ways:
-///
-/// - `Routine` — provably read-only; minimal chrome.
-/// - `Elevated` — ordinary state-touching work (edits, builds, MCP
-///   actions); a calm approval, not a warning.
-/// - `Critical` — genuinely destructive, publish-like, or
-///   secret-touching per `ToolActionKind`; keeps the strong styling and
-///   the policy semantics lines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalStakes {
-    Routine,
-    Elevated,
-    Critical,
-}
-
-#[must_use]
-pub fn classify_stakes(
-    tool_name: &str,
-    category: ToolCategory,
-    risk: RiskLevel,
-    params: &Value,
-) -> ApprovalStakes {
-    if matches!(risk, RiskLevel::Benign) {
-        return ApprovalStakes::Routine;
-    }
-    match crate::tui::auto_review::ToolActionKind::from_tool_call(tool_name, params, category) {
-        crate::tui::auto_review::ToolActionKind::Publish
-        | crate::tui::auto_review::ToolActionKind::Destructive
-        | crate::tui::auto_review::ToolActionKind::Secret => ApprovalStakes::Critical,
-        _ => ApprovalStakes::Elevated,
-    }
-}
-
-/// Decide the stakes variant for an approval request.
-///
-/// The bias is conservative: a category we don't recognise routes to
-/// `Destructive`, and any shell command that `command_safety` flags as
-/// `Dangerous` is forced to `Destructive` even when the rest of the
-/// request looks calm. The split lets the modal render stronger warning
-/// copy on anything that can touch state outside this turn.
-#[must_use]
-pub fn classify_risk(tool_name: &str, category: ToolCategory, params: &Value) -> RiskLevel {
-    match category {
-        // Read paths and discovery.
-        ToolCategory::Safe | ToolCategory::McpRead => RiskLevel::Benign,
-        // Query-only network is benign; opening a URL pulls arbitrary
-        // remote content, so it stays destructive.
-        ToolCategory::Network => match tool_name {
-            "web_search" | "wait_for_dev_server" => RiskLevel::Benign,
-            // web_run is benign for search/query, but its `open`/`click`
-            // actions fetch model-supplied URLs (arbitrary remote content) —
-            // destructive, consistent with fetch_url.
-            "web_run" => {
-                let fetches_url = params
-                    .get("open")
-                    .and_then(Value::as_array)
-                    .is_some_and(|a| !a.is_empty())
-                    || params
-                        .get("click")
-                        .and_then(Value::as_array)
-                        .is_some_and(|a| !a.is_empty());
-                if fetches_url {
-                    RiskLevel::Destructive
-                } else {
-                    RiskLevel::Benign
-                }
-            }
-            _ => RiskLevel::Destructive,
-        },
-        // Shell stays destructive unless the existing command-safety analyzer
-        // can prove the concrete command is read-only.
-        ToolCategory::Shell => {
-            if let Some(cmd) = params.get("command").and_then(Value::as_str) {
-                if is_parallel_readonly_command(cmd) {
-                    return RiskLevel::Benign;
-                }
-            }
-            RiskLevel::Destructive
-        }
-        // Sub-agent lifecycle: status/peek are inspection-only. Starts and
-        // other actions keep the explicit-options keymap (the child's own
-        // gates govern what it may do once running).
-        ToolCategory::Agent => match params.get("action").and_then(Value::as_str) {
-            Some("status" | "peek" | "list") => RiskLevel::Benign,
-            _ => RiskLevel::Destructive,
-        },
-        // File writes, MCP actions, unclassified surfaces — all
-        // require explicit confirmation.
-        ToolCategory::FileWrite | ToolCategory::McpAction | ToolCategory::Unknown => {
-            RiskLevel::Destructive
-        }
-    }
 }
 
 fn param_preview(params: &Value, keys: &[&str], max_len: usize) -> Option<String> {
@@ -1024,10 +862,8 @@ fn changes_preview_lines(changes: &[Value]) -> Option<Vec<String>> {
             .and_then(Value::as_str)
             .unwrap_or("<file>");
         let content = change.get("content").and_then(Value::as_str).unwrap_or("");
-        if idx > 0 {
-            if !push_preview_line(&mut lines, String::new(), PREVIEW_LIMIT) {
-                break;
-            }
+        if idx > 0 && !push_preview_line(&mut lines, String::new(), PREVIEW_LIMIT) {
+            break;
         }
         if !push_preview_line(&mut lines, format!("file: {path}"), PREVIEW_LIMIT) {
             break;
@@ -3188,12 +3024,45 @@ diff --git a/src/b.rs b/src/b.rs
         let joined = lines.join("\n");
         assert!(joined.contains("REVIEW"), "missing REVIEW badge:\n{joined}");
         assert_approval_key_badges_visible(&joined);
-        assert!(joined.contains("Choose"), "benign hint missing:\n{joined}");
+        // The selection prose moved into the per-option key badges; the footer
+        // keeps only the escape-hatch hints.
         assert!(
-            joined.contains("Enter selected option"),
-            "benign selection hint missing:\n{joined}"
+            joined.contains("full params"),
+            "footer controls hint missing:\n{joined}"
         );
         assert!(joined.contains("read_file"));
+    }
+
+    #[test]
+    fn approval_footer_hints_use_muted_contrast_tier() {
+        // #3380: the footer key hints ("v: full params · Esc: abort") must
+        // render one contrast tier above TEXT_HINT — TEXT_MUTED, the same
+        // color the app-wide ActionHint modal footers use for labels.
+        use crate::palette;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let view = ApprovalView::new(benign_request());
+        let (w, h) = (100u16, 40u16);
+        let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+        ModalView::render(&view, Rect::new(0, 0, w, h), &mut buf);
+
+        let target: Vec<String> = "full params".chars().map(|c| c.to_string()).collect();
+        let mut found = None;
+        for y in 0..h {
+            let symbols: Vec<String> = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            for x in 0..=(w as usize - target.len()) {
+                if symbols[x..x + target.len()] == target[..] {
+                    found = Some((u16::try_from(x).expect("column fits"), y));
+                }
+            }
+        }
+        let (x, y) = found.expect("footer key hints must be rendered");
+        assert_eq!(
+            buf[(x, y)].fg,
+            palette::TEXT_MUTED,
+            "footer key hints must use the muted (not hint) contrast tier"
+        );
     }
 
     #[test]
@@ -3211,8 +3080,8 @@ diff --git a/src/b.rs b/src/b.rs
         );
         assert_approval_key_badges_visible(&joined);
         assert!(
-            joined.contains("Enter selected option"),
-            "selection hint missing:\n{joined}"
+            joined.contains("full params"),
+            "footer controls hint missing:\n{joined}"
         );
         assert!(
             !joined.contains("active approval policy"),
@@ -3266,12 +3135,8 @@ diff --git a/src/b.rs b/src/b.rs
             "routine write must not use the destructive zh badge:\n{joined}"
         );
         assert!(
-            joined.contains("选择："),
-            "missing zh selection prefix:\n{joined}"
-        );
-        assert!(
-            joined.contains("Enter执行选中项，或直接按y/a/d"),
-            "missing zh one-step hint:\n{joined}"
+            joined.contains("v：完整参数"),
+            "missing zh footer controls hint:\n{joined}"
         );
         assert!(
             !joined.contains("影响："),

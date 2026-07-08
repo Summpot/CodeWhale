@@ -1,11 +1,12 @@
 use super::*;
+use crate::fleet::roster::FleetRoster;
 use crate::tools::{AgentToolSurfaceOptions, ToolRegistryBuilder};
 use crate::worker_profile::ShellPolicy;
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
 use std::collections::HashSet;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tempfile::tempdir;
+use tempfile::{Builder as TempDirBuilder, tempdir};
 
 fn make_assignment() -> SubAgentAssignment {
     SubAgentAssignment::new("prompt".to_string(), Some("worker".to_string()))
@@ -632,6 +633,55 @@ async fn transient_header_timeout_then_success_chat_client(
     (client, calls)
 }
 
+async fn always_rate_limited_chat_client() -> (DeepSeekClient, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let calls = Arc::clone(&calls);
+            move |Json(_body): Json<Value>| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("Retry-After", "0")],
+                        Json(json!({
+                            "error": {
+                                "message": "test provider rate limit"
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake rate-limited chat server");
+    let addr = listener.local_addr().expect("fake chat server addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let config = crate::config::Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(format!("http://{addr}/v1")),
+        retry: Some(crate::config::RetryConfig {
+            enabled: Some(false),
+            max_retries: Some(0),
+            initial_delay: Some(0.0),
+            max_delay: Some(0.0),
+            exponential_base: Some(1.0),
+        }),
+        ..crate::config::Config::default()
+    };
+    let client = DeepSeekClient::new(&config).expect("fake rate-limited chat client");
+    (client, calls)
+}
+
 fn estimate_tool_description_tokens_conservative(text: &str) -> usize {
     text.chars().count().div_ceil(3)
 }
@@ -838,33 +888,6 @@ fn agent_description_explains_background_child_and_transcript_handle() {
 fn new_session_tools_use_single_agent_name() {
     let manager = Arc::new(RwLock::new(SubAgentManager::new(PathBuf::from("."), 1)));
     assert_eq!(AgentTool::new(manager, stub_runtime()).name(), "agent");
-}
-
-#[test]
-fn test_implementer_allowed_tools_include_writes() {
-    // Implementer is the write-heavy role; the deprecated
-    // `allowed_tools()` advisory list should reflect that the role
-    // can write/edit/patch even if today's runtime grants full
-    // inheritance.
-    #[allow(deprecated)]
-    let tools = SubAgentType::Implementer.allowed_tools();
-    assert!(tools.contains(&"write_file"));
-    assert!(tools.contains(&"edit_file"));
-    assert!(tools.contains(&"apply_patch"));
-}
-
-#[test]
-fn test_verifier_allowed_tools_include_test_runner_but_no_writes() {
-    // Verifier runs validation; it should not have write tools in
-    // its advisory list. The runtime will still gate writes through
-    // approval, but the advisory list signals intent.
-    #[allow(deprecated)]
-    let tools = SubAgentType::Verifier.allowed_tools();
-    assert!(tools.contains(&"run_tests"));
-    assert!(tools.contains(&"run_verifiers"));
-    assert!(tools.contains(&"diagnostics"));
-    assert!(!tools.contains(&"write_file"));
-    assert!(!tools.contains(&"apply_patch"));
 }
 
 #[test]
@@ -1086,6 +1109,297 @@ fn test_parse_spawn_request_rejects_out_of_range_max_depth() {
         err.to_string()
             .contains(&format!("max_depth must be between 0 and {ceiling}"))
     );
+}
+
+fn fleet_roster_with(id: &str, profile: codewhale_config::FleetProfile) -> FleetRoster {
+    let tmp = tempdir().expect("tempdir");
+    let config = codewhale_config::FleetConfigToml {
+        profiles: std::collections::BTreeMap::from([(id.to_string(), profile)]),
+        ..Default::default()
+    };
+    FleetRoster::load(&config, tmp.path())
+}
+
+fn custom_fleet_profile(role: &str) -> codewhale_config::FleetProfile {
+    codewhale_config::FleetProfile {
+        slot: codewhale_config::FleetSlot::from_name(role),
+        role: codewhale_config::FleetRole {
+            name: role.to_string(),
+            description: None,
+            instructions: None,
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_parse_spawn_request_accepts_profile_and_normalizes() {
+    let input = json!({
+        "prompt": "review the diff",
+        "profile": "  Reviewer  "
+    });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(parsed.profile.as_deref(), Some("reviewer"));
+    assert!(!parsed.agent_type_explicit);
+    assert!(!parsed.model_strength_explicit);
+
+    let parsed = parse_spawn_request(&json!({"prompt": "x", "fleet_profile": "Scout"}))
+        .expect("fleet_profile alias should parse");
+    assert_eq!(parsed.profile.as_deref(), Some("scout"));
+
+    let parsed = parse_spawn_request(&json!({"prompt": "x", "roster_profile": "BUILDER"}))
+        .expect("roster_profile alias should parse");
+    assert_eq!(parsed.profile.as_deref(), Some("builder"));
+}
+
+#[test]
+fn test_parse_spawn_request_rejects_invalid_profile_token() {
+    for bad in [
+        "rev iewer",
+        "rev\"iewer",
+        "rev'iewer",
+        "rev`iewer",
+        "rev=er",
+    ] {
+        let err = parse_spawn_request(&json!({"prompt": "x", "profile": bad}))
+            .expect_err("invalid profile token should fail");
+        assert!(
+            err.to_string()
+                .contains("profile must be a bare roster member id"),
+            "{bad}: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_apply_spawn_profile_unknown_lists_available_members() {
+    let roster = FleetRoster::built_ins_only();
+    let mut request =
+        parse_spawn_request(&json!({"prompt": "x", "profile": "warlock"})).expect("parse");
+    let err = apply_spawn_profile(&mut request, &roster).expect_err("unknown profile should fail");
+    let message = err.to_string();
+    assert!(message.contains("Unknown profile 'warlock'"), "{message}");
+    for member in [
+        "manager",
+        "scout",
+        "builder",
+        "reviewer",
+        "verifier",
+        "synthesizer",
+        "general",
+    ] {
+        assert!(message.contains(member), "missing {member}: {message}");
+    }
+}
+
+#[test]
+fn test_apply_spawn_profile_rejects_conflicting_explicit_type() {
+    let roster = FleetRoster::built_ins_only();
+    let mut request = parse_spawn_request(&json!({
+        "prompt": "x",
+        "profile": "reviewer",
+        "type": "implementer"
+    }))
+    .expect("parse");
+    let err = apply_spawn_profile(&mut request, &roster).expect_err("type conflict should fail");
+    let message = err.to_string();
+    assert!(
+        message.contains("profile 'reviewer' implies type review"),
+        "{message}"
+    );
+    assert!(
+        message.contains("conflicting explicit type 'implementer'"),
+        "{message}"
+    );
+}
+
+#[test]
+fn test_apply_spawn_profile_accepts_agreeing_explicit_type() {
+    let roster = FleetRoster::built_ins_only();
+    let mut request = parse_spawn_request(&json!({
+        "prompt": "x",
+        "profile": "reviewer",
+        "type": "review"
+    }))
+    .expect("parse");
+    let member = apply_spawn_profile(&mut request, &roster)
+        .expect("agreeing type should pass")
+        .expect("member resolved");
+    assert_eq!(member.id, "reviewer");
+    assert_eq!(request.agent_type, SubAgentType::Review);
+    assert_eq!(request.assignment.role.as_deref(), Some("reviewer"));
+}
+
+#[test]
+fn test_apply_spawn_profile_scout_yields_explore_type_and_faster_route() {
+    let roster = FleetRoster::built_ins_only();
+    let mut request = parse_spawn_request(&json!({"prompt": "map the parser", "profile": "scout"}))
+        .expect("parse");
+    let member = apply_spawn_profile(&mut request, &roster)
+        .expect("scout should resolve")
+        .expect("member resolved");
+    assert_eq!(request.agent_type, SubAgentType::Explore);
+    assert_eq!(
+        spawn_model_route(&request, Some(&member)),
+        ModelRoute::Faster,
+        "scout's fast loadout routes to the faster sibling"
+    );
+}
+
+#[test]
+fn test_apply_spawn_profile_synthesizer_yields_plan_type() {
+    let roster = FleetRoster::built_ins_only();
+    let mut request =
+        parse_spawn_request(&json!({"prompt": "merge findings", "profile": "synthesizer"}))
+            .expect("parse");
+    apply_spawn_profile(&mut request, &roster).expect("synthesizer should resolve");
+    assert_eq!(request.agent_type, SubAgentType::Plan);
+}
+
+#[test]
+fn test_spawn_model_route_profile_precedence() {
+    let mut profile = custom_fleet_profile("reviewer");
+    profile.model = Some("deepseek-v4-pro".to_string());
+    profile.loadout = codewhale_config::FleetLoadout::Fast;
+    let roster = fleet_roster_with("auditor", profile);
+    let member = roster.get("auditor").expect("member").clone();
+
+    // Member model pin beats loadout.
+    let request =
+        parse_spawn_request(&json!({"prompt": "x", "profile": "auditor"})).expect("parse");
+    assert_eq!(
+        spawn_model_route(&request, Some(&member)),
+        ModelRoute::Fixed("deepseek-v4-pro".to_string())
+    );
+
+    // Explicit model_strength beats the member model pin.
+    let request = parse_spawn_request(&json!({
+        "prompt": "x",
+        "profile": "auditor",
+        "model_strength": "same"
+    }))
+    .expect("parse");
+    assert_eq!(
+        spawn_model_route(&request, Some(&member)),
+        ModelRoute::Inherit
+    );
+
+    // Explicit model beats the member model pin: the requested route steps
+    // aside and the configured-model path fixes the explicit id.
+    let request = parse_spawn_request(&json!({
+        "prompt": "x",
+        "profile": "auditor",
+        "model": "deepseek-v4-flash"
+    }))
+    .expect("parse");
+    let requested_route = spawn_model_route(&request, Some(&member));
+    assert_eq!(
+        assignment_model_route(Some("deepseek-v4-flash"), requested_route),
+        ModelRoute::Fixed("deepseek-v4-flash".to_string())
+    );
+
+    // Without a model pin, the loadout decides: fast -> Faster, other
+    // loadouts inherit rather than auto-downgrade to the cheap sibling.
+    let mut fast = custom_fleet_profile("scout");
+    fast.loadout = codewhale_config::FleetLoadout::Fast;
+    let roster = fleet_roster_with("recon", fast);
+    let request = parse_spawn_request(&json!({"prompt": "x", "profile": "recon"})).expect("parse");
+    assert_eq!(
+        spawn_model_route(&request, roster.get("recon")),
+        ModelRoute::Faster
+    );
+
+    let mut strong = custom_fleet_profile("builder");
+    strong.loadout = codewhale_config::FleetLoadout::Custom("strong".to_string());
+    let roster = fleet_roster_with("architect", strong);
+    assert_eq!(
+        spawn_model_route(&request, roster.get("architect")),
+        ModelRoute::Inherit
+    );
+}
+
+#[test]
+fn test_child_max_spawn_depth_profile_hint_only_narrows() {
+    // Profile hint narrows the inherited budget...
+    assert_eq!(child_max_spawn_depth_for_spawn(3, 1, None, Some(1)), 2);
+    // ...but never widens it.
+    assert_eq!(child_max_spawn_depth_for_spawn(2, 0, None, Some(6)), 2);
+    // Explicit request takes the min with the hint.
+    assert_eq!(child_max_spawn_depth_for_spawn(2, 0, Some(3), Some(1)), 1);
+    // Explicit request alone keeps its existing widen-up-to-ceiling semantics.
+    assert_eq!(child_max_spawn_depth_for_spawn(2, 0, Some(3), None), 3);
+    assert_eq!(
+        child_max_spawn_depth_for_spawn(
+            2,
+            0,
+            Some(codewhale_config::MAX_SPAWN_DEPTH_CEILING),
+            None
+        ),
+        codewhale_config::MAX_SPAWN_DEPTH_CEILING
+    );
+    // Neither request nor hint: inherit unchanged.
+    assert_eq!(child_max_spawn_depth_for_spawn(5, 2, None, None), 5);
+}
+
+#[test]
+fn test_apply_spawn_profile_depth_hint_flows_from_member() {
+    let mut profile = custom_fleet_profile("scout");
+    profile.delegation.max_spawn_depth = Some(1);
+    let roster = fleet_roster_with("recon", profile);
+    let mut request =
+        parse_spawn_request(&json!({"prompt": "x", "profile": "recon", "max_depth": 3}))
+            .expect("parse");
+    let member = apply_spawn_profile(&mut request, &roster)
+        .expect("resolve")
+        .expect("member resolved");
+    let effective = child_max_spawn_depth_for_spawn(
+        DEFAULT_MAX_SPAWN_DEPTH,
+        1,
+        request.max_depth,
+        member.profile.delegation.max_spawn_depth,
+    );
+    assert_eq!(
+        effective, 2,
+        "hint 1 caps the requested 3 at spawn_depth 1 + 1"
+    );
+}
+
+#[test]
+fn test_apply_spawn_profile_appends_instruction_overlay() {
+    let mut profile = custom_fleet_profile("reviewer");
+    profile.role.description = Some("Security-focused reviewer.".to_string());
+    profile.role.instructions = Some("Check unsafe blocks first.".to_string());
+    let roster = fleet_roster_with("auditor", profile);
+    let mut request =
+        parse_spawn_request(&json!({"prompt": "audit the crate", "profile": "auditor"}))
+            .expect("parse");
+    apply_spawn_profile(&mut request, &roster).expect("resolve");
+    assert!(
+        request.prompt.starts_with("audit the crate"),
+        "{}",
+        request.prompt
+    );
+    assert!(
+        request.prompt.contains("Fleet profile: auditor"),
+        "{}",
+        request.prompt
+    );
+    assert!(
+        request
+            .prompt
+            .contains("Profile description:\nSecurity-focused reviewer."),
+        "{}",
+        request.prompt
+    );
+    assert!(
+        request
+            .prompt
+            .contains("Profile instructions:\nCheck unsafe blocks first."),
+        "{}",
+        request.prompt
+    );
+    // Ledger objective keeps the original task; the overlay is prompt-only.
+    assert_eq!(request.assignment.objective, "audit the crate");
 }
 
 #[tokio::test]
@@ -2453,6 +2767,90 @@ async fn subagent_retries_transient_provider_header_timeout_before_succeeding() 
 }
 
 #[tokio::test]
+async fn subagent_rate_limit_exhaustion_interrupts_with_checkpoint() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        tmp.path().to_path_buf(),
+        2,
+    )));
+    let agent_id = "agent_rate_limited_checkpoint".to_string();
+    let (task_input_tx, task_input_rx) = mpsc::unbounded_channel();
+    let agent = SubAgent::new(
+        agent_id.clone(),
+        SubAgentType::General,
+        "Inspect rate-limit recovery".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some("Blue".to_string()),
+        Some(vec![]),
+        task_input_tx,
+        tmp.path().to_path_buf(),
+        "boot_test".to_string(),
+    );
+    {
+        let mut manager = manager.write().await;
+        manager.agents.insert(agent_id.clone(), agent);
+        manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+    }
+
+    let (client, calls) = always_rate_limited_chat_client().await;
+    let mut runtime = stub_runtime().with_step_api_timeout(Duration::from_secs(5));
+    runtime.client = client;
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path());
+
+    let task = SubAgentTask {
+        manager_handle: Arc::clone(&manager),
+        runtime,
+        agent_id: agent_id.clone(),
+        agent_type: SubAgentType::General,
+        prompt: "Inspect rate-limit recovery".to_string(),
+        assignment: make_assignment(),
+        allowed_tools: Some(vec![]),
+        fork_context: false,
+        started_at: Instant::now(),
+        max_steps: 3,
+        token_budget: None,
+        input_rx: task_input_rx,
+        launch_gate: None,
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::spawn(run_subagent_task(task)),
+    )
+    .await
+    .expect("sub-agent task should finish")
+    .expect("sub-agent join should succeed");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        SUBAGENT_TRANSIENT_PROVIDER_MAX_RETRIES.saturating_add(1) as usize,
+        "rate-limit retries should be owned by the sub-agent retry loop"
+    );
+    let snapshot = {
+        let manager = manager.read().await;
+        manager
+            .get_result(&agent_id)
+            .expect("agent should stay registered")
+    };
+    let SubAgentStatus::Interrupted(reason) = &snapshot.status else {
+        panic!("expected interrupted sub-agent, got {:?}", snapshot.status);
+    };
+    assert!(
+        reason.contains("rate-limited provider response"),
+        "reason should name the provider rate limit: {reason}"
+    );
+    let checkpoint = snapshot
+        .checkpoint
+        .as_ref()
+        .expect("rate-limit interruption should preserve checkpoint");
+    assert_eq!(checkpoint.reason, "api_rate_limited");
+    assert!(checkpoint.continuable);
+    assert!(snapshot.needs_input.is_some());
+}
+
+#[tokio::test]
 async fn spawn_duplicate_session_name_error_names_conflicting_agent() {
     // #2656: the duplicate-name error must identify the conflicting agent so a
     // model can recover deterministically (reuse the id, or pick a new name).
@@ -3094,16 +3492,70 @@ fn parse_spawn_request_accepts_worktree_isolation() {
 }
 
 #[test]
-fn parse_spawn_request_rejects_cwd_with_worktree_isolation() {
+fn parse_spawn_request_accepts_cwd_with_worktree_isolation() {
     let input = json!({
         "prompt": "build feature A",
         "cwd": ".worktrees/manual",
         "worktree": true
     });
-    let err = parse_spawn_request(&input).expect_err("cwd and worktree should conflict");
+    let parsed = parse_spawn_request(&input).expect("cwd and worktree may be combined");
+    assert!(parsed.worktree.is_some());
+    assert!(parsed.cwd.is_some());
+}
+
+#[test]
+fn git_repo_root_finds_repo_from_direct_cwd() {
+    let repo = init_subagent_git_repo();
+    let root = git_repo_root(repo.path()).expect("direct repo cwd should resolve");
+    assert_eq!(
+        root.canonicalize().expect("canonical root"),
+        repo.path().canonicalize().expect("canonical repo")
+    );
+}
+
+#[test]
+fn git_repo_root_discovers_one_level_nested_repo_from_harness() {
+    let repo = init_subagent_git_repo();
+    let harness = tempdir().expect("harness dir");
+    let nested = harness.path().join("CodeWhale");
+    Command::new("git")
+        .args([
+            "clone",
+            repo.path().to_str().unwrap(),
+            nested.to_str().unwrap(),
+        ])
+        .output()
+        .expect("clone nested repo");
+    let root = git_repo_root(harness.path()).expect("harness cwd should discover nested repo");
+    assert_eq!(
+        root.canonicalize().expect("canonical root"),
+        nested.canonicalize().expect("canonical nested")
+    );
+}
+
+#[test]
+fn git_repo_root_reports_attempted_paths_when_no_repo_found() {
+    let repo_root = git_repo_root(&std::env::current_dir().expect("current dir"))
+        .expect("test should run inside the checkout");
+    let harness = TempDirBuilder::new()
+        .prefix(".codewhale-no-repo-")
+        .tempdir_in(repo_root.parent().expect("repo parent"))
+        .expect("empty harness outside checkout");
+    let empty = harness
+        .path()
+        .join("isolated")
+        .join("a")
+        .join("b")
+        .join("c")
+        .join("d")
+        .join("empty");
+    std::fs::create_dir_all(&empty).expect("empty nested dir");
+    let expected = empty.canonicalize().expect("canonical empty dir");
+    let err = git_repo_root(&empty).expect_err("missing repo should fail cleanly");
+    let message = err.to_string();
     assert!(
-        err.to_string().contains("either cwd or worktree"),
-        "unexpected error: {err}"
+        message.contains("Tried:") && message.contains(expected.to_string_lossy().as_ref()),
+        "expected friendly attempted-path error, got: {message}"
     );
 }
 
@@ -3171,6 +3623,104 @@ fn create_isolated_worktree_rejects_invalid_branch_as_input() {
     assert!(
         err.to_string().contains("Invalid worktree_branch"),
         "unexpected error: {err}"
+    );
+}
+
+fn init_git_repo_at(path: &std::path::Path) {
+    let init = Command::new("git")
+        .arg("init")
+        .current_dir(path)
+        .output()
+        .expect("git init should run");
+    assert!(init.status.success(), "git init failed");
+    let commit = Command::new("git")
+        .args([
+            "-c",
+            "user.name=codewhale Tests",
+            "-c",
+            "user.email=tests@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .current_dir(path)
+        .output()
+        .expect("git commit should run");
+    assert!(commit.status.success(), "git commit failed");
+}
+
+#[test]
+fn create_isolated_worktree_discovers_nested_repo_from_harness_parent() {
+    let harness = tempdir().expect("harness");
+    let nested = harness.path().join("CodeWhale");
+    std::fs::create_dir_all(&nested).expect("nested checkout dir");
+    init_git_repo_at(&nested);
+    let worktree_home = tempdir().expect("worktree home");
+    let request = SubAgentWorktreeRequest {
+        branch: Some("codex/agent-harness-nested".to_string()),
+        path: Some(worktree_home.path().join("isolated")),
+        base_ref: None,
+    };
+
+    let path = create_isolated_worktree(
+        harness.path(),
+        &request,
+        Some("harness-nested"),
+        &SubAgentType::Explore,
+    )
+    .expect("harness parent should discover nested repo");
+
+    assert!(path.exists(), "worktree path should exist");
+    assert_eq!(
+        current_git_branch(&path).as_deref(),
+        Some("codex/agent-harness-nested")
+    );
+}
+
+#[test]
+fn create_isolated_worktree_reports_friendly_error_when_no_repo_found() {
+    let harness = tempdir().expect("harness");
+    std::fs::create_dir_all(harness.path().join("not-a-repo")).expect("mkdir");
+    let worktree_home = tempdir().expect("worktree home");
+    let request = SubAgentWorktreeRequest {
+        branch: Some("codex/agent-missing".to_string()),
+        path: Some(worktree_home.path().join("isolated")),
+        base_ref: None,
+    };
+
+    let err = create_isolated_worktree(harness.path(), &request, None, &SubAgentType::General)
+        .expect_err("missing repo should fail with friendly error");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("requires a git repository") && message.contains("Tried:"),
+        "expected actionable discovery error, got: {message}"
+    );
+}
+
+#[test]
+fn create_isolated_worktree_rejects_ambiguous_nested_repos() {
+    let harness = tempdir().expect("harness");
+    for name in ["RepoA", "RepoB"] {
+        let nested = harness.path().join(name);
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        init_git_repo_at(&nested);
+    }
+    let worktree_home = tempdir().expect("worktree home");
+    let request = SubAgentWorktreeRequest {
+        branch: Some("codex/agent-ambiguous".to_string()),
+        path: Some(worktree_home.path().join("isolated")),
+        base_ref: None,
+    };
+
+    let err = create_isolated_worktree(harness.path(), &request, None, &SubAgentType::General)
+        .expect_err("multiple nested repos should fail deterministically");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("Multiple git repositories found"),
+        "expected ambiguity diagnostic, got: {message}"
     );
 }
 
@@ -3336,7 +3886,14 @@ fn annotated_failure_message_composes_class_tag_and_model_hint() {
     ))
     .context("Responses API request failed");
 
-    let annotated = annotate_child_model_error(&subagent_failure_message(&err), "gpt-5.5-codex");
+    let provider = crate::config::ApiProvider::OpenaiCodex;
+    let route = ModelRoute::Fixed("gpt-5.5-codex".to_string());
+    let annotated = annotate_child_model_error(
+        &subagent_failure_message(&err),
+        "gpt-5.5-codex",
+        provider,
+        &route,
+    );
 
     // Class tag from subagent_failure_message.
     assert!(annotated.starts_with("[auth]"), "{annotated}");
@@ -3355,6 +3912,10 @@ fn annotated_failure_message_composes_class_tag_and_model_hint() {
             || annotated.contains("child-agent model config"),
         "{annotated}"
     );
+    // #4049: the failure now names the provider and the route source.
+    assert!(annotated.contains(provider.display_name()), "{annotated}");
+    assert!(annotated.contains("route:"), "{annotated}");
+    assert!(annotated.contains("explicit model id"), "{annotated}");
 }
 
 #[test]
@@ -3402,7 +3963,9 @@ fn subagent_failure_message_preserves_error_chain() {
 fn annotate_child_model_error_adds_actionable_hint() {
     // #2653: a bare provider 403 becomes actionable by naming the model and the
     // recovery path, while unrelated errors pass through unchanged.
-    let auth = annotate_child_model_error("403 Forbidden", "kimi-k2");
+    let provider = crate::config::ApiProvider::Moonshot;
+    let inherit = ModelRoute::Inherit;
+    let auth = annotate_child_model_error("403 Forbidden", "kimi-k2", provider, &inherit);
     assert!(auth.contains("kimi-k2"), "names the model: {auth}");
     assert!(
         auth.contains("child model override"),
@@ -3412,13 +3975,19 @@ fn annotate_child_model_error_adds_actionable_hint() {
         auth.contains("403 Forbidden"),
         "preserves the original: {auth}"
     );
+    // #4049: provider + route source are named in the hint.
+    assert!(auth.contains(provider.display_name()), "{auth}");
+    assert!(auth.contains("inherited from the parent"), "{auth}");
 
-    let unrelated = annotate_child_model_error("connection reset by peer", "kimi-k2");
+    // Unrelated errors still pass through completely unchanged (no provider
+    // /route noise on a network failure).
+    let unrelated =
+        annotate_child_model_error("connection reset by peer", "kimi-k2", provider, &inherit);
     assert_eq!(unrelated, "connection reset by peer");
 
     // #3020: provider rejections that classify as Internal (not
     // Authorization/State) still get the hint via raw-text matching.
-    let not_exist = annotate_child_model_error("Model Not Exist", "kimi-k2");
+    let not_exist = annotate_child_model_error("Model Not Exist", "kimi-k2", provider, &inherit);
     assert!(
         not_exist.contains("child-agent model config"),
         "DeepSeek-style rejection gets the hint: {not_exist}"
@@ -3427,10 +3996,56 @@ fn annotate_child_model_error_adds_actionable_hint() {
     let openai_style = annotate_child_model_error(
         "The model `gpt-5.5-nano` does not exist or you do not have access to it.",
         "gpt-5.5-nano",
+        crate::config::ApiProvider::OpenaiCodex,
+        &ModelRoute::Fixed("gpt-5.5-nano".to_string()),
     );
     assert!(
         openai_style.contains("child-agent model config"),
         "OpenAI-style rejection gets the hint: {openai_style}"
+    );
+}
+
+#[test]
+fn child_launch_error_names_provider_model_and_route_source() {
+    // #4049: a model-not-found child launch failure must name the provider
+    // that was used, the model that was requested, and the route that produced
+    // it, so the parent (and user) can tell whether the provider context was
+    // lost, the wrong model was requested, or an override needs adjusting.
+    let err = anyhow::Error::new(crate::llm_client::LlmError::ModelError(
+        "Model \"deepseek-v4-pro\" not found".to_string(),
+    ));
+    let provider = crate::config::ApiProvider::Deepseek;
+    let route = ModelRoute::Fixed("deepseek-v4-pro".to_string());
+    let annotated = annotate_child_model_error(
+        &subagent_failure_message(&err),
+        "deepseek-v4-pro",
+        provider,
+        &route,
+    );
+    assert!(
+        annotated.contains(provider.display_name()),
+        "provider: {annotated}"
+    );
+    assert!(annotated.contains("deepseek-v4-pro"), "model: {annotated}");
+    assert!(
+        annotated.contains("route:"),
+        "route label present: {annotated}"
+    );
+    assert!(
+        annotated.contains("explicit model id"),
+        "route source: {annotated}"
+    );
+
+    // The route label reflects an inherited route distinctly from a fixed one.
+    let inherited = annotate_child_model_error(
+        &subagent_failure_message(&err),
+        "deepseek-v4-pro",
+        provider,
+        &ModelRoute::Inherit,
+    );
+    assert!(
+        inherited.contains("inherited from the parent"),
+        "inherit route source: {inherited}"
     );
 }
 
@@ -3490,6 +4105,10 @@ fn clamp_child_max_spawn_depth_enforces_absolute_ceiling() {
 #[allow(clippy::await_holding_lock)]
 async fn rate_limit_pause_blocks_subagent_spawn() {
     let _guard = crate::retry_status::test_guard();
+    // Drop-clear the window even if an assertion below panics: this state is
+    // process-global, and a leaked 30s pause strands every concurrently
+    // running test whose worker issues a model request.
+    let _clear = ClearRateLimitOnDrop;
     crate::retry_status::clear();
     crate::retry_status::clear_rate_limit();
     crate::retry_status::note_rate_limit(Duration::from_secs(30));
@@ -3515,7 +4134,6 @@ async fn rate_limit_pause_blocks_subagent_spawn() {
         manager.read().await.list().is_empty(),
         "refused spawn must not register or launch a worker"
     );
-    crate::retry_status::clear_rate_limit();
 }
 
 #[test]
@@ -4065,11 +4683,13 @@ fn stub_runtime() -> SubAgentRuntime {
     let context = ToolContext::new(workspace.clone());
     SubAgentRuntime {
         client: stub_client(),
+        api_config: None,
         model: "deepseek-v4-flash".to_string(),
         auto_model: false,
         reasoning_effort: None,
         reasoning_effort_auto: false,
         role_models: std::collections::HashMap::new(),
+        fleet_roster: std::sync::Arc::new(crate::fleet::roster::FleetRoster::built_ins_only()),
         context,
         allow_shell: true,
         agent_tool_surface_options: AgentToolSurfaceOptions::new(ShellPolicy::Full),
@@ -4083,6 +4703,7 @@ fn stub_runtime() -> SubAgentRuntime {
         parent_agent_id: None,
         parent_completion_tx: None,
         fork_context: None,
+        parent_mode: crate::tui::app::AppMode::Agent,
         mcp_pool: None,
         step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
         tool_timeout: DEFAULT_TOOL_TIMEOUT,
@@ -4134,6 +4755,12 @@ fn stub_client_for_provider(provider: &str) -> DeepSeekClient {
         }
         // Ollama is keyless (local runtime); extend per-provider as needed.
         "ollama" => {}
+        "sakana" => {
+            providers.sakana = crate::config::ProviderConfig {
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            };
+        }
         other => panic!("extend stub_client_for_provider for provider {other}"),
     }
     let config = crate::config::Config {
@@ -4152,6 +4779,154 @@ fn stub_client() -> DeepSeekClient {
         ..crate::config::Config::default()
     };
     DeepSeekClient::new(&config).expect("stub client should construct")
+}
+
+// ---- #4193: interactive-TUI in-process spawn honors a profile's pinned provider ----
+
+/// A `Config` with two fully-configured providers, each on a DISTINCT host so a
+/// test can prove a child client actually re-pointed: `deepseek` is the session
+/// route, `zai` is a pinned route. Provider-scoped keys/base URLs are used (root
+/// `api_key` intentionally unset) so `deepseek_api_key`/`deepseek_base_url`
+/// resolve each provider independently.
+fn cross_provider_config() -> crate::config::Config {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let providers = crate::config::ProvidersConfig {
+        deepseek: crate::config::ProviderConfig {
+            api_key: Some("session-key".to_string()),
+            base_url: Some("https://session-provider.example.com/v1".to_string()),
+            ..Default::default()
+        },
+        zai: crate::config::ProviderConfig {
+            api_key: Some("pinned-key".to_string()),
+            base_url: Some("https://pinned-provider.example.com/v1".to_string()),
+            ..Default::default()
+        },
+        ..crate::config::ProvidersConfig::default()
+    };
+    crate::config::Config {
+        provider: Some("deepseek".to_string()),
+        providers: Some(providers),
+        ..crate::config::Config::default()
+    }
+}
+
+/// A session runtime on `deepseek` with the cross-provider `Config` threaded in,
+/// exactly as the engine wires it via `with_api_config`.
+fn cross_provider_runtime() -> SubAgentRuntime {
+    let config = cross_provider_config();
+    let client = DeepSeekClient::new(&config).expect("session client builds");
+    let mut runtime = stub_runtime().with_api_config(config);
+    runtime.client = client;
+    runtime
+}
+
+/// A roster member whose profile explicitly pins `provider` (+ an arbitrary
+/// `model`), mirroring the on-disk `[fleet]` profile shape.
+fn member_pinning_provider(provider: &str, model: &str) -> crate::fleet::profile::AgentProfile {
+    let mut profile = custom_fleet_profile("worker");
+    profile.provider = Some(provider.to_string());
+    profile.model = Some(model.to_string());
+    crate::fleet::profile::AgentProfile {
+        id: format!("{provider}-worker"),
+        display_name: Some(format!("{provider} worker")),
+        description: None,
+        profile,
+        source: std::path::PathBuf::from(format!("{provider}-worker.toml")),
+        origin: crate::fleet::roster::ProfileOrigin::Workspace,
+    }
+}
+
+#[test]
+fn spawn_child_client_targets_profile_pinned_provider() {
+    // Session runs on DeepSeek; the roster member pins Z.ai. The in-process
+    // child must issue its request to a Z.ai client (Z.ai base URL + creds),
+    // not the shared session DeepSeek client (#4193 acceptance criterion).
+    let runtime = cross_provider_runtime();
+    assert_eq!(
+        runtime.client.api_provider(),
+        crate::config::ApiProvider::Deepseek,
+        "precondition: session is on DeepSeek"
+    );
+
+    let member = member_pinning_provider("zai", "glm-4.6");
+    let child_client = child_client_for_member(&runtime, Some(&member))
+        .expect("pinned-provider client builds when its creds are configured");
+
+    assert_eq!(
+        child_client.api_provider(),
+        crate::config::ApiProvider::Zai,
+        "child client must target the profile-pinned provider (#4193)"
+    );
+    assert!(
+        child_client
+            .base_url()
+            .contains("pinned-provider.example.com"),
+        "child must talk to the pinned provider's endpoint, got {}",
+        child_client.base_url()
+    );
+    assert!(
+        !child_client
+            .base_url()
+            .contains("session-provider.example.com"),
+        "child must NOT reuse the session provider's endpoint (the #4093 misroute)"
+    );
+}
+
+#[test]
+fn spawn_child_client_inherits_session_provider_without_pin() {
+    // Regression: profile-less members and members that pin no provider (or the
+    // session's own provider) keep the session client. No cross-provider build,
+    // no misroute, no behavior change from before #4193.
+    let runtime = cross_provider_runtime();
+
+    let inherited = child_client_for_member(&runtime, None)
+        .expect("profile-less spawn reuses the session client");
+    assert_eq!(
+        inherited.api_provider(),
+        crate::config::ApiProvider::Deepseek
+    );
+    assert!(
+        inherited
+            .base_url()
+            .contains("session-provider.example.com"),
+        "profile-less child stays on the session endpoint, got {}",
+        inherited.base_url()
+    );
+
+    // A member that pins the SAME provider as the session also stays put.
+    let same = member_pinning_provider("deepseek", "deepseek-v4-flash");
+    let same_client = child_client_for_member(&runtime, Some(&same))
+        .expect("same-provider pin reuses the session client");
+    assert_eq!(
+        same_client.api_provider(),
+        crate::config::ApiProvider::Deepseek
+    );
+    assert!(
+        same_client
+            .base_url()
+            .contains("session-provider.example.com")
+    );
+}
+
+#[test]
+fn spawn_child_client_fails_closed_when_pinned_provider_unavailable() {
+    // Defense in depth (#4093): if the pinned provider's client cannot be built
+    // (here: no session Config threaded in), fail the spawn instead of silently
+    // sending the pinned model id to the session provider's endpoint.
+    let mut runtime = cross_provider_runtime();
+    runtime.api_config = None; // simulate a legacy/untethered runtime
+
+    let member = member_pinning_provider("zai", "glm-4.6");
+    // `DeepSeekClient` is not `Debug`, so match instead of `expect_err`.
+    let err = match child_client_for_member(&runtime, Some(&member)) {
+        Ok(_) => panic!("must fail closed when the pinned client cannot be built"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("zai"),
+        "error must name the pinned provider so the failure is actionable: {msg}"
+    );
 }
 
 // ---- #405 session-boundary classification ----
@@ -4613,7 +5388,37 @@ async fn run_subagent_task_emits_parent_completion_before_terminal_update() {
             .get_result(&agent_id)
             .expect("completed agent should be present")
     };
-    assert_eq!(snapshot.status, SubAgentStatus::Completed);
+    assert!(
+        matches!(snapshot.status, SubAgentStatus::Failed(_)),
+        "0 max_steps cannot produce a final summary, so the child must fail: {:?}",
+        snapshot.status
+    );
+}
+
+#[test]
+fn summarize_subagent_result_diagnoses_missing_completed_payload() {
+    let snap = make_snapshot(SubAgentStatus::Completed);
+    let summary = summarize_subagent_result(&snap);
+    assert!(
+        summary.contains("no final summary"),
+        "Completed without payload must not read as silent success: {summary}"
+    );
+}
+
+#[test]
+fn summarize_subagent_result_budget_exhaustion_is_actionable_not_raw_done() {
+    let mut snap = make_snapshot(SubAgentStatus::BudgetExhausted);
+    snap.result = Some("partial findings from step 1".to_string());
+    let summary = summarize_subagent_result(&snap);
+    assert!(summary.contains("partial output preserved"), "{summary}");
+    assert!(!summary.eq("Token budget exhausted"), "{summary}");
+
+    let empty = make_snapshot(SubAgentStatus::BudgetExhausted);
+    let summary = summarize_subagent_result(&empty);
+    assert!(
+        summary.contains("retry with a smaller scoped task"),
+        "{summary}"
+    );
 }
 
 #[test]
@@ -4662,6 +5467,76 @@ fn nested_tool_runtime_routes_child_completions_to_local_inbox() {
         root_rx.try_recv().is_err(),
         "root engine must not receive nested child completion directly"
     );
+}
+
+#[test]
+fn subagent_completion_from_result_surfaces_step_limit_not_silent_success() {
+    let snap = make_snapshot(SubAgentStatus::Failed(
+        "child reached its step limit (12 steps) without returning a final summary".to_string(),
+    ));
+    let completion = subagent_completion_from_result(&snap);
+    assert!(completion.payload.contains("step limit"), "{completion:?}");
+    assert!(!completion.payload.contains("Completed (no output)"));
+}
+
+#[test]
+fn subagent_completion_from_result_preserves_missing_final_summary_diagnostic() {
+    let snap = make_snapshot(SubAgentStatus::Completed);
+    let completion = subagent_completion_from_result(&snap);
+    assert!(
+        completion.payload.contains("no final summary"),
+        "{completion:?}"
+    );
+}
+
+#[test]
+fn subagent_budget_exhaustion_completion_carries_budget_exhausted_sentinel() {
+    let mut snap = make_snapshot(SubAgentStatus::BudgetExhausted);
+    snap.result = Some("partial findings from step 2".to_string());
+    let completion = subagent_completion_from_result(&snap);
+    assert!(
+        completion.payload.contains("partial output preserved"),
+        "{completion:?}"
+    );
+    let inner = completion
+        .payload
+        .split("<codewhale:subagent.done>")
+        .nth(1)
+        .and_then(|chunk| chunk.split("</codewhale:subagent.done>").next())
+        .expect("sentinel json");
+    let parsed: serde_json::Value = serde_json::from_str(inner).expect("sentinel parses");
+    assert_eq!(parsed["status"], "budget_exhausted");
+    assert_eq!(parsed["summary_location"], "previous_line");
+}
+
+#[test]
+fn subagent_completion_inlines_evidence_before_sentinel() {
+    let mut snap = make_snapshot(SubAgentStatus::Completed);
+    snap.result =
+        Some("VERDICT: pass\n### EVIDENCE\n- src/lib.rs:1-3 — init ok\n### GAPS\nnone".to_string());
+    let completion = subagent_completion_from_result(&snap);
+    let evidence_pos = completion
+        .payload
+        .find("### EVIDENCE")
+        .expect("evidence block");
+    let sentinel_pos = completion
+        .payload
+        .find("<codewhale:subagent.done>")
+        .expect("sentinel");
+    assert!(evidence_pos < sentinel_pos, "evidence before sentinel");
+    assert!(completion.payload.contains("src/lib.rs:1-3"));
+    assert!(
+        completion.payload.find("VERDICT: pass").unwrap_or(0) < evidence_pos,
+        "summary before evidence"
+    );
+}
+
+#[test]
+fn subagent_completion_skips_empty_evidence_on_failed_child() {
+    let mut snap = make_snapshot(SubAgentStatus::Failed("boom".to_string()));
+    snap.result = Some("### EVIDENCE\n- should-not-appear".to_string());
+    let completion = subagent_completion_from_result(&snap);
+    assert!(!completion.payload.contains("### EVIDENCE"));
 }
 
 #[test]
@@ -4870,6 +5745,75 @@ fn faster_route_uses_known_deepseek_and_glm_family_siblings() {
 }
 
 #[test]
+fn inherit_route_remaps_stale_deepseek_model_for_sakana_provider() {
+    let mut runtime = stub_runtime_for_provider("sakana");
+    runtime.model = "deepseek-v4-flash".to_string();
+
+    let route = fallback_subagent_assignment_route(
+        &runtime,
+        None,
+        ModelRoute::Inherit,
+        SubAgentThinking::Inherit,
+        "summarize the repo layout",
+    );
+    assert_eq!(route.model, "deepseek-v4-flash");
+
+    let validated = ensure_subagent_model_for_provider(&runtime, &route.model_route, route.model)
+        .expect("inherit should remap to operator route");
+    assert_eq!(validated, crate::config::DEFAULT_SAKANA_MODEL);
+    assert!(
+        !validated.contains("deepseek"),
+        "Sakana inherit must not keep DeepSeek ids: {validated}"
+    );
+}
+
+#[test]
+fn faster_route_remaps_stale_deepseek_model_for_sakana_provider() {
+    let mut runtime = stub_runtime_for_provider("sakana");
+    runtime.model = "deepseek-v4-flash".to_string();
+
+    let route = fallback_subagent_assignment_route(
+        &runtime,
+        None,
+        ModelRoute::Faster,
+        SubAgentThinking::Inherit,
+        "quick scan",
+    );
+    let validated = ensure_subagent_model_for_provider(&runtime, &route.model_route, route.model)
+        .expect("faster should remap to operator route");
+    assert_eq!(validated, crate::config::DEFAULT_SAKANA_MODEL);
+}
+
+#[test]
+fn fixed_route_rejects_deepseek_model_for_sakana_provider() {
+    let runtime = stub_runtime_for_provider("sakana");
+    let err = ensure_subagent_model_for_provider(
+        &runtime,
+        &ModelRoute::Fixed("deepseek-v4-flash".to_string()),
+        "deepseek-v4-flash".to_string(),
+    )
+    .expect_err("explicit DeepSeek pin must fail before spawn");
+    assert!(
+        err.to_string().contains("deepseek-v4-flash"),
+        "error should name the model: {err}"
+    );
+}
+
+#[test]
+fn normalize_requested_subagent_model_rejects_cross_namespace_for_sakana() {
+    let err = normalize_requested_subagent_model(
+        "deepseek-v4-flash",
+        "model",
+        crate::config::ApiProvider::Sakana,
+    )
+    .expect_err("Sakana must reject DeepSeek-only model ids at spawn");
+    assert!(
+        err.to_string().contains("deepseek-v4-flash"),
+        "error should name the model: {err}"
+    );
+}
+
+#[test]
 fn gpt55_faster_route_stays_on_gpt55_with_low_reasoning() {
     // AC: a faster/explore child of a GPT-5.5 (OpenAI Codex) parent must stay
     // on GPT-5.5 — there is no cheaper same-provider sibling, so we never
@@ -4942,6 +5886,51 @@ fn role_model_validation_stays_strict_on_official_deepseek() {
         msg.contains("deepseek-v4-pro"),
         "lists accepted ids from model_completion_names_for_provider: {msg}"
     );
+}
+
+#[test]
+fn operator_model_for_subagent_enumerates_from_catalog_facade() {
+    // #4116: the operator-route fallback must source its model from the
+    // catalog-backed ProviderLake facade, not the raw legacy table. On the
+    // strict official DeepSeek API an invalid id is rejected, forcing the
+    // enumeration branch; the chosen model must be exactly the facade's first
+    // entry (proving the consumer was migrated off the raw legacy path), never
+    // an invented id.
+    crate::provider_lake::clear_live_snapshot();
+    let mut runtime = stub_runtime(); // official DeepSeek API (strict validation)
+    runtime.model = "definitely-not-a-real-model".to_string();
+
+    let provider = runtime.client.api_provider();
+    assert_eq!(provider, crate::config::ApiProvider::Deepseek);
+    // Sanity: the strict provider really does reject the invalid id, so
+    // operator_model_for_subagent must take the enumeration branch.
+    assert!(crate::config::validate_route(provider, &runtime.model).is_err());
+
+    let facade = crate::provider_lake::all_catalog_models_for_provider(provider);
+    assert!(
+        !facade.is_empty(),
+        "expected the catalog facade to enumerate DeepSeek models"
+    );
+
+    let chosen = operator_model_for_subagent(&runtime);
+    assert_eq!(
+        chosen, facade[0],
+        "operator model must come from the catalog-backed facade"
+    );
+    assert_ne!(
+        chosen, "definitely-not-a-real-model",
+        "operator model must not echo an invalid id"
+    );
+    // No-regression guard: DeepSeek's catalog view still enumerates every legacy
+    // id it accepted before the migration (facade ⊇ legacy for this provider).
+    let facade_lower: std::collections::BTreeSet<String> =
+        facade.iter().map(|m| m.to_ascii_lowercase()).collect();
+    for legacy in crate::config::model_completion_names_for_provider(provider) {
+        assert!(
+            facade_lower.contains(&legacy.to_ascii_lowercase()),
+            "catalog facade dropped legacy model {legacy:?} for {provider:?}"
+        );
+    }
 }
 
 #[test]
@@ -5379,6 +6368,57 @@ async fn per_worker_token_budget_does_not_double_count_scope_accounting() {
         Some(100),
         "scope accounting must equal the single turn's tokens, not double-count: {:?}",
         worker_record.usage
+    );
+}
+
+/// Clears the process-wide rate-limit window on drop so a panicking test
+/// body cannot leak a live pause into concurrently running tests.
+struct ClearRateLimitOnDrop;
+
+impl Drop for ClearRateLimitOnDrop {
+    fn drop(&mut self) {
+        crate::retry_status::clear_rate_limit();
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn worker_is_not_stranded_by_transient_global_rate_limit_window() {
+    // Regression for a parallel-suite flake: `rate_limit_pause_blocks_subagent_spawn`
+    // opens a 30s process-wide rate-limit window and closes it milliseconds
+    // later. A worker whose request reached `send_with_retry` inside that
+    // window used to commit to sleeping the FULL remaining window without
+    // re-checking, blowing the 5s timeouts in the budget tests above. The
+    // pause must be re-polled so an already-cleared window releases
+    // in-flight requests promptly.
+    let _guard = crate::retry_status::test_guard();
+    let _clear = ClearRateLimitOnDrop;
+    crate::retry_status::note_rate_limit(Duration::from_secs(30));
+
+    let tmp = tempdir().expect("tempdir");
+    let (manager, agent_id, _calls, task_handle) =
+        spawn_budget_capped_worker(tmp.path(), 60, 40, Some(50), 4).await;
+
+    // Simulate the concurrent test finishing: the window closes shortly
+    // after the worker's first request has already observed it.
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        crate::retry_status::clear_rate_limit();
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), task_handle)
+        .await
+        .expect("worker must not be stranded by an already-cleared rate-limit window")
+        .expect("task should finish");
+
+    let result = {
+        let manager = manager.read().await;
+        manager.get_result(&agent_id).expect("agent registered")
+    };
+    assert!(
+        matches!(result.status, SubAgentStatus::BudgetExhausted),
+        "expected BudgetExhausted, got {:?}",
+        result.status
     );
 }
 

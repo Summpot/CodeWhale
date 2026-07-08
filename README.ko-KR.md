@@ -35,7 +35,7 @@ CodeWhale이 실제 라우트를 해석해 실행합니다.
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.66
+codewhale --version   # 0.8.67
 ```
 
 npm 래퍼(Node 18+)는 GitHub Releases에서 SHA-256으로 검증된 바이너리를
@@ -64,18 +64,19 @@ nix run github:Hmbown/CodeWhale
 scoop install codewhale        # or the NSIS installer from GitHub Releases
 
 # CNB mirror for users who cannot reliably reach GitHub
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-cli --locked --force
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.66 codewhale-tui --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.67 codewhale-cli --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.67 codewhale-tui --locked --force
 
 # Legacy Homebrew compatibility while the formula is renamed
 brew tap Hmbown/deepseek-tui
 brew install deepseek-tui
 ```
 
-모든 플랫폼용 사전 빌드 아카이브는 Linux riscv64를 포함해
+Linux x64/arm64, macOS x64/arm64, Windows x64용 사전 빌드 아카이브는
 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases)에
-첨부되어 있습니다. 체크섬, 중국 미러, Windows 관련 세부 사항, 문제
-해결은 [docs/INSTALL.md](docs/INSTALL.md)에 있습니다.
+첨부되어 있습니다. Linux riscv64 사전 빌드는 upstream QuickJS bindings
+지원이 준비될 때까지 잠시 중단되었습니다. 체크섬, 중국 미러, Windows
+관련 세부 사항, 문제 해결은 [docs/INSTALL.md](docs/INSTALL.md)에 있습니다.
 
 **레거시 `deepseek-tui` 패키지에서 업그레이드하나요?** 설정, 세션,
 스킬, MCP 설정은 보존됩니다. [docs/REBRAND.md](docs/REBRAND.md)를
@@ -277,7 +278,7 @@ README는 짧은 버전입니다. 나머지는 docs와
   출력 계약, 복구 동작.
 - [아키텍처](docs/ARCHITECTURE.md) — 크레이트 구성, 런타임 흐름, 도구 시스템,
   확장 지점, 보안 모델.
-- [WhaleFlow 작성](docs/WHALEFLOW_AUTHORING.md) · [MCP](docs/MCP.md) ·
+- [Workflow 작성](docs/WORKFLOW_AUTHORING.md) · [MCP](docs/MCP.md) ·
   [Runtime API](docs/RUNTIME_API.md) · [Model Lab](docs/MODEL_LAB.md)
 - [키 바인딩](docs/KEYBINDINGS.md) · [샌드박스와 승인](docs/SANDBOX.md)
   · [접근성](docs/ACCESSIBILITY.md) · [Docker](docs/DOCKER.md)

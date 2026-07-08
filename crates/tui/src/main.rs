@@ -2,6 +2,9 @@
 
 #![allow(clippy::uninlined_format_args)]
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -72,6 +75,7 @@ mod project_context;
 mod project_context_cache;
 mod prompt_zones;
 mod prompts;
+mod provider_lake;
 mod purge;
 mod remote_setup;
 pub mod repl;
@@ -336,6 +340,13 @@ struct ExecArgs {
     /// Override model for this run
     #[arg(long)]
     model: Option<String>,
+    /// Override the provider for this run (e.g. `deepseek`, `openrouter`).
+    /// Non-secret identifier only — credentials still resolve from the
+    /// environment/config. Fleet uses this to launch a worker on its
+    /// profile-pinned provider even when the parent session is on another
+    /// one (#4093).
+    #[arg(long)]
+    provider: Option<String>,
     /// Enable tool-backed agent mode with auto-approvals
     #[arg(long, default_value_t = false)]
     auto: bool,
@@ -1117,6 +1128,14 @@ enum SandboxCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Match the dispatcher entrypoint: Unix shells and supervisors may inherit
+    // SIGPIPE ignored, which turns short pipelines such as `codewhale doctor |
+    // head` into BrokenPipe panics once this delegated TUI binary prints.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     startup_trace::mark_process_start();
     configure_windows_console_utf8();
     install_rustls_crypto_provider();
@@ -1240,12 +1259,32 @@ async fn main() -> Result<()> {
                 // Honour DEEPSEEK_BASE_URL forwarded by the CLI dispatcher from --base-url.
                 if let Ok(env_url) = std::env::var("DEEPSEEK_BASE_URL") {
                     let trimmed = env_url.trim();
-                    eprintln!("DEBUG DEEPSEEK_BASE_URL='{trimmed}'");
                     if !trimmed.is_empty() {
                         config.base_url = Some(trimmed.to_string());
                     }
-                } else {
-                    eprintln!("DEBUG DEEPSEEK_BASE_URL not set");
+                }
+                // Honour `--provider` (#4093): a Fleet worker whose profile pins
+                // a provider launches on that provider even when the parent
+                // session is on another one. This sets ONLY the non-secret
+                // provider identity (`config.provider`); credentials/base URL
+                // still resolve from the worker's own env/config, and for a
+                // non-DeepSeek provider the legacy root `base_url` above is
+                // ignored by `deepseek_base_url()`. Must precede model
+                // resolution so an `auto`/default model resolves to the
+                // overridden provider's default.
+                if let Some(provider_arg) = args
+                    .provider
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                {
+                    let Some(provider) = crate::config::ApiProvider::parse(provider_arg) else {
+                        bail!(
+                            "Unrecognized --provider {provider_arg:?}. Known providers: {}",
+                            crate::config::ApiProvider::names_hint()
+                        );
+                    };
+                    config.provider = Some(provider.as_str().to_string());
                 }
                 let model = resolve_exec_model(&config, args.model.as_deref());
                 let prompt = join_prompt_parts(&args.prompt);
@@ -1830,12 +1869,13 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
             .unwrap_or_else(|| "codewhale".to_string())
     }
 
-    let exec_config = config
-        .fleet
-        .as_ref()
-        .map(|fleet| fleet.exec.clone())
-        .unwrap_or_default();
-    let manager = FleetManager::open(workspace)?.with_exec_config(exec_config);
+    let fleet_config = config.fleet_config();
+    // The configured route is the operator: fleet workers without a
+    // task/profile model pin inherit the session's active model.
+    let manager = FleetManager::open(workspace)?
+        .with_exec_config(fleet_config.exec.clone())
+        .with_fleet_config(fleet_config)
+        .with_session_model(config.default_model());
     match args.command {
         FleetCommand::Init => {
             println!("fleet ledger: {}", manager.ledger_path().display());
@@ -2266,8 +2306,8 @@ fn run_setup(config: &Config, workspace: &Path, args: SetupArgs) -> Result<()> {
     use crate::palette;
     use colored::Colorize;
 
-    let (aqua_r, aqua_g, aqua_b) = palette::DEEPSEEK_SKY_RGB;
-    let (sky_r, sky_g, sky_b) = palette::DEEPSEEK_SKY_RGB;
+    let (aqua_r, aqua_g, aqua_b) = palette::WHALE_INFO_RGB;
+    let (sky_r, sky_g, sky_b) = palette::WHALE_INFO_RGB;
 
     let any_explicit = args.mcp || args.skills || args.tools || args.plugins;
     let run_mcp = args.mcp || args.all || !any_explicit;
@@ -2483,9 +2523,9 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
     use crate::palette;
     use colored::Colorize;
 
-    let (aqua_r, aqua_g, aqua_b) = palette::DEEPSEEK_SKY_RGB;
-    let (sky_r, sky_g, sky_b) = palette::DEEPSEEK_SKY_RGB;
-    let (red_r, red_g, red_b) = palette::DEEPSEEK_RED_RGB;
+    let (aqua_r, aqua_g, aqua_b) = palette::WHALE_INFO_RGB;
+    let (sky_r, sky_g, sky_b) = palette::WHALE_INFO_RGB;
+    let (red_r, red_g, red_b) = palette::WHALE_ERROR_RGB;
 
     println!(
         "{}",
@@ -2694,9 +2734,9 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
     use colored::Colorize;
 
     let (accent_r, accent_g, accent_b) = palette::WHALE_ACCENT_PRIMARY_RGB;
-    let (sky_r, sky_g, sky_b) = palette::DEEPSEEK_SKY_RGB;
-    let (aqua_r, aqua_g, aqua_b) = palette::DEEPSEEK_SKY_RGB;
-    let (red_r, red_g, red_b) = palette::DEEPSEEK_RED_RGB;
+    let (sky_r, sky_g, sky_b) = palette::WHALE_INFO_RGB;
+    let (aqua_r, aqua_g, aqua_b) = palette::WHALE_INFO_RGB;
+    let (red_r, red_g, red_b) = palette::WHALE_ERROR_RGB;
 
     println!(
         "{}",
@@ -3830,12 +3870,18 @@ fn print_doctor_setup_report(
 
     let first_run_ready = state.first_run_ready();
     let update_ready = state.update_ready(crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION);
+    let operate_ready = state.operate_ready();
     let first_run_icon = if first_run_ready {
         "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2)
     } else {
         "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2)
     };
     let update_icon = if update_ready {
+        "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2)
+    } else {
+        "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2)
+    };
+    let operate_icon = if operate_ready {
         "✓".truecolor(ok_rgb.0, ok_rgb.1, ok_rgb.2)
     } else {
         "!".truecolor(warn_rgb.0, warn_rgb.1, warn_rgb.2)
@@ -3852,6 +3898,10 @@ fn print_doctor_setup_report(
         "  {update_icon} update checkpoint {}: {}",
         crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
         doctor_ready_label(update_ready)
+    );
+    println!(
+        "  {operate_icon} operate/fleet: {}",
+        doctor_ready_label(operate_ready)
     );
     println!(
         "  · constitution autonomy: {} (guidance only)",
@@ -3880,7 +3930,7 @@ fn print_doctor_setup_report(
         );
     }
     println!(
-        "  · next actions: /constitution (standing law), /setup report (readiness), /provider or /model (route), /config (runtime posture)"
+        "  · next actions: /constitution (standing law), /setup report (readiness), /setup provider or /provider setup <name> (provider credentials), /model (route), /config (runtime posture), /setup fleet (Operate/Fleet readiness), /fleet setup (explicit profile authoring), /setup hotbar (optional shortcuts), /setup tools (Tools/MCP readiness), /setup remote (remote runtime on-ramp), /setup persistence (path review)"
     );
     for step in codewhale_config::SetupStep::ALL {
         let entry = state.steps.get(&step);
@@ -4034,6 +4084,110 @@ fn doctor_runtime_posture_line(config: &Config, workspace: &Path) -> String {
     )
 }
 
+fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_json::Value {
+    use serde_json::json;
+
+    let provider = config.api_provider();
+    let has_credentials_or_local = crate::config::has_api_key_for(config, provider);
+    let subagents_enabled = config.subagents_enabled_for_provider(provider);
+    let disabled_reason = if subagents_enabled {
+        None
+    } else {
+        Some(
+            config
+                .subagents_disabled_reason()
+                .unwrap_or("disabled for active provider"),
+        )
+    };
+    let max_subagents = config.max_subagents_for_provider(provider);
+    let launch_concurrency = config.launch_concurrency_for_provider(provider);
+    let max_admitted = config.max_admitted_subagents_for_provider(provider);
+    let roster = crate::fleet::roster::FleetRoster::load(&config.fleet_config(), workspace);
+    let mut built_in_members = 0usize;
+    let mut config_members = 0usize;
+    let mut workspace_members = 0usize;
+    for member in roster.members() {
+        match member.origin {
+            crate::fleet::roster::ProfileOrigin::BuiltIn => built_in_members += 1,
+            crate::fleet::roster::ProfileOrigin::Config => config_members += 1,
+            crate::fleet::roster::ProfileOrigin::Workspace => workspace_members += 1,
+        }
+    }
+    let roster_members = roster.members().len();
+    let custom_members = config_members + workspace_members;
+    let roster_ready = roster_members > 0;
+    let runtime_ready = subagents_enabled && max_subagents > 0 && launch_concurrency > 0;
+
+    json!({
+        "ready": has_credentials_or_local && runtime_ready && roster_ready,
+        "provider": {
+            "id": provider.as_str(),
+            "auth": {
+                "present_or_local": has_credentials_or_local,
+                "source": doctor_api_key_source_label(resolve_api_key_source(config)),
+            },
+        },
+        "worker_runtime": {
+            "ready": runtime_ready,
+            "enabled": subagents_enabled,
+            "disabled_reason": disabled_reason,
+            "max_subagents": max_subagents,
+            "launch_concurrency": launch_concurrency,
+            "max_admitted": max_admitted,
+        },
+        "roster": {
+            "ready": roster_ready,
+            "total": roster_members,
+            "built_in": built_in_members,
+            "config": config_members,
+            "workspace": workspace_members,
+            "custom": custom_members,
+            "starter_roster_available": built_in_members > 0,
+            "readiness_rule": "built-in starter roster or custom roster",
+        },
+        "concurrency": {
+            "launch_concurrency": launch_concurrency,
+            "max_subagents": max_subagents,
+            "max_admitted": max_admitted,
+            "plan_limit_probed": false,
+        },
+    })
+}
+
+fn doctor_provider_model_report_json(config: &Config) -> serde_json::Value {
+    use serde_json::json;
+
+    let provider = config.api_provider();
+    let auth_source = resolve_api_key_source(config);
+    let auth_present_or_local = crate::config::has_api_key_for(config, provider);
+    let credential_url = provider.credential_url();
+
+    json!({
+        "provider": {
+            "id": provider.as_str(),
+            "display": provider.display_name(),
+        },
+        "model": {
+            "resolved": config.default_model(),
+        },
+        "auth": {
+            "present_or_local": auth_present_or_local,
+            "source": doctor_api_key_source_label(auth_source),
+            "env_vars": provider.env_vars(),
+            "credential_url": credential_url,
+            "oauth_only": provider == crate::config::ApiProvider::OpenaiCodex,
+        },
+        "health": {
+            "live_validation": false,
+            "next_action": if auth_present_or_local {
+                "/model"
+            } else {
+                "/setup provider or /provider setup <name>"
+            },
+        },
+    })
+}
+
 fn doctor_setup_report_json(config: &Config, workspace: &Path) -> serde_json::Value {
     use serde_json::json;
 
@@ -4088,6 +4242,7 @@ fn doctor_setup_report_json(config: &Config, workspace: &Path) -> serde_json::Va
         "checkpoint_version": crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
         "first_run_ready": state.first_run_ready(),
         "update_ready": state.update_ready(crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION),
+        "operate_ready": state.operate_ready(),
         "constitution": {
             "choice": constitution_choice_id(state.constitution_choice),
             "source": constitution_source_id(state.constitution_source),
@@ -4126,12 +4281,19 @@ fn doctor_setup_report_json(config: &Config, workspace: &Path) -> serde_json::Va
                 "source": "workspace",
             },
         },
+        "provider_model": doctor_provider_model_report_json(config),
+        "operate_fleet": doctor_operate_fleet_report_json(config, workspace),
         "consistency": doctor_setup_consistency(&state, source),
         "next_actions": {
             "constitution": "/constitution",
             "setup_report": "/setup report",
-            "provider_model": "/provider or /model",
+            "provider_model": "/setup provider, /provider setup <name>, or /model",
             "runtime_posture": "/config",
+            "operate_fleet": "/setup fleet (readiness), /fleet setup (explicit profile authoring)",
+            "hotbar": "/setup hotbar",
+            "tools_mcp": "/setup tools",
+            "remote_runtime": "/setup remote",
+            "persistence": "/setup persistence",
         },
         "steps": steps,
     })
@@ -4145,7 +4307,9 @@ fn setup_step_id(step: codewhale_config::SetupStep) -> &'static str {
         codewhale_config::SetupStep::ToolsMcp => "tools_mcp",
         codewhale_config::SetupStep::Hotbar => "hotbar",
         codewhale_config::SetupStep::RemoteRuntime => "remote_runtime",
+        codewhale_config::SetupStep::Persistence => "persistence",
         codewhale_config::SetupStep::Constitution => "constitution",
+        codewhale_config::SetupStep::OperateFleet => "operate_fleet",
         codewhale_config::SetupStep::Verification => "verification",
     }
 }
@@ -5086,8 +5250,8 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
     use session_manager::{SessionManager, format_session_line};
 
     let (accent_r, accent_g, accent_b) = palette::WHALE_ACCENT_PRIMARY_RGB;
-    let (sky_r, sky_g, sky_b) = palette::DEEPSEEK_SKY_RGB;
-    let (aqua_r, aqua_g, aqua_b) = palette::DEEPSEEK_SKY_RGB;
+    let (sky_r, sky_g, sky_b) = palette::WHALE_INFO_RGB;
+    let (aqua_r, aqua_g, aqua_b) = palette::WHALE_INFO_RGB;
 
     let manager = SessionManager::default_location()?;
 
@@ -5153,9 +5317,9 @@ fn init_project() -> Result<()> {
     use colored::Colorize;
     use project_context::create_default_agents_md;
 
-    let (sky_r, sky_g, sky_b) = palette::DEEPSEEK_SKY_RGB;
-    let (aqua_r, aqua_g, aqua_b) = palette::DEEPSEEK_SKY_RGB;
-    let (red_r, red_g, red_b) = palette::DEEPSEEK_RED_RGB;
+    let (sky_r, sky_g, sky_b) = palette::WHALE_INFO_RGB;
+    let (aqua_r, aqua_g, aqua_b) = palette::WHALE_INFO_RGB;
+    let (red_r, red_g, red_b) = palette::WHALE_ERROR_RGB;
 
     let workspace = std::env::current_dir()?;
     let agents_path = workspace.join("AGENTS.md");
@@ -7595,6 +7759,10 @@ async fn run_exec_agent(
         lsp_config,
         runtime_services: crate::tools::spec::RuntimeToolServices::default(),
         subagent_model_overrides: execution_config.subagent_model_overrides(),
+        fleet_roster: std::sync::Arc::new(crate::fleet::roster::FleetRoster::load(
+            &execution_config.fleet_config(),
+            &workspace,
+        )),
         subagent_api_timeout: std::time::Duration::from_secs(
             execution_config.subagent_api_timeout_secs_for_provider(effective_provider),
         ),
@@ -8272,8 +8440,10 @@ mod doctor_setup_state_tests {
         let workspace = tmp.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
 
-        let mut state = codewhale_config::SetupState::default();
-        state.constitution_source = codewhale_config::ConstitutionSource::UserGlobal;
+        let state = codewhale_config::SetupState {
+            constitution_source: codewhale_config::ConstitutionSource::UserGlobal,
+            ..Default::default()
+        };
         state.save().expect("persist setup state");
 
         let report = doctor_setup_report_json(&Config::default(), &workspace);
@@ -8349,14 +8519,47 @@ mod doctor_setup_state_tests {
         assert_eq!(report["next_actions"]["setup_report"], "/setup report");
         assert_eq!(
             report["next_actions"]["provider_model"],
-            "/provider or /model"
+            "/setup provider, /provider setup <name>, or /model"
         );
         assert_eq!(report["next_actions"]["runtime_posture"], "/config");
+        assert_eq!(
+            report["next_actions"]["operate_fleet"],
+            "/setup fleet (readiness), /fleet setup (explicit profile authoring)"
+        );
+        assert_eq!(report["next_actions"]["hotbar"], "/setup hotbar");
+        assert_eq!(report["next_actions"]["tools_mcp"], "/setup tools");
+        assert_eq!(report["next_actions"]["remote_runtime"], "/setup remote");
+        assert_eq!(report["next_actions"]["persistence"], "/setup persistence");
         assert_eq!(
             report["checkpoint_version"],
             crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION
         );
         assert_eq!(report["update_ready"], false);
+        assert_eq!(report["operate_ready"], false);
+        assert_eq!(
+            report["operate_fleet"]["concurrency"]["plan_limit_probed"],
+            false
+        );
+        assert_eq!(
+            report["operate_fleet"]["roster"]["readiness_rule"],
+            "built-in starter roster or custom roster"
+        );
+        assert_eq!(report["provider_model"]["provider"]["id"], "deepseek");
+        assert_eq!(report["provider_model"]["provider"]["display"], "DeepSeek");
+        assert_eq!(
+            report["provider_model"]["model"]["resolved"],
+            crate::config::DEFAULT_TEXT_MODEL
+        );
+        assert_eq!(report["provider_model"]["auth"]["source"], "missing");
+        assert_eq!(
+            report["provider_model"]["auth"]["credential_url"],
+            "https://platform.deepseek.com/api_keys"
+        );
+        assert_eq!(
+            report["provider_model"]["auth"]["env_vars"][0],
+            "DEEPSEEK_API_KEY"
+        );
+        assert_eq!(report["provider_model"]["health"]["live_validation"], false);
         assert_eq!(report["constitution"]["source"], "bundled");
         assert_eq!(report["constitution"]["autonomy_preference"], "unspecified");
         assert_eq!(report["runtime_posture"]["source"], "unset");
@@ -8375,6 +8578,78 @@ mod doctor_setup_state_tests {
             "prompt"
         );
         assert_eq!(provider_step(&report)["status"], "needs_action");
+    }
+
+    #[test]
+    fn doctor_setup_provider_model_json_covers_cn_codex_and_local_matrix() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().expect("tempdir");
+        let (_home_guard, _codewhale_home) = prepare_env(&tmp);
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _deepseek_key = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _deepseek_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _codex_key = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+        let _codex_legacy_key = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let cn_config = Config {
+            provider: Some("deepseek-cn".to_string()),
+            ..Config::default()
+        };
+        let cn_report = doctor_setup_report_json(&cn_config, &workspace);
+        assert_eq!(cn_report["provider_model"]["provider"]["id"], "deepseek-cn");
+        assert_eq!(
+            cn_report["provider_model"]["provider"]["display"],
+            "DeepSeek (legacy alias)"
+        );
+        assert_eq!(
+            cn_report["provider_model"]["auth"]["env_vars"][0],
+            "DEEPSEEK_API_KEY"
+        );
+        assert_eq!(
+            cn_report["provider_model"]["auth"]["credential_url"],
+            "https://platform.deepseek.com/api_keys"
+        );
+        assert_eq!(cn_report["provider_model"]["auth"]["oauth_only"], false);
+        assert_eq!(
+            cn_report["provider_model"]["health"]["live_validation"],
+            false
+        );
+
+        let codex_config = Config {
+            provider: Some("openai-codex".to_string()),
+            ..Config::default()
+        };
+        let codex_report = doctor_setup_report_json(&codex_config, &workspace);
+        assert_eq!(
+            codex_report["provider_model"]["provider"]["id"],
+            crate::config::ApiProvider::OpenaiCodex.as_str()
+        );
+        assert!(codex_report["provider_model"]["auth"]["credential_url"].is_null());
+        assert_eq!(codex_report["provider_model"]["auth"]["oauth_only"], true);
+        assert_eq!(
+            codex_report["provider_model"]["health"]["next_action"],
+            "/setup provider or /provider setup <name>"
+        );
+
+        let local_config = Config {
+            provider: Some("ollama".to_string()),
+            ..Config::default()
+        };
+        let local_report = doctor_setup_report_json(&local_config, &workspace);
+        assert_eq!(local_report["provider_model"]["provider"]["id"], "ollama");
+        assert_eq!(
+            local_report["provider_model"]["auth"]["present_or_local"],
+            true
+        );
+        assert!(local_report["provider_model"]["auth"]["credential_url"].is_null());
+        assert_eq!(local_report["provider_model"]["auth"]["oauth_only"], false);
+        assert_eq!(
+            local_report["provider_model"]["health"]["next_action"],
+            "/model"
+        );
     }
 
     #[test]
@@ -8447,6 +8722,7 @@ mod doctor_setup_state_tests {
         assert_eq!(report["source"], "persisted");
         assert_eq!(report["first_run_ready"], true);
         assert_eq!(report["update_ready"], true);
+        assert_eq!(report["operate_ready"], false);
         assert_eq!(report["constitution"]["choice"], "bundled");
         assert_eq!(
             report["constitution"]["checkpoint_completed_for"],
@@ -8482,6 +8758,75 @@ mod doctor_setup_state_tests {
             "config"
         );
         assert_eq!(provider_step(&report)["result"], "deepseek/deepseek-chat");
+    }
+
+    #[test]
+    fn doctor_setup_report_json_reports_operate_readiness() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().expect("tempdir");
+        let (_home_guard, _codewhale_home) = prepare_env(&tmp);
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let mut state = codewhale_config::SetupState::default();
+        state.set_step(
+            codewhale_config::SetupStep::Language,
+            codewhale_config::StepEntry::new(
+                codewhale_config::StepStatus::Verified,
+                true,
+                crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            ),
+        );
+        state.set_step(
+            codewhale_config::SetupStep::ProviderModel,
+            codewhale_config::StepEntry::new(
+                codewhale_config::StepStatus::Verified,
+                true,
+                crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            ),
+        );
+        state.runtime_posture_source = codewhale_config::RuntimePostureSource::Confirmed;
+        state.complete_constitution_checkpoint(
+            crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            codewhale_config::ConstitutionChoice::Bundled,
+        );
+        state.set_step(
+            codewhale_config::SetupStep::OperateFleet,
+            codewhale_config::StepEntry::new(
+                codewhale_config::StepStatus::Verified,
+                false,
+                crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            )
+            .with_result(
+                "provider=ready, runtime=ready, roster=ready, concurrency=plan limit not probed",
+            ),
+        );
+        state.save().expect("persist setup state");
+
+        let report = doctor_setup_report_json(&Config::default(), &workspace);
+
+        assert_eq!(report["first_run_ready"], true);
+        assert_eq!(report["operate_ready"], true);
+        assert_eq!(
+            report["operate_fleet"]["concurrency"]["plan_limit_probed"],
+            false
+        );
+        assert!(
+            report["operate_fleet"]["roster"]["built_in"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        let operate_step = report["steps"]
+            .as_array()
+            .expect("steps array")
+            .iter()
+            .find(|step| step["step"] == "operate_fleet")
+            .expect("operate/fleet step");
+        assert_eq!(operate_step["status"], "verified");
+        assert!(
+            operate_step["result"]
+                .as_str()
+                .is_some_and(|result| result.contains("plan limit not probed"))
+        );
     }
 }
 
@@ -9037,6 +9382,34 @@ mod terminal_mode_tests {
 
         assert!(args.json);
         assert_eq!(args.prompt, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn exec_parses_provider_flag_alongside_model() {
+        // #4093: Fleet threads `--provider <id>` so a worker launches on its
+        // profile-pinned provider even when the parent session is elsewhere.
+        let cli = parse_cli(&[
+            "codewhale",
+            "exec",
+            "--provider",
+            "openrouter",
+            "--model",
+            "glm-5.2",
+            "audit",
+        ]);
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert_eq!(args.provider.as_deref(), Some("openrouter"));
+        assert_eq!(args.model.as_deref(), Some("glm-5.2"));
+        assert_eq!(args.prompt, vec!["audit"]);
+        // The threaded id round-trips through the provider vocabulary the exec
+        // handler validates against — never a model-id sniff (EPIC #2608).
+        assert_eq!(
+            crate::config::ApiProvider::parse(args.provider.as_deref().unwrap()),
+            Some(crate::config::ApiProvider::Openrouter)
+        );
     }
 
     #[test]
