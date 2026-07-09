@@ -7654,3 +7654,23 @@ fn custom_provider_base_url_and_model_resolve_from_named_table() {
     assert_eq!(config.deepseek_base_url(), "https://api.example.com/v1");
     assert_eq!(config.default_model(), "custom-model-v1");
 }
+
+#[test]
+fn provider_auth_mode_save_uses_requested_path_and_preserves_comments() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "# keep this operator note\n[providers.xai]\nmodel = \"grok-code-fast-1\" # keep model note\n",
+    )
+    .expect("seed config");
+
+    let saved = save_provider_auth_mode_for_at(ApiProvider::Xai, "oauth", Some(&path))
+        .expect("save auth mode");
+
+    assert_eq!(saved, path);
+    let contents = std::fs::read_to_string(&saved).expect("read config");
+    assert!(contents.contains("# keep this operator note"));
+    assert!(contents.contains("model = \"grok-code-fast-1\" # keep model note"));
+    assert!(contents.contains("auth_mode = \"oauth\""));
+}
