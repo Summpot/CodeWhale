@@ -1001,16 +1001,11 @@ fn sync_workflow_history_card_from_panel(app: &mut App) {
                     return;
                 }
                 // Prefer full event-bearing records when the tool has completed.
-                if generic.status != ToolStatus::Running
-                    && value
+                generic.status == ToolStatus::Running
+                    || !value
                         .get("events")
                         .and_then(|e| e.as_array())
                         .is_some_and(|e| !e.is_empty())
-                {
-                    false
-                } else {
-                    true
-                }
             }
         };
         if replace {
