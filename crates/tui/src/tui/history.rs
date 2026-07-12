@@ -692,7 +692,7 @@ impl ExecCell {
 
         // Foreground shell waits block the turn but do not need a verbose
         // transcript card — spinner + running badge + Ctrl+B hint only.
-        // Command, live output, and artifact paths belong in the Tasks sidebar
+        // Command, live output, and artifact paths belong in the Activity sidebar
         // and `/jobs` detail surfaces.
         if compact_foreground_wait {
             return wrap_card_rail(lines);
@@ -1311,22 +1311,43 @@ impl GenericToolCell {
             return lines;
         }
 
-        // #4038: give the `workflow` tool a purpose-built run card (run_id,
-        // status, goal, children, progress, schema errors) instead of
-        // collapsing to a one-line generic header or dumping raw JSON.
-        if let Some(lines) = self.try_render_as_workflow(width, low_motion) {
+        // #4038 / #4122: purpose-built workflow run card (compact in live,
+        // expanded in transcript) shared with the WorkflowPanel state machine.
+        if let Some(lines) = self.try_render_as_workflow(width, low_motion, mode) {
             return lines;
         }
 
         // Sub-agent launch already gets a dedicated `DelegateCard`
-        // that owns the live action tree, status, and final summary. The
-        // generic tool block for the same call duplicates that signal at
-        // 3-4 lines per spawn — N parallel spawns multiply the noise. In
-        // live mode, render one compact summary line and let the
-        // DelegateCard be the source of truth. Transcript mode keeps the
-        // full block so session replay remains complete.
-        if matches!(mode, RenderMode::Live) && self.name == "agent" {
-            return agent_activity::render_agent_compact(self, low_motion);
+        // that owns the live action tree, status, and final summary (#4133).
+        // Spawns therefore render nothing here in either mode — one visible
+        // artifact per delegated unit. Inspection/join calls (peek/status/
+        // wait) stay as a single compact line (#4112 dogfood A5).
+        if self.name == "agent" {
+            if agent_activity::is_agent_inspection(self) {
+                return agent_activity::render_agent_compact(self, low_motion);
+            }
+            // Spawn / start / run: suppress the generic tool card entirely.
+            return Vec::new();
+        }
+
+        // A call to a tool that doesn't exist carries exactly one useful
+        // fact: the catalog error. The full name:/args:/result: block turns
+        // each model slip into a four-line card (dogfood A5) — collapse it
+        // to a single header line in both render modes.
+        if self.status == ToolStatus::Failed
+            && let Some(output) = self.output.as_deref()
+            && output.contains("is not available in the current tool catalog")
+        {
+            let family = crate::tui::widgets::tool_card::tool_family_for_name(&self.name);
+            let summary = truncate_text(output.trim(), 200);
+            return wrap_card_rail(vec![render_tool_header_with_family_and_summary(
+                family,
+                Some(summary.as_str()),
+                tool_status_label(self.status),
+                self.status,
+                None,
+                low_motion,
+            )]);
         }
 
         // Live mode stays calm: successful tool calls collapse to one header
@@ -1496,15 +1517,17 @@ impl GenericToolCell {
         ))
     }
 
-    /// Render the `workflow` tool as a compact run card rather than the
-    /// generic one-line header (live) or a large JSON dump (transcript).
-    /// Fields are parsed defensively from the tool's JSON output, which is
-    /// either a single `WorkflowRunRecord` or a `{action:"status",
-    /// runs:[...]}` list; anything that does not parse falls back to the
-    /// generic renderer. The header owns the lifecycle label (Wave 5c #7);
-    /// the body deliberately carries no `status:` KV. Full live overlay
-    /// (#4038) is future work.
-    fn try_render_as_workflow(&self, width: u16, low_motion: bool) -> Option<Vec<Line<'static>>> {
+    /// Render the `workflow` tool via the shared WorkflowPanel history-card
+    /// renderer (#4122). Live mode stays compact (lifecycle, children, phases,
+    /// failures, elapsed); transcript mode expands phase/child summaries,
+    /// artifact/transcript links, final result, and failure details.
+    /// Status-list payloads keep a multi-run summary card.
+    fn try_render_as_workflow(
+        &self,
+        width: u16,
+        low_motion: bool,
+        mode: RenderMode,
+    ) -> Option<Vec<Line<'static>>> {
         if self.name != "workflow" {
             return None;
         }
@@ -1563,85 +1586,67 @@ impl GenericToolCell {
             return Some(wrap_card_rail(lines));
         }
 
-        let run_id = value
-            .get("run_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("workflow");
+        use crate::tui::widgets::workflow_panel::{WorkflowHistoryExtras, WorkflowPanel};
+        let panel = WorkflowPanel::from_run_json(&value)?;
+        // Prefer the panel's lifecycle-aware status label when the tool cell
+        // is still marked running but the snapshot already terminal (or vice
+        // versa during live streaming).
+        let header_status = match panel.lifecycle {
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Failed
+            | crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Cancelled => {
+                ToolStatus::Failed
+            }
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Succeeded => {
+                ToolStatus::Success
+            }
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Pending
+            | crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Running => {
+                if self.status == ToolStatus::Failed {
+                    ToolStatus::Failed
+                } else if self.status == ToolStatus::Success {
+                    ToolStatus::Success
+                } else {
+                    ToolStatus::Running
+                }
+            }
+        };
+        let summary = panel.history_header_summary(usize::from(width).saturating_sub(18));
         lines.push(render_tool_header_with_family_and_summary(
             family,
-            Some(run_id),
-            tool_status_label(self.status),
-            self.status,
+            Some(summary.as_str()),
+            tool_status_label(header_status),
+            header_status,
             None,
             low_motion,
         ));
-        if let Some(goal) = value
-            .get("workflow_goal")
-            .and_then(serde_json::Value::as_str)
-            && !goal.trim().is_empty()
-        {
-            lines.extend(render_card_detail_line(
-                Some("goal"),
-                &truncate_text(goal.trim(), 200),
-                tool_value_style(),
-                width,
-            ));
-        }
-        let child_count = value
-            .get("child_ids")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0);
-        lines.extend(render_compact_kv(
-            "children",
-            &child_count.to_string(),
-            tool_value_style(),
-            width,
-        ));
-        if let Some(progress) = value.get("progress").and_then(serde_json::Value::as_array)
-            && let Some(last) = progress.last().and_then(serde_json::Value::as_str)
-        {
-            lines.extend(render_card_detail_line(
-                Some("progress"),
-                &format!("{} ({} events)", truncate_text(last, 160), progress.len()),
-                tool_value_style(),
-                width,
-            ));
-        }
-        if let Some(verification) = value.get("verification")
-            && let Some(summary) = verification
-                .get("summary")
-                .and_then(serde_json::Value::as_str)
-        {
-            lines.extend(render_card_detail_line(
-                Some("verification"),
-                &truncate_text(summary, 200),
-                tool_value_style(),
-                width,
-            ));
-        }
-        let schema_error_count = value
-            .get("schema_errors")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0);
-        if schema_error_count > 0 {
-            lines.extend(render_card_detail_line(
-                Some("schema errors"),
-                &schema_error_count.to_string(),
-                tool_value_style(),
-                width,
-            ));
-        }
-        if let Some(error) = value.get("error").and_then(serde_json::Value::as_str)
-            && !error.trim().is_empty()
-        {
-            lines.extend(render_card_detail_line(
-                Some("error"),
-                &truncate_text(error.trim(), 200),
-                tool_value_style(),
-                width,
-            ));
+        let expanded = matches!(mode, RenderMode::Transcript);
+        if expanded {
+            let extras = WorkflowHistoryExtras {
+                result_summary: panel.result_summary.clone(),
+                source_path: panel.source_path.clone().or_else(|| {
+                    value
+                        .get("source_path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(std::path::PathBuf::from)
+                }),
+                spillover_path: self.spillover_path.clone(),
+                verification_summary: value
+                    .get("verification")
+                    .and_then(|v| v.get("summary"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            };
+            for detail in panel.history_expanded_lines(width, &extras) {
+                // history_expanded_lines omit the leading indent; re-use the
+                // card detail path so rails and spacing stay consistent.
+                let text: String = detail.spans.iter().map(|s| s.content.as_ref()).collect();
+                lines.extend(render_card_detail_line(
+                    None,
+                    &text,
+                    tool_value_style(),
+                    width,
+                ));
+            }
         }
         Some(wrap_card_rail(lines))
     }

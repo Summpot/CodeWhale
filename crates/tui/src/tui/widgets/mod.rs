@@ -14,6 +14,7 @@ pub mod decision_card;
 pub mod pending_input_preview;
 mod renderable;
 pub mod tool_card;
+pub mod workflow_panel;
 
 pub use footer::{
     FooterProps, FooterToast, FooterWidget, footer_agents_chip, footer_shell_label_chip,
@@ -161,16 +162,17 @@ impl ChatWidget {
         if !has_collapsed {
             let mut cell_revisions: Vec<u64> =
                 Vec::with_capacity(app.history.len() + active_entries.len());
-            cell_revisions.extend_from_slice(&app.history_revisions);
+            cell_revisions.extend(
+                app.history_revisions
+                    .iter()
+                    .copied()
+                    .map(history_entry_revision),
+            );
             if !active_entries.is_empty() {
                 let active_rev = app.active_cell_revision;
                 for i in 0..active_entries.len() {
                     let salt = (i as u64).wrapping_add(1);
-                    cell_revisions.push(
-                        active_rev
-                            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                            .wrapping_add(salt),
-                    );
+                    cell_revisions.push(active_entry_revision(active_rev, salt));
                 }
             }
             // Build identity mapping: filtered index == original index.
@@ -186,10 +188,26 @@ impl ChatWidget {
                 None,
             );
         } else {
-            // Slow path: clone non-collapsed cells into filtered vecs so
-            // collapsed cells are excluded from rendering. Build the
-            // filtered→original index mapping.
-            let mut filtered_cells: Vec<HistoryCell> =
+            // Slow path: borrow non-collapsed cells into a filtered ref list
+            // so collapsed cells are excluded from rendering, and build the
+            // filtered→original index mapping. Collapsed run starts render a
+            // synthetic summary cell; those few summaries are materialized
+            // up front so the ref list can borrow from a stable Vec —
+            // avoiding the per-frame deep clone of every visible cell that
+            // this path used to pay (#3896).
+            let summary_cells: Vec<(usize, HistoryCell)> = tool_runs
+                .iter()
+                .filter(|run| collapsed_run_starts.contains(&run.start))
+                .map(|run| (run.start, tool_run_summary_cell(run)))
+                .collect();
+            let summary_cell_for = |idx: usize| -> Option<&HistoryCell> {
+                summary_cells
+                    .iter()
+                    .find(|(start, _)| *start == idx)
+                    .map(|(_, cell)| cell)
+            };
+
+            let mut filtered_cells: Vec<&HistoryCell> =
                 Vec::with_capacity(history_len + active_entries.len());
             let mut filtered_revs: Vec<u64> =
                 Vec::with_capacity(history_len + active_entries.len());
@@ -207,7 +225,7 @@ impl ChatWidget {
                     .iter()
                     .find(|run| run.start == idx && collapsed_run_starts.contains(&idx))
                 {
-                    filtered_cells.push(tool_run_summary_cell(run));
+                    filtered_cells.push(summary_cell_for(idx).expect("summary cell materialized"));
                     filtered_revs.push(tool_run_summary_revision(
                         run,
                         &app.history_revisions,
@@ -217,8 +235,8 @@ impl ChatWidget {
                     filtered_to_original.push(idx);
                     continue;
                 }
-                filtered_cells.push(cell.clone());
-                filtered_revs.push(app.history_revisions[idx]);
+                filtered_cells.push(cell);
+                filtered_revs.push(history_entry_revision(app.history_revisions[idx]));
                 filtered_to_original.push(idx);
             }
 
@@ -235,7 +253,8 @@ impl ChatWidget {
                     if let Some(run) = tool_runs.iter().find(|run| {
                         run.start == original_idx && collapsed_run_starts.contains(&original_idx)
                     }) {
-                        filtered_cells.push(tool_run_summary_cell(run));
+                        filtered_cells
+                            .push(summary_cell_for(original_idx).expect("summary materialized"));
                         filtered_revs.push(tool_run_summary_revision(
                             run,
                             &app.history_revisions,
@@ -245,7 +264,7 @@ impl ChatWidget {
                         filtered_to_original.push(original_idx);
                         continue;
                     }
-                    filtered_cells.push(cell.clone());
+                    filtered_cells.push(cell);
                     let salt = (i as u64).wrapping_add(1);
                     filtered_revs.push(active_entry_revision(active_rev, salt));
                     filtered_to_original.push(original_idx);
@@ -254,9 +273,8 @@ impl ChatWidget {
 
             app.collapsed_cell_map = filtered_to_original;
 
-            let shards: [&[HistoryCell]; 1] = [&filtered_cells];
-            app.viewport.transcript_cache.ensure_split(
-                &shards,
+            app.viewport.transcript_cache.ensure_filtered(
+                &filtered_cells,
                 &filtered_revs,
                 content_area.width.max(1),
                 render_options,
@@ -411,19 +429,49 @@ fn tool_run_summary_revision(
 ) -> u64 {
     let mut revision = 0xA11C_EA5E_D00D_2692u64 ^ ((run.start as u64) << 32) ^ (run.count as u64);
     for idx in run.start..run.start.saturating_add(run.count) {
-        let cell_revision = revisions.get(idx).copied().unwrap_or_else(|| {
-            let active_idx = idx.saturating_sub(history_len);
-            active_entry_revision(active_rev, (active_idx as u64).wrapping_add(1))
-        });
+        let cell_revision = revisions
+            .get(idx)
+            .copied()
+            .map(history_entry_revision)
+            .unwrap_or_else(|| {
+                let active_idx = idx.saturating_sub(history_len);
+                active_entry_revision(active_rev, (active_idx as u64).wrapping_add(1))
+            });
         revision = revision.rotate_left(7) ^ cell_revision;
     }
-    revision
+    let extends_into_active = run.start.saturating_add(run.count) > history_len;
+    revision_in_domain(revision, extends_into_active)
+}
+
+const ACTIVE_REVISION_DOMAIN: u64 = 1 << 63;
+
+fn revision_in_domain(revision: u64, active: bool) -> u64 {
+    // The top bit is exclusively a cache-domain tag. Clearing it means raw
+    // counters that differ only by bit 63 can theoretically alias within one
+    // domain after 2^63 updates; that lifetime is acceptable, while active and
+    // committed-history keys must never alias each other.
+    let payload = revision & !ACTIVE_REVISION_DOMAIN;
+    if active {
+        ACTIVE_REVISION_DOMAIN | payload
+    } else {
+        payload
+    }
+}
+
+fn history_entry_revision(revision: u64) -> u64 {
+    revision_in_domain(revision, false)
 }
 
 fn active_entry_revision(active_rev: u64, salt: u64) -> u64 {
-    active_rev
+    // Active entries and committed history cells can occupy the same
+    // positional cache slot across `flush_active_cell`. Keep their revision
+    // domains distinct so the first active entry (`active_rev = 0`,
+    // `salt = 1`) cannot collide with the first history revision (`1`) and
+    // reuse a stale `running` render after cancellation.
+    let mixed = active_rev
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(salt)
+        .wrapping_add(salt);
+    revision_in_domain(mixed, true)
 }
 
 impl Renderable for ChatWidget {
@@ -619,9 +667,9 @@ impl<'a> ComposerWidget<'a> {
 
     fn mode_color(&self) -> Color {
         match self.app.mode {
-            AppMode::Agent | AppMode::Auto | AppMode::Multitask => palette::MODE_AGENT,
-            AppMode::Yolo | AppMode::Operate => palette::MODE_YOLO,
+            AppMode::Agent | AppMode::Auto | AppMode::Yolo => palette::MODE_AGENT,
             AppMode::Plan => palette::MODE_PLAN,
+            AppMode::Operate => palette::MODE_OPERATE,
         }
     }
 
@@ -1578,7 +1626,8 @@ fn build_approval_controls(
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
-    for (i, opt) in approval_options_for(risk, locale).iter().enumerate() {
+    let options = approval_options_for_request(request, risk, locale);
+    for (i, opt) in options.iter().enumerate() {
         let is_selected = i == view.selected();
         let label_color = if opt.dangerous {
             accent
@@ -1932,6 +1981,7 @@ fn save_ask_rule_hint(locale: Locale) -> &'static str {
     }
 }
 
+#[derive(Clone)]
 struct ApprovalOptionRow {
     label: Cow<'static, str>,
     key_hint: &'static str,
@@ -1962,6 +2012,61 @@ fn approval_options_for(risk: RiskLevel, locale: Locale) -> [ApprovalOptionRow; 
             dangerous: false,
         },
     ]
+}
+
+/// Workflow elevated-plan card options (#4126): Approve / Edit plan / Cancel.
+fn workflow_approval_options(risk: RiskLevel, locale: Locale) -> [ApprovalOptionRow; 3] {
+    let dangerous = matches!(risk, RiskLevel::Destructive);
+    [
+        ApprovalOptionRow {
+            label: workflow_option_approve(locale),
+            key_hint: "1 / y",
+            dangerous,
+        },
+        ApprovalOptionRow {
+            label: workflow_option_edit_plan(locale),
+            key_hint: "2 / e",
+            dangerous: false,
+        },
+        ApprovalOptionRow {
+            label: workflow_option_cancel(locale),
+            key_hint: "3 / Esc",
+            dangerous: false,
+        },
+    ]
+}
+
+fn approval_options_for_request(
+    request: &ApprovalRequest,
+    risk: RiskLevel,
+    locale: Locale,
+) -> Vec<ApprovalOptionRow> {
+    if request.tool_name == "workflow" {
+        workflow_approval_options(risk, locale).to_vec()
+    } else {
+        approval_options_for(risk, locale).to_vec()
+    }
+}
+
+fn workflow_option_approve(locale: Locale) -> Cow<'static, str> {
+    match locale {
+        Locale::ZhHans => Cow::Borrowed("批准"),
+        _ => Cow::Borrowed("Approve"),
+    }
+}
+
+fn workflow_option_edit_plan(locale: Locale) -> Cow<'static, str> {
+    match locale {
+        Locale::ZhHans => Cow::Borrowed("编辑计划"),
+        _ => Cow::Borrowed("Edit plan"),
+    }
+}
+
+fn workflow_option_cancel(locale: Locale) -> Cow<'static, str> {
+    match locale {
+        Locale::ZhHans => Cow::Borrowed("取消"),
+        _ => Cow::Borrowed("Cancel"),
+    }
 }
 
 fn option_approve_once(locale: Locale) -> Cow<'static, str> {
@@ -3035,13 +3140,21 @@ fn push_command_entry(
         } else {
             None
         };
-        let desc = if info.aliases.is_empty() {
+        // Omit aliases already shown in the label (`/clear or /qingping`) so
+        // the description does not repeat them (#3990).
+        let remaining_aliases: Vec<&str> = info
+            .aliases
+            .iter()
+            .copied()
+            .filter(|alias| hint.as_deref() != Some(*alias))
+            .collect();
+        let desc = if remaining_aliases.is_empty() {
             info.description_for(locale).to_string()
         } else {
             format!(
                 "{}  (aliases: {})",
                 info.description_for(locale),
-                info.aliases
+                remaining_aliases
                     .iter()
                     .map(|a| format!("/{a}"))
                     .collect::<Vec<_>>()
@@ -3353,20 +3466,23 @@ fn line_spans_with_selection<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER, ChatWidget, ComposerWidget,
-        Renderable, SlashMenuEntry, apply_detail_target_highlight, apply_selection_to_line,
-        apply_send_flash, build_empty_state_lines, composer_height, composer_max_height,
-        composer_min_input_rows, composer_top_padding, cursor_row_col, empty_composer_visual_rows,
+        ACTIVE_REVISION_DOMAIN, ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER,
+        ChatWidget, ComposerWidget, Renderable, SlashMenuEntry, active_entry_revision,
+        apply_detail_target_highlight, apply_selection_to_line, apply_send_flash,
+        build_empty_state_lines, composer_height, composer_max_height, composer_min_input_rows,
+        composer_top_padding, cursor_row_col, empty_composer_visual_rows, history_entry_revision,
         layout_input, pad_lines_to_bottom, placeholder_visual_lines, push_command_entry,
-        should_render_empty_state, slash_completion_hints, wrap_input_lines,
-        wrap_input_lines_for_mouse, wrap_text,
+        revision_in_domain, should_render_empty_state, slash_completion_hints,
+        tool_run_summary_revision, wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
     };
     use crate::config::{ApiProvider, Config};
     use crate::localization::Locale;
     use crate::palette;
     use crate::tui::active_cell::ActiveCell;
     use crate::tui::app::{App, ComposerDensity, ToolCollapseMode, TuiOptions};
-    use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
+    use crate::tui::history::{
+        ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus,
+    };
     use crate::tui::scrolling::{TranscriptLineMeta, TranscriptScroll};
     use ratatui::{
         buffer::Buffer,
@@ -3416,6 +3532,39 @@ mod tests {
         text
     }
 
+    #[test]
+    fn first_active_tool_settles_when_flushed_to_history() {
+        let mut app = create_test_app();
+        app.clear_history();
+        app.next_history_revision = 1;
+        app.active_cell_revision = 0;
+
+        let mut active = ActiveCell::new();
+        active.push_tool("user_shell_1", running_user_shell_cell());
+        app.active_cell = Some(active);
+
+        let area = Rect::new(0, 0, 100, 20);
+        let mut running_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut running_buf);
+        let running = buffer_text(&running_buf, area);
+        assert!(running.contains("run running"), "{running}");
+
+        app.finalize_active_cell_as_interrupted();
+        let HistoryCell::Tool(ToolCell::Exec(exec)) = &app.history[0] else {
+            panic!("expected settled exec history cell")
+        };
+        assert_eq!(exec.status, ToolStatus::Failed);
+
+        let mut settled_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut settled_buf);
+        let settled = buffer_text(&settled_buf, area);
+        assert!(
+            !settled.contains("run running"),
+            "flushed terminal state reused the active cache entry:\n{settled}"
+        );
+        assert!(settled.contains("run issue"), "{settled}");
+    }
+
     fn render_approval_request(
         request: &crate::tui::approval::ApprovalRequest,
         area: Rect,
@@ -3445,6 +3594,23 @@ mod tests {
             spillover_path: None,
             output_summary: None,
             is_diff: false,
+        }))
+    }
+
+    fn running_user_shell_cell() -> HistoryCell {
+        HistoryCell::Tool(ToolCell::Exec(ExecCell {
+            command: "sleep 30".to_string(),
+            status: ToolStatus::Running,
+            output: None,
+            live_output: None,
+            shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+            started_at: None,
+            duration_ms: None,
+            source: ExecSource::User,
+            interaction: None,
+            output_summary: None,
         }))
     }
 
@@ -3491,6 +3657,47 @@ mod tests {
         apply_detail_target_highlight(&mut lines, 0, 4, &line_meta, &original_index_map);
 
         assert_eq!(lines[0].spans[0].style.bg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn tool_run_summary_revision_separates_128_entry_history_and_active_alias() {
+        let active_rev = 17;
+        let run = ToolRun {
+            start: 0,
+            count: 128,
+            tool_families: Vec::new(),
+            activity: Default::default(),
+        };
+        let history_revisions = (1..=run.count)
+            .map(|salt| active_entry_revision(active_rev, salt as u64))
+            .collect::<Vec<_>>();
+
+        let history_key =
+            tool_run_summary_revision(&run, &history_revisions, run.count, active_rev);
+        let active_key = tool_run_summary_revision(&run, &[], 0, active_rev);
+
+        // Rotating by seven over 128 entries cancels the 128 identical domain
+        // bits, reproducing the old untagged hash alias. The final domain tag
+        // must still keep the cache keys distinct.
+        assert_eq!(
+            history_key & !ACTIVE_REVISION_DOMAIN,
+            active_key & !ACTIVE_REVISION_DOMAIN,
+            "fixture must exercise the 128-entry payload alias"
+        );
+        assert_eq!(history_key & ACTIVE_REVISION_DOMAIN, 0);
+        assert_eq!(active_key & ACTIVE_REVISION_DOMAIN, ACTIVE_REVISION_DOMAIN);
+        assert_ne!(history_key, active_key);
+    }
+
+    #[test]
+    fn high_bit_raw_revision_remains_distinct_across_history_and_active_domains() {
+        let raw = ACTIVE_REVISION_DOMAIN | 0x2692;
+        let history_key = history_entry_revision(raw);
+        let active_key = revision_in_domain(raw, true);
+
+        assert_eq!(history_key, 0x2692);
+        assert_eq!(active_key, ACTIVE_REVISION_DOMAIN | 0x2692);
+        assert_ne!(history_key, active_key);
     }
 
     #[test]
@@ -3558,6 +3765,46 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_slow_path_does_not_reuse_running_active_cache_after_flush() {
+        let mut app = create_test_app();
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        add_dense_tool_run(&mut app);
+
+        // Force the next committed history revision to have the same raw key
+        // as active revision 0, salt 1. The prior collapsed run keeps both
+        // renders on the filtered slow path.
+        app.next_history_revision = ACTIVE_REVISION_DOMAIN | 1;
+        app.active_cell_revision = 0;
+        let mut active = ActiveCell::new();
+        active.push_tool("user_shell_slow_path", running_user_shell_cell());
+        app.active_cell = Some(active);
+
+        let area = Rect::new(0, 0, 100, 20);
+        let mut running_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut running_buf);
+        let running = buffer_text(&running_buf, area);
+        assert!(running.contains("run running"), "{running}");
+        assert_eq!(app.collapsed_cell_map, vec![0, 3]);
+
+        app.finalize_active_cell_as_interrupted();
+        assert_eq!(
+            app.history_revisions[3],
+            ACTIVE_REVISION_DOMAIN | 1,
+            "fixture must force the old raw-revision collision"
+        );
+
+        let mut settled_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut settled_buf);
+        let settled = buffer_text(&settled_buf, area);
+        assert!(
+            !settled.contains("run running"),
+            "history cell reused the active slow-path cache entry:\n{settled}"
+        );
+        assert!(settled.contains("run issue"), "{settled}");
+    }
+
+    #[test]
     fn chat_widget_expands_dense_tool_runs_on_demand() {
         let mut app = create_test_app();
         app.tool_collapse_mode = ToolCollapseMode::Compact;
@@ -3602,6 +3849,80 @@ mod tests {
         let _widget = ChatWidget::new(&mut app, area);
 
         assert_eq!(app.collapsed_cell_map, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn chat_widget_collapse_path_stable_across_frames() {
+        let mut app = create_test_app();
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        add_dense_tool_run(&mut app);
+        app.add_message(HistoryCell::User {
+            content: "trailing prompt".to_string(),
+        });
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+
+        let mut first_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut first_buf);
+        let first = buffer_text(&first_buf, area);
+        let first_map = app.collapsed_cell_map.clone();
+        let first_total = app.viewport.last_transcript_total;
+
+        // Second frame without any app mutation: the borrowed filtered path
+        // must reproduce the identical output and index map.
+        let mut second_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut second_buf);
+        let second = buffer_text(&second_buf, area);
+
+        assert_eq!(first, second, "collapse path is frame-stable");
+        assert_eq!(first_map, app.collapsed_cell_map);
+        assert_eq!(first_total, app.viewport.last_transcript_total);
+        assert!(first.contains("Explored 2 files, 1 search"), "{first}");
+        assert!(first.contains("trailing prompt"), "{first}");
+    }
+
+    #[test]
+    fn chat_widget_collapses_run_spanning_history_and_active_entries() {
+        let mut app = create_test_app();
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        app.add_message(success_tool_cell("read_file"));
+        app.add_message(success_tool_cell("list_dir"));
+        let active = app.active_cell.get_or_insert_with(ActiveCell::new);
+        active.push_untracked(success_tool_cell("web_search"));
+        app.bump_active_cell_revision();
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 8,
+        };
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+
+        assert_eq!(app.collapsed_cell_map, vec![0]);
+        assert!(
+            rendered.contains("Explored 2 files, 1 search"),
+            "run spanning the history/active boundary renders one summary: {rendered}"
+        );
+
+        // Mutating the active tail must re-render the summary (its revision
+        // folds in the covered active entries).
+        let rev_before = app.active_cell_revision;
+        app.bump_active_cell_revision();
+        assert_ne!(rev_before, app.active_cell_revision);
+        let mut second_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut second_buf);
+        let second = buffer_text(&second_buf, area);
+        assert!(second.contains("Explored 2 files, 1 search"), "{second}");
     }
 
     #[test]
@@ -3791,6 +4112,33 @@ mod tests {
         assert!(
             exit_pos < clear_pos,
             "expected /exit to rank above /clear for prefix /q, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn slash_completion_does_not_repeat_alias_already_in_label() {
+        // Typing `/p` matches `/clear` via alias `qingping`, so the label
+        // shows `/clear or /qingping`. The description must not also append
+        // `(aliases: /qingping)` (#3990).
+        let hints = slash_completion_hints("/p", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        let clear = hints
+            .iter()
+            .find(|h| h.name == "/clear")
+            .expect("/clear should appear for /p via qingping");
+        assert_eq!(
+            clear.alias_hint.as_deref(),
+            Some("qingping"),
+            "label should surface the matching alias"
+        );
+        assert!(
+            !clear.description.contains("(aliases:"),
+            "description should omit alias list when the only alias is already in the label: {}",
+            clear.description
+        );
+        assert!(
+            !clear.description.contains("/qingping"),
+            "description must not repeat /qingping: {}",
+            clear.description
         );
     }
 

@@ -353,7 +353,11 @@ mod tests {
             resume_session_id: None,
             initial_input: None,
         };
-        App::new(options, &Config::default())
+        // Pin sidebar so dogfood machines with Agents-visible settings.toml
+        // do not hide the footer agents chip this test asserts.
+        let mut app = App::new(options, &Config::default());
+        app.sidebar_focus = crate::tui::app::SidebarFocus::Hidden;
+        app
     }
 
     #[test]
@@ -625,7 +629,7 @@ fn collect_active_tool_status(
             }
         }
         ToolCell::PlanUpdate(plan) => {
-            snapshot.record("update plan".to_string(), plan.status, None);
+            snapshot.record("update Strategy".to_string(), plan.status, None);
         }
         ToolCell::PatchSummary(patch) => {
             snapshot.record(format!("patch {}", patch.path), patch.status, None);

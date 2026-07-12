@@ -8,10 +8,16 @@ of the problem:
 - **Workflow** describes orchestration: phases, branches, reducers, loops, and
   agent leaves that can dispatch through the Fleet/sub-agent runtime.
 
-The supported path today is a reviewed structured spec. CodeWhale can help you
-draft a Fleet task spec or Workflow source, but it should show the plan before
-launching multi-worker work. A one-sentence natural language request should not
-silently generate `tasks.json` and start workers without review.
+**Default product path:** ask in natural language. Soft-auto Workflow decides
+when orchestration helps, **tells you the shape**, may open
+`request_user_input` for 1–2 setup choices, then launches — you do not need to
+write workflow files for ordinary multi-agent work. Details:
+[Automatic Workflows](AUTOMATIC_WORKFLOWS.md).
+
+This tutorial covers the **manual** Fleet task-spec / checked-in Workflow path
+for operators who want durable host workers and reviewable specs. A
+one-sentence request should still not silently generate `tasks.json` and start
+workers without indication or approval.
 
 ## 1. Prepare The Workspace
 
@@ -31,8 +37,9 @@ If you want named reusable workers, open the TUI and run:
 /fleet setup
 ```
 
-Pick a role, pick a model class, review the permissions/tools/route posture,
-and ratify the rendered TOML. Ratified profiles are saved under
+Pick a role, choose whether that profile inherits the operator route or pins a
+specific provider/model/thinking tier, review the permissions/tools/route
+posture, and ratify the rendered TOML. Ratified profiles are saved under
 `.codewhale/agents/<role>.toml`. Fleet task specs can reference those profiles
 with `worker.agent_profile` or the shorter `worker.profile` alias.
 
@@ -67,7 +74,7 @@ one bounded docs-note worker. It keeps secrets disabled and caps trust at
         "role": "reviewer",
         "profile": "reviewer",
         "tools": ["rg", "sed", "git"],
-        "model_class": "fast"
+        "model": "deepseek-v4-flash"
       },
       "workspace": {
         "required_files": ["docs/FLEET.md", "docs/WORKFLOW_AUTHORING.md"],
@@ -93,8 +100,7 @@ one bounded docs-note worker. It keeps secrets disabled and caps trust at
       "instructions": "Write a concise Markdown note with the missing Fleet + Workflow tutorial steps. Do not edit public docs unless explicitly asked.",
       "worker": {
         "role": "builder",
-        "tools": ["rg", "sed"],
-        "model_class": "inherit"
+        "tools": ["rg", "sed"]
       },
       "workspace": {
         "required_files": ["docs/FLEET.md"],
@@ -123,7 +129,8 @@ Common task fields:
 | `worker.role` | Built-in or custom role intent, such as `reviewer`, `builder`, `read-only`, or `smoke-runner`. |
 | `worker.profile` / `worker.agent_profile` | Ratified Fleet roster profile from `.codewhale/agents/`. |
 | `worker.tools` | Tool names the task expects the worker to use. |
-| `worker.model_class`, `worker.loadout`, `worker.model` | Routing hints or explicit model intent. Route resolution still owns provider/model validation. |
+| `worker.model` | Preferred explicit model pin. Route resolution still owns provider/model validation. |
+| `worker.model_class`, `worker.loadout` | Compatibility routing hints for older task specs; prefer `worker.profile` plus saved profile route pins for new specs. |
 | `workspace.required_files` | Files that must exist before the task starts. |
 | `workspace.writable_paths` | Paths the task is allowed to write when the effective runtime posture allows writing. |
 | `workspace.environment` | Required or allowlisted environment variables, by name only. |

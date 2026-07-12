@@ -54,6 +54,7 @@ pub enum ProviderKind {
     Arcee,
     #[serde(alias = "siliconflow-cn", alias = "siliconflow-CN")]
     SiliconflowCN,
+    #[serde(alias = "moonshot-ai", alias = "moonshotai", alias = "moonshot_ai")]
     Moonshot,
     Sglang,
     Vllm,
@@ -104,6 +105,17 @@ pub enum ProviderKind {
     Sakana,
     #[serde(alias = "long-cat", alias = "meituan-longcat", alias = "meituan")]
     LongCat,
+    #[serde(
+        alias = "meta-ai",
+        alias = "meta_ai",
+        alias = "meta-model-api",
+        alias = "meta_model_api",
+        alias = "muse",
+        alias = "muse-spark"
+    )]
+    Meta,
+    #[serde(alias = "x-ai", alias = "x_ai", alias = "grok")]
+    Xai,
     /// User-defined OpenAI-compatible endpoint (#1519).
     ///
     /// A single dynamic identity for arbitrary `[providers.<name>]
@@ -115,7 +127,7 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 33] = [
         Self::Deepseek,
         Self::DeepseekAnthropic,
         Self::NvidiaNim,
@@ -146,6 +158,8 @@ impl ProviderKind {
         Self::Deepinfra,
         Self::Sakana,
         Self::LongCat,
+        Self::Meta,
+        Self::Xai,
         Self::Custom,
     ];
 

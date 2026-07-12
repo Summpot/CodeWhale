@@ -865,6 +865,15 @@ struct EnvGuard {
     codewhale_provider: Option<OsString>,
     codewhale_model: Option<OsString>,
     codewhale_base_url: Option<OsString>,
+    xai_api_key: Option<OsString>,
+    xai_base_url: Option<OsString>,
+    xai_model: Option<OsString>,
+    meta_model_api_key: Option<OsString>,
+    model_api_key: Option<OsString>,
+    meta_model_api_base_url: Option<OsString>,
+    model_api_base_url: Option<OsString>,
+    meta_model_api_model: Option<OsString>,
+    model_api_model: Option<OsString>,
 }
 
 impl EnvGuard {
@@ -882,6 +891,15 @@ impl EnvGuard {
             codewhale_provider: env::var_os("CODEWHALE_PROVIDER"),
             codewhale_model: env::var_os("CODEWHALE_MODEL"),
             codewhale_base_url: env::var_os("CODEWHALE_BASE_URL"),
+            xai_api_key: env::var_os("XAI_API_KEY"),
+            xai_base_url: env::var_os("XAI_BASE_URL"),
+            xai_model: env::var_os("XAI_MODEL"),
+            meta_model_api_key: env::var_os("META_MODEL_API_KEY"),
+            model_api_key: env::var_os("MODEL_API_KEY"),
+            meta_model_api_base_url: env::var_os("META_MODEL_API_BASE_URL"),
+            model_api_base_url: env::var_os("MODEL_API_BASE_URL"),
+            meta_model_api_model: env::var_os("META_MODEL_API_MODEL"),
+            model_api_model: env::var_os("MODEL_API_MODEL"),
             nvidia_api_key: env::var_os("NVIDIA_API_KEY"),
             nvidia_nim_api_key: env::var_os("NVIDIA_NIM_API_KEY"),
             nim_base_url: env::var_os("NIM_BASE_URL"),
@@ -991,6 +1009,15 @@ impl EnvGuard {
             env::remove_var("CODEWHALE_PROVIDER");
             env::remove_var("CODEWHALE_MODEL");
             env::remove_var("CODEWHALE_BASE_URL");
+            env::remove_var("XAI_API_KEY");
+            env::remove_var("XAI_BASE_URL");
+            env::remove_var("XAI_MODEL");
+            env::remove_var("META_MODEL_API_KEY");
+            env::remove_var("MODEL_API_KEY");
+            env::remove_var("META_MODEL_API_BASE_URL");
+            env::remove_var("MODEL_API_BASE_URL");
+            env::remove_var("META_MODEL_API_MODEL");
+            env::remove_var("MODEL_API_MODEL");
             env::remove_var("NVIDIA_API_KEY");
             env::remove_var("NVIDIA_NIM_API_KEY");
             env::remove_var("NIM_BASE_URL");
@@ -1123,6 +1150,18 @@ impl Drop for EnvGuard {
             Self::restore_var("CODEWHALE_PROVIDER", self.codewhale_provider.take());
             Self::restore_var("CODEWHALE_MODEL", self.codewhale_model.take());
             Self::restore_var("CODEWHALE_BASE_URL", self.codewhale_base_url.take());
+            Self::restore_var("XAI_API_KEY", self.xai_api_key.take());
+            Self::restore_var("XAI_BASE_URL", self.xai_base_url.take());
+            Self::restore_var("XAI_MODEL", self.xai_model.take());
+            Self::restore_var("META_MODEL_API_KEY", self.meta_model_api_key.take());
+            Self::restore_var("MODEL_API_KEY", self.model_api_key.take());
+            Self::restore_var(
+                "META_MODEL_API_BASE_URL",
+                self.meta_model_api_base_url.take(),
+            );
+            Self::restore_var("MODEL_API_BASE_URL", self.model_api_base_url.take());
+            Self::restore_var("META_MODEL_API_MODEL", self.meta_model_api_model.take());
+            Self::restore_var("MODEL_API_MODEL", self.model_api_model.take());
             Self::restore_var("NVIDIA_API_KEY", self.nvidia_api_key.take());
             Self::restore_var("NVIDIA_NIM_API_KEY", self.nvidia_nim_api_key.take());
             Self::restore_var("NIM_BASE_URL", self.nim_base_url.take());
@@ -3368,11 +3407,12 @@ fn provider_kind_parses_openrouter_and_novita_aliases() {
 }
 
 /// Models.dev publishes provider ids that do not always match CodeWhale's
-/// canonical id (`fireworks-ai`, `togetherai`, `novita-ai`). These MUST
-/// normalize onto the right [`ProviderKind`] via [`ProviderKind::parse`], which
-/// is the seam `ModelReferenceCard::from_offering` uses to label a live-catalog
-/// row's provider kind. A miss here means Fireworks/Together/Novita models from
-/// the live Models.dev catalog land under an `unknown` kind (Refs #4186).
+/// canonical id (`fireworks-ai`, `togetherai`, `novita-ai`, `moonshotai`).
+/// These MUST normalize onto the right [`ProviderKind`] via
+/// [`ProviderKind::parse`], which is the seam `ModelReferenceCard::from_offering`
+/// uses to label a live-catalog row's provider kind. A miss here means
+/// Fireworks/Together/Novita/Moonshot models from the live Models.dev catalog
+/// land under an `unknown` kind (Refs #4186).
 #[test]
 fn provider_kind_normalizes_models_dev_provider_ids() {
     let cases = [
@@ -3382,12 +3422,23 @@ fn provider_kind_normalizes_models_dev_provider_ids() {
         ("together_ai", ProviderKind::Together),
         ("novita-ai", ProviderKind::Novita),
         ("novita_ai", ProviderKind::Novita),
+        // Live Models.dev key for Moonshot/Kimi (verified 2026-07-08).
+        ("moonshotai", ProviderKind::Moonshot),
+        ("moonshot-ai", ProviderKind::Moonshot),
+        ("moonshot_ai", ProviderKind::Moonshot),
+        ("nvidia", ProviderKind::NvidiaNim),
+        ("xiaomi", ProviderKind::XiaomiMimo),
         ("deepinfra", ProviderKind::Deepinfra),
         ("siliconflow", ProviderKind::Siliconflow),
         // Models.dev spells the China endpoint `siliconflow-cn`; CodeWhale's
         // canonical id is `siliconflow-CN` and `parse` is case-insensitive.
         ("siliconflow-cn", ProviderKind::SiliconflowCN),
         ("openrouter", ProviderKind::Openrouter),
+        ("longcat", ProviderKind::LongCat),
+        ("xai", ProviderKind::Xai),
+        ("x-ai", ProviderKind::Xai),
+        ("x_ai", ProviderKind::Xai),
+        ("grok", ProviderKind::Xai),
     ];
     for (models_dev_id, expected) in cases {
         assert_eq!(
@@ -3398,11 +3449,14 @@ fn provider_kind_normalizes_models_dev_provider_ids() {
     }
 
     // The separator-free Models.dev ids must also deserialize from config TOML,
-    // so a `provider = "togetherai"` / `"novita-ai"` line resolves identically.
+    // so a `provider = "togetherai"` / `"novita-ai"` / `"moonshotai"` line
+    // resolves identically.
     for (alias, expected) in [
         ("togetherai", ProviderKind::Together),
         ("novita-ai", ProviderKind::Novita),
         ("fireworks-ai", ProviderKind::Fireworks),
+        ("moonshotai", ProviderKind::Moonshot),
+        ("grok", ProviderKind::Xai),
     ] {
         let parsed: ConfigToml =
             toml::from_str(&format!("provider = \"{alias}\"")).expect("models.dev id alias");
@@ -3592,6 +3646,71 @@ fn openmodel_route_defaults_to_messages_endpoint() {
 }
 
 #[test]
+fn xai_api_key_provider_resolves_defaults_and_env_overrides() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+
+    let config = ConfigToml {
+        provider: ProviderKind::Xai,
+        ..ConfigToml::default()
+    };
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+    assert_eq!(resolved.provider, ProviderKind::Xai);
+    assert_eq!(resolved.base_url, DEFAULT_XAI_BASE_URL);
+    assert_eq!(resolved.model, DEFAULT_XAI_MODEL);
+    assert_eq!(resolved.api_key, None);
+
+    unsafe {
+        std::env::set_var("XAI_API_KEY", "xai-env-key");
+        std::env::set_var("XAI_BASE_URL", "https://xai-gateway.example/v1");
+        std::env::set_var("XAI_MODEL", "grok-4.3");
+    }
+
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.api_key.as_deref(), Some("xai-env-key"));
+    assert_eq!(resolved.base_url, "https://xai-gateway.example/v1");
+    assert_eq!(resolved.model, "grok-4.3");
+}
+
+#[test]
+fn meta_model_api_resolves_defaults_and_both_documented_key_names() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+
+    let config = ConfigToml {
+        provider: ProviderKind::Meta,
+        ..ConfigToml::default()
+    };
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+    assert_eq!(resolved.provider, ProviderKind::Meta);
+    assert_eq!(resolved.base_url, DEFAULT_META_BASE_URL);
+    assert_eq!(resolved.model, DEFAULT_META_MODEL);
+    assert_eq!(resolved.api_key, None);
+
+    unsafe {
+        std::env::set_var("MODEL_API_KEY", "meta-official-key");
+        std::env::set_var("MODEL_API_BASE_URL", "https://meta-gateway.example/v1");
+        std::env::set_var("MODEL_API_MODEL", "muse-spark-canary");
+    }
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.api_key.as_deref(), Some("meta-official-key"));
+    assert_eq!(resolved.base_url, "https://meta-gateway.example/v1");
+    assert_eq!(resolved.model, "muse-spark-canary");
+
+    unsafe {
+        std::env::set_var("META_MODEL_API_KEY", "meta-models-dev-key");
+        std::env::set_var("META_MODEL_API_BASE_URL", "https://meta-primary.example/v1");
+        std::env::set_var("META_MODEL_API_MODEL", "muse-spark-1.1");
+    }
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.api_key.as_deref(), Some("meta-models-dev-key"));
+    assert_eq!(resolved.base_url, "https://meta-primary.example/v1");
+    assert_eq!(resolved.model, "muse-spark-1.1");
+}
+
+#[test]
 fn provider_metadata_registry_covers_every_provider_kind_once() {
     let providers = provider::all_providers();
     assert_eq!(providers.len(), ProviderKind::ALL.len());
@@ -3646,6 +3765,18 @@ fn provider_metadata_preserves_alias_and_config_key_semantics() {
             .expect("huggingface alias")
             .kind(),
         ProviderKind::Huggingface
+    );
+    assert_eq!(
+        provider::resolve_provider("grok")
+            .expect("xAI grok alias")
+            .kind(),
+        ProviderKind::Xai
+    );
+    assert_eq!(
+        provider::resolve_provider("muse-spark")
+            .expect("Meta Muse Spark alias")
+            .kind(),
+        ProviderKind::Meta
     );
 
     let siliconflow_cn =
@@ -5382,6 +5513,113 @@ fn empty_fallback_providers_do_not_serialize() {
     let serialized = toml::to_string_pretty(&ConfigToml::default()).expect("config serializes");
 
     assert!(!serialized.contains("fallback_providers"));
+}
+
+#[test]
+fn empty_provider_header_tables_do_not_survive_round_trip() {
+    let polluted = r#"
+[http_headers]
+
+[providers.anthropic.http_headers]
+" " = "ignored"
+"X-Blank" = "   "
+
+[providers.openrouter.http_headers]
+
+[providers.xai]
+model = "   "
+"#;
+    let config: ConfigToml = toml::from_str(polluted).expect("polluted config parses");
+    let serialized = toml::to_string_pretty(&config).expect("config serializes");
+
+    assert!(
+        !serialized.contains("[http_headers]"),
+        "empty root headers must not be serialized:\n{serialized}"
+    );
+    assert!(
+        !serialized.contains("[providers.anthropic"),
+        "empty Anthropic provider state must not be serialized:\n{serialized}"
+    );
+    assert!(
+        !serialized.contains("[providers.openrouter"),
+        "empty OpenRouter provider state must not be serialized:\n{serialized}"
+    );
+    assert!(
+        !serialized.contains("[providers.xai"),
+        "blank provider fields must not be serialized:\n{serialized}"
+    );
+
+    let round_tripped: ConfigToml = toml::from_str(&serialized).expect("canonical config parses");
+    assert!(round_tripped.http_headers.is_empty());
+    assert!(round_tripped.providers.anthropic.http_headers.is_empty());
+    assert!(round_tripped.providers.openrouter.http_headers.is_empty());
+}
+
+#[test]
+fn workflow_config_defaults_match_product_surface() {
+    // #4128 / Section 2.11: omitted `[workflow]` keys resolve to the
+    // documented product defaults so launch/approval/persist share one model.
+    let defaults = WorkflowConfigToml::default();
+    assert!(defaults.automatic);
+    assert!(defaults.auto_start_read_only);
+    assert!(defaults.require_approval_for_writes);
+    assert_eq!(defaults.auto_start_child_limit, 16);
+    assert_eq!(defaults.max_children, 1000);
+    assert_eq!(defaults.max_concurrent, 16);
+    assert_eq!(defaults.max_depth, 2);
+    assert_eq!(defaults.default_token_budget, 120_000);
+    assert_eq!(defaults.max_parallel_writes_without_worktree, 0);
+    assert!(defaults.persist_completed_activity);
+    assert!(defaults.persist_completed_across_restarts);
+}
+
+#[test]
+fn workflow_config_absent_table_stays_none_empty_table_fills_defaults() {
+    let absent: ConfigToml = toml::from_str("").expect("empty config parses");
+    assert!(absent.workflow.is_none());
+
+    let empty_table: ConfigToml = toml::from_str(
+        r#"
+[workflow]
+"#,
+    )
+    .expect("empty workflow table should parse");
+    assert_eq!(
+        empty_table.workflow.expect("workflow table present"),
+        WorkflowConfigToml::default()
+    );
+}
+
+#[test]
+fn workflow_config_partial_override_and_round_trip() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+[workflow]
+automatic = false
+max_children = 16
+default_token_budget = 50000
+"#,
+    )
+    .expect("workflow overrides should parse");
+
+    let workflow = config.workflow.expect("workflow table");
+    assert!(!workflow.automatic);
+    assert_eq!(workflow.max_children, 16);
+    assert_eq!(workflow.default_token_budget, 50_000);
+    // Unset keys keep product defaults.
+    assert!(workflow.auto_start_read_only);
+    assert!(workflow.require_approval_for_writes);
+    assert_eq!(workflow.auto_start_child_limit, 16);
+    assert_eq!(workflow.max_concurrent, 16);
+    assert_eq!(workflow.max_depth, 2);
+    assert_eq!(workflow.max_parallel_writes_without_worktree, 0);
+    assert!(workflow.persist_completed_activity);
+    assert!(workflow.persist_completed_across_restarts);
+
+    let serialized = toml::to_string_pretty(&workflow).expect("workflow serializes");
+    let round_tripped: WorkflowConfigToml =
+        toml::from_str(&serialized).expect("serialized workflow parses");
+    assert_eq!(round_tripped, workflow);
 }
 
 #[test]

@@ -125,6 +125,8 @@ pub enum MessageId {
     HotbarActionModeAgentDescription,
     HotbarActionModeYoloName,
     HotbarActionModeYoloDescription,
+    HotbarActionModeOperateName,
+    HotbarActionModeOperateDescription,
     HotbarActionReasoningCycleName,
     HotbarActionReasoningCycleDescription,
     HotbarActionReasoningCycleAutoDisabled,
@@ -136,7 +138,10 @@ pub enum MessageId {
     HotbarActionPaletteOpenDescription,
     HotbarActionTrustToggleName,
     HotbarActionTrustToggleDescription,
+    CommandPaletteTitle,
+    CommandPaletteSubtitle,
     ConfigTitle,
+    ConfigSubtitle,
     ConfigModalTitle,
     ConfigSearchPlaceholder,
     ConfigNoSettings,
@@ -171,6 +176,7 @@ pub enum MessageId {
     ConfigDefaultReasoning,
     ConfigUnavailable,
     HelpTitle,
+    HelpSubtitle,
     HelpFilterPlaceholder,
     HelpFilterPrefix,
     HelpNoMatches,
@@ -193,6 +199,7 @@ pub enum MessageId {
     CmdCompactDescription,
     CmdPurgeDescription,
     CmdConfigDescription,
+    CmdAuthDescription,
     CmdConstitutionDescription,
     CmdContextDescription,
     CmdCostDescription,
@@ -393,7 +400,21 @@ pub enum MessageId {
     HomeYoloModeCaution,
     HomePlanModeTip,
     HomePlanModeChecklistTip,
+    HomeOperateModeTip,
+    HomeOperateModeFleetTip,
     HomeGoalModeTip,
+    // Onboarding screens — welcome.
+    OnboardWelcomeVersion,
+    OnboardWelcomeLead,
+    OnboardWelcomeSetupBlurb,
+    OnboardWelcomeSteps,
+    OnboardWelcomeStepLanguage,
+    OnboardWelcomeStepApiKey,
+    OnboardWelcomeStepTrust,
+    OnboardWelcomeStepTips,
+    OnboardWelcomeDefaults,
+    OnboardWelcomeEnter,
+    OnboardWelcomeExit,
     // Onboarding screens — language picker.
     OnboardLanguageTitle,
     OnboardLanguageBlurb,
@@ -529,8 +550,12 @@ pub enum MessageId {
     SetupToolsMcpSkillsLabel,
     SetupToolsMcpToolsLabel,
     SetupToolsMcpPluginsLabel,
+    SetupToolsMcpHotbarLabel,
     SetupToolsMcpReviewHint,
     SetupToolsMcpReviewed,
+    SetupToolsMcpNeedsActionSaved,
+    SetupToolsMcpPreviewTitle,
+    SetupToolsMcpOnRampText,
     SetupRemoteCloudsLabel,
     SetupRemoteBridgesLabel,
     SetupRemoteProvidersLabel,
@@ -621,13 +646,11 @@ pub enum MessageId {
     AppModeAuto,
     AppModeYolo,
     AppModePlan,
-    AppModeMultitask,
     AppModeOperate,
     AppModeAgentHint,
     AppModeAutoHint,
     AppModePlanHint,
     AppModeYoloHint,
-    AppModeMultitaskHint,
     AppModeOperateHint,
     VimModeNormal,
     VimModeInsert,
@@ -753,6 +776,94 @@ pub enum MessageId {
     VoiceRecording,
     VoiceProcessing,
     VoiceTranscribed,
+    // Notifications (turn/agent completion).
+    NotificationTurnComplete,
+    NotificationSubagentComplete,
+    // Footer chips.
+    FooterWorkedChip,
+    // Fleet setup wizard.
+    FleetDraftTitle,
+    FleetDraftHeader,
+    FleetPreviewHeader,
+    // Remote setup on-ramp.
+    SetupRemoteOnRampText,
+    // Approval dialog — localized descriptions.
+    ApprovalDescSafe,
+    ApprovalDescFileWrite,
+    ApprovalDescShell,
+    ApprovalDescNetwork,
+    ApprovalDescMcpRead,
+    ApprovalDescMcpAction,
+    ApprovalDescAgent,
+    ApprovalDescUnknown,
+    // Approval impact summaries.
+    ApprovalImpactSafe,
+    ApprovalImpactFileWrite,
+    ApprovalImpactShell,
+    ApprovalImpactNetwork,
+    ApprovalImpactMcpRead,
+    ApprovalImpactMcpAction,
+    ApprovalImpactAgent,
+    ApprovalImpactUnknown,
+    // Approval detail labels.
+    ApprovalLabelCommand,
+    ApprovalLabelDir,
+    ApprovalLabelFile,
+    ApprovalLabelPreview,
+    ApprovalLabelProposedContent,
+    ApprovalLabelReplaceThis,
+    ApprovalLabelWithThis,
+    ApprovalLabelReplacementContent,
+    ApprovalLabelPath,
+    ApprovalLabelTarget,
+    ApprovalLabelInput,
+    ApprovalLabelAction,
+    ApprovalLabelType,
+    ApprovalLabelPrompt,
+    // Approval header labels.
+    ApprovalLabelAbout,
+    ApprovalLabelImpact,
+    // Setup wizard — constitution file state.
+    SetupConstitutionFileNotChecked,
+    SetupConstitutionFileMissing,
+    SetupConstitutionFileLoadedSelected,
+    SetupConstitutionFileLoadedInactive,
+    SetupConstitutionFileLoadedUnselected,
+    SetupConstitutionFileEmpty,
+    SetupConstitutionFileInvalid,
+    SetupConstitutionFileUnreadable,
+    SetupConstitutionFilePathError,
+    // Setup wizard — expert override state.
+    SetupExpertOverrideNotChecked,
+    SetupExpertOverrideMissing,
+    SetupExpertOverrideActive,
+    SetupExpertOverrideDisabled,
+    SetupExpertOverrideEmpty,
+    SetupExpertOverrideUnreadable,
+    SetupExpertOverridePathError,
+    // Setup wizard — autonomy fallback.
+    SetupAutonomyUnspecified,
+    // Setup wizard — purpose labels.
+    SetupGuidedPurposeCoding,
+    SetupGuidedPurposeResearch,
+    SetupGuidedPurposeOperations,
+    SetupGuidedPurposeMixed,
+    // Setup wizard — purpose about descriptions.
+    SetupGuidedPurposeAboutCoding,
+    SetupGuidedPurposeAboutResearch,
+    SetupGuidedPurposeAboutOperations,
+    SetupGuidedPurposeAboutMixed,
+    // Setup wizard — working style descriptions.
+    SetupGuidedStyleCoding,
+    SetupGuidedStyleResearch,
+    SetupGuidedStyleOperations,
+    SetupGuidedStyleMixed,
+    // Setup wizard — evidence labels.
+    SetupGuidedEvidenceAssumptions,
+    SetupGuidedEvidenceTestsAndReceipts,
+    SetupGuidedEvidenceReleaseReceipts,
+    // Setup wizard — guided answer notes.
+    SetupGuidedNotes,
 }
 
 #[allow(dead_code)]
@@ -801,6 +912,8 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::HotbarActionModeAgentDescription,
     MessageId::HotbarActionModeYoloName,
     MessageId::HotbarActionModeYoloDescription,
+    MessageId::HotbarActionModeOperateName,
+    MessageId::HotbarActionModeOperateDescription,
     MessageId::HotbarActionReasoningCycleName,
     MessageId::HotbarActionReasoningCycleDescription,
     MessageId::HotbarActionReasoningCycleAutoDisabled,
@@ -812,7 +925,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::HotbarActionPaletteOpenDescription,
     MessageId::HotbarActionTrustToggleName,
     MessageId::HotbarActionTrustToggleDescription,
+    MessageId::CommandPaletteTitle,
+    MessageId::CommandPaletteSubtitle,
     MessageId::ConfigTitle,
+    MessageId::ConfigSubtitle,
     MessageId::ConfigModalTitle,
     MessageId::ConfigSearchPlaceholder,
     MessageId::ConfigNoSettings,
@@ -847,6 +963,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ConfigDefaultReasoning,
     MessageId::ConfigUnavailable,
     MessageId::HelpTitle,
+    MessageId::HelpSubtitle,
     MessageId::HelpFilterPlaceholder,
     MessageId::HelpFilterPrefix,
     MessageId::HelpNoMatches,
@@ -864,6 +981,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdCompactDescription,
     MessageId::CmdPurgeDescription,
     MessageId::CmdConfigDescription,
+    MessageId::CmdAuthDescription,
     MessageId::CmdConstitutionDescription,
     MessageId::CmdContextDescription,
     MessageId::CmdCostDescription,
@@ -1066,7 +1184,20 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::HomeYoloModeCaution,
     MessageId::HomePlanModeTip,
     MessageId::HomePlanModeChecklistTip,
+    MessageId::HomeOperateModeTip,
+    MessageId::HomeOperateModeFleetTip,
     MessageId::HomeGoalModeTip,
+    MessageId::OnboardWelcomeVersion,
+    MessageId::OnboardWelcomeLead,
+    MessageId::OnboardWelcomeSetupBlurb,
+    MessageId::OnboardWelcomeSteps,
+    MessageId::OnboardWelcomeStepLanguage,
+    MessageId::OnboardWelcomeStepApiKey,
+    MessageId::OnboardWelcomeStepTrust,
+    MessageId::OnboardWelcomeStepTips,
+    MessageId::OnboardWelcomeDefaults,
+    MessageId::OnboardWelcomeEnter,
+    MessageId::OnboardWelcomeExit,
     MessageId::OnboardLanguageTitle,
     MessageId::OnboardLanguageBlurb,
     MessageId::OnboardLanguageFooter,
@@ -1198,8 +1329,12 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SetupToolsMcpSkillsLabel,
     MessageId::SetupToolsMcpToolsLabel,
     MessageId::SetupToolsMcpPluginsLabel,
+    MessageId::SetupToolsMcpHotbarLabel,
     MessageId::SetupToolsMcpReviewHint,
     MessageId::SetupToolsMcpReviewed,
+    MessageId::SetupToolsMcpNeedsActionSaved,
+    MessageId::SetupToolsMcpPreviewTitle,
+    MessageId::SetupToolsMcpOnRampText,
     MessageId::SetupRemoteCloudsLabel,
     MessageId::SetupRemoteBridgesLabel,
     MessageId::SetupRemoteProvidersLabel,
@@ -1287,13 +1422,11 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::AppModeAuto,
     MessageId::AppModeYolo,
     MessageId::AppModePlan,
-    MessageId::AppModeMultitask,
     MessageId::AppModeOperate,
     MessageId::AppModeAgentHint,
     MessageId::AppModeAutoHint,
     MessageId::AppModePlanHint,
     MessageId::AppModeYoloHint,
-    MessageId::AppModeMultitaskHint,
     MessageId::AppModeOperateHint,
     MessageId::VimModeNormal,
     MessageId::VimModeInsert,
@@ -1413,6 +1546,78 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::VoiceRecording,
     MessageId::VoiceProcessing,
     MessageId::VoiceTranscribed,
+    MessageId::NotificationTurnComplete,
+    MessageId::NotificationSubagentComplete,
+    MessageId::FooterWorkedChip,
+    MessageId::FleetDraftTitle,
+    MessageId::FleetDraftHeader,
+    MessageId::FleetPreviewHeader,
+    MessageId::SetupRemoteOnRampText,
+    MessageId::ApprovalDescSafe,
+    MessageId::ApprovalDescFileWrite,
+    MessageId::ApprovalDescShell,
+    MessageId::ApprovalDescNetwork,
+    MessageId::ApprovalDescMcpRead,
+    MessageId::ApprovalDescMcpAction,
+    MessageId::ApprovalDescAgent,
+    MessageId::ApprovalDescUnknown,
+    MessageId::ApprovalImpactSafe,
+    MessageId::ApprovalImpactFileWrite,
+    MessageId::ApprovalImpactShell,
+    MessageId::ApprovalImpactNetwork,
+    MessageId::ApprovalImpactMcpRead,
+    MessageId::ApprovalImpactMcpAction,
+    MessageId::ApprovalImpactAgent,
+    MessageId::ApprovalImpactUnknown,
+    MessageId::ApprovalLabelCommand,
+    MessageId::ApprovalLabelDir,
+    MessageId::ApprovalLabelFile,
+    MessageId::ApprovalLabelPreview,
+    MessageId::ApprovalLabelProposedContent,
+    MessageId::ApprovalLabelReplaceThis,
+    MessageId::ApprovalLabelWithThis,
+    MessageId::ApprovalLabelReplacementContent,
+    MessageId::ApprovalLabelPath,
+    MessageId::ApprovalLabelTarget,
+    MessageId::ApprovalLabelInput,
+    MessageId::ApprovalLabelAction,
+    MessageId::ApprovalLabelType,
+    MessageId::ApprovalLabelPrompt,
+    MessageId::ApprovalLabelAbout,
+    MessageId::ApprovalLabelImpact,
+    MessageId::SetupConstitutionFileNotChecked,
+    MessageId::SetupConstitutionFileMissing,
+    MessageId::SetupConstitutionFileLoadedSelected,
+    MessageId::SetupConstitutionFileLoadedInactive,
+    MessageId::SetupConstitutionFileLoadedUnselected,
+    MessageId::SetupConstitutionFileEmpty,
+    MessageId::SetupConstitutionFileInvalid,
+    MessageId::SetupConstitutionFileUnreadable,
+    MessageId::SetupConstitutionFilePathError,
+    MessageId::SetupExpertOverrideNotChecked,
+    MessageId::SetupExpertOverrideMissing,
+    MessageId::SetupExpertOverrideActive,
+    MessageId::SetupExpertOverrideDisabled,
+    MessageId::SetupExpertOverrideEmpty,
+    MessageId::SetupExpertOverrideUnreadable,
+    MessageId::SetupExpertOverridePathError,
+    MessageId::SetupAutonomyUnspecified,
+    MessageId::SetupGuidedPurposeCoding,
+    MessageId::SetupGuidedPurposeResearch,
+    MessageId::SetupGuidedPurposeOperations,
+    MessageId::SetupGuidedPurposeMixed,
+    MessageId::SetupGuidedPurposeAboutCoding,
+    MessageId::SetupGuidedPurposeAboutResearch,
+    MessageId::SetupGuidedPurposeAboutOperations,
+    MessageId::SetupGuidedPurposeAboutMixed,
+    MessageId::SetupGuidedStyleCoding,
+    MessageId::SetupGuidedStyleResearch,
+    MessageId::SetupGuidedStyleOperations,
+    MessageId::SetupGuidedStyleMixed,
+    MessageId::SetupGuidedEvidenceAssumptions,
+    MessageId::SetupGuidedEvidenceTestsAndReceipts,
+    MessageId::SetupGuidedEvidenceReleaseReceipts,
+    MessageId::SetupGuidedNotes,
 ];
 
 pub fn tr(locale: Locale, id: MessageId) -> Cow<'static, str> {
@@ -1713,6 +1918,7 @@ mod tests {
             MessageId::AppModeAutoHint,
             MessageId::AppModePlanHint,
             MessageId::AppModeYoloHint,
+            MessageId::AppModeOperateHint,
         ];
         for locale in Locale::shipped_complete() {
             if *locale == Locale::En {
@@ -1825,5 +2031,133 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn visible_row_text(buf: &Buffer, area: Rect, y: u16) -> String {
+        let mut out = String::new();
+        let mut skip_cells = 0usize;
+        for x in area.left()..area.right() {
+            if skip_cells > 0 {
+                skip_cells -= 1;
+                continue;
+            }
+            let symbol = buf[(x, y)].symbol();
+            out.push_str(symbol);
+            skip_cells = UnicodeWidthStr::width(symbol).saturating_sub(1);
+        }
+        out
+    }
+
+    // --- Unicode / CJK / terminal-width QA (issue #3488) -------------------
+    // `truncate_to_width` is the localization-layer truncation helper. These
+    // verify it clips by display width (never byte/char count), preserves
+    // semantic prefixes, never splits a grapheme cluster, and that mixed
+    // English/CJK rows wrap inside a narrow (40-col) and medium (80-col)
+    // terminal buffer without overflowing the column.
+
+    #[test]
+    fn truncate_to_width_clips_cjk_by_display_width_and_keeps_prefix_intact() {
+        // Each Han glyph is two columns. A 12-column budget fits the six-glyph
+        // title exactly, so no truncation/ellipsis happens and the prefix survives.
+        let title = "项目报告结果"; // 12 columns
+        assert_eq!(truncate_to_width(title, 12), title);
+
+        // Oversized: clip on a whole-glyph boundary, append the ellipsis, and
+        // stay within the budget by display width.
+        let out = truncate_to_width("数据库迁移任务结果", 7); // 10 glyphs = 20 cols
+        assert!(
+            UnicodeWidthStr::width(out.as_str()) <= 7,
+            "{out:?} overflowed"
+        );
+        assert!(out.ends_with('…'), "expected ellipsis, got {out:?}");
+        assert!(!out.contains('\u{FFFD}'), "split a wide glyph: {out:?}");
+        // The kept body is whole wide glyphs (each two columns) — never a half cell.
+        let body = out.strip_suffix('…').unwrap_or(&out);
+        assert!(
+            body.chars()
+                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum::<usize>()
+                <= 6,
+            "body exceeded budget-minus-ellipsis: {out:?}"
+        );
+
+        // A semantic ASCII prefix (e.g. a status verb) survives when it fits.
+        let row = "running 数据库迁移任务结果预览测试";
+        let out = truncate_to_width(row, 16);
+        assert!(
+            out.starts_with("running"),
+            "semantic prefix dropped: {out:?}"
+        );
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 16);
+        assert!(!out.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn truncate_to_width_never_splits_combining_marks_or_emoji() {
+        // Combining mark (U+0301) and ZWJ are zero-width; they must not be
+        // counted as columns and must never be cut mid-cluster into U+FFFD.
+        let cafe = "cafe\u{0301}"; // "café", 4 columns
+        assert_eq!(truncate_to_width(cafe, 10), cafe);
+        let out = truncate_to_width("cafe\u{0301} overflow here", 6);
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 6);
+        assert!(!out.contains('\u{FFFD}'));
+
+        // Emoji is two columns; truncation lands on a cluster boundary.
+        let out = truncate_to_width("\u{1F433}\u{1F433}\u{1F433} whales everywhere", 5);
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 5);
+        assert!(!out.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn narrow_and_medium_terminal_wraps_mixed_width_rows_without_overflow() {
+        // Issue #3488 acceptance: at a 40-col (narrow, macOS-Terminal-like) and
+        // 80-col (medium) terminal, mixed English/CJK task titles and transcript
+        // lines must (a) truncate to the column by display width, and (b) wrap
+        // inside the buffer so no rendered row exceeds the terminal width.
+        let fixtures = [
+            "Task: 数据库迁移任务 — verify provider routing for issue #3488",
+            "抹香鲸 is running codex/issue-3439-zhipu-glm-fixture @ issue-3439",
+            "满員電車🫠 — full-width punctuation：『』【】 mixes with ASCII ids",
+        ];
+
+        for width in [40usize, 80] {
+            // (a) The truncation helper clips by display width.
+            for fixture in fixtures {
+                let out = truncate_to_width(fixture, width);
+                assert!(
+                    UnicodeWidthStr::width(out.as_str()) <= width,
+                    "width={width}: truncated row overflowed: {out:?}"
+                );
+                assert!(
+                    !out.contains('\u{FFFD}'),
+                    "width={width}: split a glyph: {out:?}"
+                );
+            }
+
+            // (b) Wrapping the full mixed-width line inside a buffer of `width`
+            // columns never lets a rendered row exceed the terminal width.
+            for fixture in fixtures {
+                let area = Rect::new(0, 0, width as u16, 6);
+                let mut buf = Buffer::empty(area);
+                Paragraph::new(fixture)
+                    .wrap(Wrap { trim: false })
+                    .render(area, &mut buf);
+                let mut saw_text = false;
+                for (row_idx, y) in (area.top()..area.bottom()).enumerate() {
+                    let row = visible_row_text(&buf, area, y);
+                    let trimmed = row.trim_end_matches('\u{0}').trim_end();
+                    assert!(
+                        UnicodeWidthStr::width(trimmed) <= width,
+                        "width={width} row {row_idx}: wrapped row overflowed ({} cols): {trimmed:?}",
+                        UnicodeWidthStr::width(trimmed)
+                    );
+                    saw_text |= trimmed.chars().any(|ch| !ch.is_whitespace());
+                }
+                assert!(
+                    saw_text,
+                    "width={width}: mixed fixture produced an empty render"
+                );
+            }
+        }
     }
 }

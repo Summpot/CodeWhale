@@ -519,6 +519,17 @@ pub enum AgentWorkerStatus {
     Interrupted,
 }
 
+impl AgentWorkerStatus {
+    /// Terminal worker statuses may be age-evicted from the run ledger (#4217).
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted
+        )
+    }
+}
+
 /// Tool capability profile requested for a headless worker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1072,6 +1083,43 @@ pub(crate) struct SubAgentSpawnOptions {
     pub token_budget: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowTaskSpawnResult {
+    pub result: SubAgentResult,
+    pub metadata: WorkflowTaskSpawnMetadata,
+}
+
+/// Workflow identity stamped onto children launched via `spawn_workflow_task`
+/// (#4119). Lets panel/history render without parsing the child prompt.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowTaskSpawnIdentity {
+    pub workflow_run_id: String,
+    pub workflow_phase_id: Option<String>,
+    pub workflow_task_label: Option<String>,
+    pub workflow_child_index: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowTaskSpawnMetadata {
+    pub resolved_provider: String,
+    pub resolved_model: String,
+    pub route_source: String,
+    /// Fleet role resolved for this spawn, if any (#4177).
+    pub resolved_role: Option<String>,
+    /// AgentProfile id resolved for this spawn, if any (#4177).
+    pub resolved_profile: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub depth: u32,
+    /// Workflow run that launched this child (`None` for direct `agent` spawns).
+    pub workflow_run_id: Option<String>,
+    /// Active phase title/id when the child was admitted (`None` outside workflows).
+    pub workflow_phase_id: Option<String>,
+    /// Human label from the Workflow `task({ label })` option.
+    pub workflow_task_label: Option<String>,
+    /// 0-based admission order among children of this workflow run.
+    pub workflow_child_index: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubAgentModelStrength {
     Same,
@@ -1175,6 +1223,13 @@ struct SpawnRequest {
     /// When unset, the child inherits the parent's budget pool or the
     /// configured root default.
     token_budget: Option<u64>,
+    /// Extra tool deny-list from the caller, unioned with the parent runtime's
+    /// inherited deny-list. Deny always wins over allow (#4042).
+    disallowed_tools: Option<Vec<String>>,
+    /// When true (default), the child inherits the parent runtime's
+    /// `disallowed_tools`. Set `false` to start the child with a clean slate
+    /// (only the explicit `disallowed_tools` above, if any, then apply).
+    inherit_disallowed_tools: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1364,6 +1419,10 @@ pub struct SubAgentRuntime {
     pub fleet_roster: std::sync::Arc<crate::fleet::roster::FleetRoster>,
     pub context: ToolContext,
     pub allow_shell: bool,
+    /// When true, Suggest-level file writes auto-accept for write-capable roles
+    /// without full parent auto-approve. Shell/network/MCP still gated.
+    /// Set for Workflow-spawned children.
+    pub accept_edits: bool,
     /// Native Agent-mode tool surface inherited from the parent turn. Carries
     /// feature/config-dependent families such as web search, patch, memory,
     /// vision, notify, and FIM so child catalogs stay in parity with the parent.
@@ -1456,6 +1515,7 @@ impl SubAgentRuntime {
             fleet_roster: std::sync::Arc::new(crate::fleet::roster::FleetRoster::built_ins_only()),
             context,
             allow_shell,
+            accept_edits: false,
             agent_tool_surface_options: AgentToolSurfaceOptions::new(
                 ShellPolicy::from_legacy_allow_shell(allow_shell),
             ),
@@ -1598,21 +1658,20 @@ impl SubAgentRuntime {
         self
     }
 
-    /// Build an LLM client bound to `provider` from the threaded session
+    /// Build an LLM client bound to `provider_id` from the threaded session
     /// `Config` (#4193). Mirrors the proven per-provider client factory used by
     /// per-turn auto-routing (`model_routing`) and the engine's provider switch:
     /// clone the session config, override only its `provider`, and let
     /// [`DeepSeekClient::new`] re-resolve that provider's base URL + credentials
-    /// from config/env.
+    /// from config/env. `provider_id` may be a built-in provider id or a
+    /// user-named `[providers.<id>] kind="openai-compatible"` custom provider
+    /// such as `lm-studio` (#3965).
     ///
     /// Returns `Err` when no config was threaded in, or when the provider's
     /// credentials/base URL cannot be resolved. Callers MUST surface that error
     /// rather than fall back to the session client: a silent fallback would send
     /// the pinned model id to the session provider's endpoint (#4093).
-    fn client_for_provider(
-        &self,
-        provider: crate::config::ApiProvider,
-    ) -> Result<DeepSeekClient, String> {
+    fn client_for_provider_id(&self, provider_id: &str) -> Result<DeepSeekClient, String> {
         let Some(api_config) = self.api_config.as_ref() else {
             return Err(
                 "session Config was not threaded into this runtime; cannot build a \
@@ -1620,13 +1679,34 @@ impl SubAgentRuntime {
                     .to_string(),
             );
         };
+        let provider_id = provider_id.trim();
+        if provider_id.is_empty() {
+            return Err("provider pin was blank".to_string());
+        }
+        let built_in = crate::config::ApiProvider::parse(provider_id);
+        let custom = built_in.is_none()
+            && api_config
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.custom_provider_config(provider_id))
+                .is_some();
+        if built_in.is_none() && !custom {
+            return Err(format!(
+                "provider '{provider_id}' is neither a built-in provider nor a configured \
+                 [providers.{provider_id}] custom provider"
+            ));
+        }
         let mut provider_config = (**api_config).clone();
         // EPIC #2608: the provider is taken verbatim from the profile pin
-        // (already parsed to a canonical `ApiProvider`), never inferred from the
-        // model id. Overriding only `provider` makes `Config::api_provider`,
+        // (built-in id or configured custom id), never inferred from the model
+        // id. Overriding only `provider` makes `Config::api_provider`,
         // `deepseek_base_url`, and `deepseek_api_key` all re-resolve for the
         // pinned provider.
-        provider_config.provider = Some(provider.as_str().to_string());
+        provider_config.provider = Some(
+            built_in
+                .map(|provider| provider.as_str().to_string())
+                .unwrap_or_else(|| provider_id.to_string()),
+        );
         DeepSeekClient::new(&provider_config).map_err(|err| err.to_string())
     }
 
@@ -1697,6 +1777,7 @@ impl SubAgentRuntime {
             fleet_roster: self.fleet_roster.clone(),
             context: child_context,
             allow_shell: self.allow_shell,
+            accept_edits: self.accept_edits,
             agent_tool_surface_options: self.agent_tool_surface_options.clone(),
             worker_profile: self.worker_profile.clone(),
             event_tx: self.event_tx.clone(),
@@ -2975,6 +3056,7 @@ impl SubAgentManager {
     /// during this pass.
     pub fn cleanup(&mut self, max_age: Duration) -> usize {
         let before = self.agents.len();
+        let before_workers = self.worker_records.len();
         let mut auto_cancelled = 0;
         let timeout = self.running_heartbeat_timeout;
         let mut worker_cancellations = Vec::new();
@@ -3023,7 +3105,23 @@ impl SubAgentManager {
                 agent.started_at.elapsed() < max_age
             }
         });
-        if self.agents.len() != before || auto_cancelled > 0 {
+        // #4217: age-evict terminal worker ledger entries. Agents already drop
+        // after `max_age`, but worker_records previously only had an LRU cap of
+        // 256 — long-lived sessions rewrote multi-MB subagents.v1.json forever.
+        // Running / starting / waiting records are always preserved.
+        let now_ms = epoch_millis_now();
+        let max_age_ms = max_age.as_millis() as u64;
+        self.worker_records.retain(|_, record| {
+            if !record.status.is_terminal() {
+                return true;
+            }
+            let anchor_ms = record.completed_at_ms.unwrap_or(record.updated_at_ms);
+            now_ms.saturating_sub(anchor_ms) < max_age_ms
+        });
+        if self.agents.len() != before
+            || auto_cancelled > 0
+            || self.worker_records.len() != before_workers
+        {
             self.persist_state_best_effort();
         }
         self.last_cleanup_at = Some(Instant::now());
@@ -3555,12 +3653,27 @@ pub fn new_shared_subagent_manager_with_timeout(
 pub struct AgentTool {
     manager: SharedSubAgentManager,
     runtime: SubAgentRuntime,
+    /// Last projection fingerprint per agent, used to throttle repeat
+    /// peek/status calls that observe no change (#4097). Std mutex: locked
+    /// only for brief map reads/writes, never across an await.
+    inspect_memo: Arc<std::sync::Mutex<HashMap<String, PeekMemo>>>,
+}
+
+/// Fingerprint of the last peek/status response for one agent (#4097).
+#[derive(Debug, Clone, Copy)]
+struct PeekMemo {
+    fingerprint: u64,
+    at: Instant,
 }
 
 impl AgentTool {
     #[must_use]
     pub fn new(manager: SharedSubAgentManager, runtime: SubAgentRuntime) -> Self {
-        Self { manager, runtime }
+        Self {
+            manager,
+            runtime,
+            inspect_memo: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -3569,6 +3682,7 @@ enum AgentToolAction {
     Start,
     Status,
     Peek,
+    Wait,
     Cancel,
 }
 
@@ -3580,9 +3694,10 @@ fn parse_agent_tool_action(input: &Value) -> Result<AgentToolAction, ToolError> 
         "" | "start" | "spawn" | "run" => Ok(AgentToolAction::Start),
         "status" | "list" | "inspect" => Ok(AgentToolAction::Status),
         "peek" | "progress" => Ok(AgentToolAction::Peek),
+        "wait" | "join" | "await" | "block" => Ok(AgentToolAction::Wait),
         "cancel" | "stop" | "abort" => Ok(AgentToolAction::Cancel),
         other => Err(ToolError::invalid_input(format!(
-            "Invalid agent action '{other}'. Use start, status, peek, or cancel."
+            "Invalid agent action '{other}'. Use start, status, peek, wait, or cancel."
         ))),
     }
 }
@@ -3606,7 +3721,8 @@ impl ToolSpec for AgentTool {
             "For several independent targets, call agent separately for each target; CodeWhale runs or queues them under runtime capacity and provider rate-limit backpressure. ",
             "The child runs in the background and reports back automatically when finished; keep tiny reads/searches local. ",
             "Pass profile to spawn a saved Fleet roster member (e.g. reviewer, scout, builder) with its role posture, model routing, and instructions. ",
-            "Use action=status or action=peek with agent_id to inspect progress, and action=cancel with agent_id to stop a running child. Returns session projections with transcript_handle for UI/debug inspection."
+            "Use action=status or action=peek with agent_id to inspect progress, and action=cancel with agent_id to stop a running child. Returns session projections with transcript_handle for UI/debug inspection. ",
+            "Never poll with repeated peek/status calls or sleep while children run: results arrive automatically as completion sentinels. If you must block until a child finishes (fan-in before synthesis), make one action=wait call — it blocks until a child settles (all children when agent_id is omitted; timeout_secs caps the block, default 300)."
         )
     }
 
@@ -3616,12 +3732,18 @@ impl ToolSpec for AgentTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "status", "peek", "cancel"],
-                    "description": "start (default) launches a child. status lists current children or inspects agent_id. peek is status for one child. cancel stops a running child by agent_id."
+                    "enum": ["start", "status", "peek", "wait", "cancel"],
+                    "description": "start (default) launches a child. status lists current children or inspects agent_id. peek is status for one child. wait blocks until a running child settles (agent_id for one specific child, otherwise the next completion) — use this instead of polling peek/status or sleeping. cancel stops a running child by agent_id."
                 },
                 "agent_id": {
                     "type": "string",
-                    "description": "Agent id or session name for action=status, action=peek, or action=cancel."
+                    "description": "Agent id or session name for action=status, action=peek, action=wait, or action=cancel."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "minimum": 5,
+                    "maximum": 1800,
+                    "description": "For action=wait: maximum seconds to block before returning a still-running snapshot. Default 300."
                 },
                 "include_archived": {
                     "type": "boolean",
@@ -3709,9 +3831,12 @@ impl ToolSpec for AgentTool {
     }
 
     /// #3801: status and peek are read-only queries — no approval needed.
+    /// #4097: wait passively observes children — also read-only.
     fn approval_requirement_for(&self, input: &Value) -> ApprovalRequirement {
         match parse_agent_tool_action(input) {
-            Ok(AgentToolAction::Status) | Ok(AgentToolAction::Peek) => ApprovalRequirement::Auto,
+            Ok(AgentToolAction::Status | AgentToolAction::Peek | AgentToolAction::Wait) => {
+                ApprovalRequirement::Auto
+            }
             _ => ApprovalRequirement::Required,
         }
     }
@@ -3734,11 +3859,12 @@ impl ToolSpec for AgentTool {
         )
     }
 
-    /// #3801: status/peek/cancel actions are read-only queries of manager state.
+    /// #3801: status/peek actions are read-only queries of manager state.
+    /// #4097: wait only observes child lifecycle — read-only as well.
     fn is_read_only_for(&self, input: &Value) -> bool {
         matches!(
             parse_agent_tool_action(input),
-            Ok(AgentToolAction::Status) | Ok(AgentToolAction::Peek)
+            Ok(AgentToolAction::Status | AgentToolAction::Peek | AgentToolAction::Wait)
         )
     }
 
@@ -3752,14 +3878,18 @@ impl ToolSpec for AgentTool {
                     self.manager.clone(),
                     context,
                     matches!(action, AgentToolAction::Peek),
+                    Some(&self.inspect_memo),
                 )
                 .await;
+            }
+            AgentToolAction::Wait => {
+                return wait_for_subagents_from_input(&input, self.manager.clone(), context).await;
             }
             AgentToolAction::Cancel => {
                 return cancel_agent_from_input(&input, self.manager.clone(), context).await;
             }
         }
-        let (snapshot, spawn_policy_note) =
+        let (snapshot, spawn_policy_note, _) =
             spawn_subagent_from_input(input, self.manager.clone(), self.runtime.clone()).await?;
         let worker_record = {
             let manager = self.manager.read().await;
@@ -3782,11 +3912,30 @@ impl ToolSpec for AgentTool {
     }
 }
 
+/// Repeat peek/status calls on an unchanged running child inside this window
+/// return a compact "no change" nudge instead of a full projection (#4097).
+const PEEK_UNCHANGED_THROTTLE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Stable change fingerprint for a running child's model-visible state.
+/// Volatile fields (durations, timestamps) are deliberately excluded so an
+/// idle child fingerprints identically across back-to-back peeks.
+fn inspect_fingerprint(snapshot: &SubAgentResult) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    subagent_status_name(&snapshot.status).hash(&mut hasher);
+    snapshot.steps_taken.hash(&mut hasher);
+    snapshot.result.is_some().hash(&mut hasher);
+    snapshot.needs_input.is_some().hash(&mut hasher);
+    snapshot.checkpoint.is_some().hash(&mut hasher);
+    hasher.finish()
+}
+
 async fn inspect_agent_from_input(
     input: &Value,
     manager: SharedSubAgentManager,
     context: &ToolContext,
     peek: bool,
+    inspect_memo: Option<&Arc<std::sync::Mutex<HashMap<String, PeekMemo>>>>,
 ) -> Result<ToolResult, ToolError> {
     let include_archived =
         parse_optional_bool(input, &["include_archived", "includeArchived"]).unwrap_or(false);
@@ -3801,6 +3950,53 @@ async fn inspect_agent_from_input(
             let worker_record = manager.get_worker_record(&snapshot.agent_id);
             (snapshot, worker_record)
         };
+
+        // #4097: a running child whose model-visible state hasn't changed
+        // since the last peek gets a compact nudge, not another full
+        // projection. Terminal/parked children always return in full — the
+        // model may legitimately be fetching results.
+        if snapshot.status == SubAgentStatus::Running
+            && let Some(memo_map) = inspect_memo
+        {
+            let fingerprint = inspect_fingerprint(&snapshot);
+            let now = Instant::now();
+            let unchanged = {
+                let mut memo_map = memo_map.lock().expect("inspect memo lock");
+                let unchanged = memo_map.get(&snapshot.agent_id).is_some_and(|memo| {
+                    memo.fingerprint == fingerprint
+                        && now.duration_since(memo.at) < PEEK_UNCHANGED_THROTTLE_WINDOW
+                });
+                memo_map.insert(
+                    snapshot.agent_id.clone(),
+                    PeekMemo {
+                        fingerprint,
+                        at: now,
+                    },
+                );
+                unchanged
+            };
+            if unchanged {
+                let payload = json!({
+                    "action": if peek { "peek" } else { "status" },
+                    "agent_id": snapshot.agent_id,
+                    "name": snapshot.name,
+                    "status": "running",
+                    "unchanged": true,
+                    "hint": "No change since your last check. Do not poll: results arrive automatically as <codewhale:subagent.done> sentinels. Either continue independent work, end your turn, or make one agent(action=\"wait\") call to block until this child settles.",
+                });
+                let mut tool_result = ToolResult::json(&payload)
+                    .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+                tool_result.metadata = Some(json!({
+                    "action": if peek { "peek" } else { "status" },
+                    "status": "running",
+                    "terminal": false,
+                    "agent_id": payload["agent_id"],
+                    "unchanged": true,
+                }));
+                return Ok(tool_result);
+            }
+        }
+
         let projection =
             subagent_session_projection(snapshot, include_archived, context, worker_record).await;
         let mut tool_result = ToolResult::json(&projection)
@@ -3873,6 +4069,187 @@ async fn cancel_agent_from_input(
     Ok(tool_result)
 }
 
+/// Bounds for `agent(action="wait")` (#4097). The default keeps one wait call
+/// well under provider/tool timeouts while covering typical child runtimes;
+/// on expiry the model gets a still-running snapshot and can wait again.
+const SUBAGENT_WAIT_DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Runtime floor is 1s (schema advertises 5) so tests can exercise the
+/// timeout path without multi-second sleeps.
+const SUBAGENT_WAIT_MIN_TIMEOUT_SECS: u64 = 1;
+const SUBAGENT_WAIT_MAX_TIMEOUT_SECS: u64 = 1800;
+/// Internal state-check cadence while blocked. Invisible to the model — the
+/// #4097 anti-pattern is model-visible polling that burns turns and tokens,
+/// not a cheap in-process timer.
+const SUBAGENT_WAIT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// `agent(action="wait")`: block until a running child settles (leaves
+/// `Running` — completed, failed, cancelled, interrupted/needs-input, or
+/// budget-exhausted), then return a compact summary. Full child results are
+/// still delivered as `<codewhale:subagent.done>` sentinels by the runtime;
+/// this call only provides the legitimate "join" the model previously faked
+/// with peek→sleep loops (#4097).
+///
+/// With `agent_id`, waits for that child specifically. Without it, waits for
+/// the next child to settle (returning every child that settled while
+/// blocked). Returns immediately when nothing is running. Cancel-safe: the
+/// engine turn's cancel token interrupts the block, and no lock is held
+/// across an await.
+async fn wait_for_subagents_from_input(
+    input: &Value,
+    manager: SharedSubAgentManager,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let timeout_secs = input
+        .get("timeout_secs")
+        .or_else(|| input.get("timeout"))
+        .and_then(Value::as_u64)
+        .unwrap_or(SUBAGENT_WAIT_DEFAULT_TIMEOUT_SECS)
+        .clamp(
+            SUBAGENT_WAIT_MIN_TIMEOUT_SECS,
+            SUBAGENT_WAIT_MAX_TIMEOUT_SECS,
+        );
+    let timeout = Duration::from_secs(timeout_secs);
+    let agent_ref = parse_agent_ref(input);
+
+    // Resolve the watch set up front so a bad reference fails immediately
+    // instead of blocking for the full timeout.
+    let watched: Vec<String> = {
+        let manager = manager.read().await;
+        if let Some(agent_ref) = &agent_ref {
+            let snapshot = manager
+                .get_result_by_ref(agent_ref)
+                .map_err(|err| ToolError::invalid_input(err.to_string()))?;
+            if snapshot.status != SubAgentStatus::Running {
+                let running = manager.running_count();
+                drop(manager);
+                return wait_result_payload(&[snapshot], running, 0, false).await;
+            }
+            vec![snapshot.agent_id]
+        } else {
+            manager
+                .list_filtered(false)
+                .into_iter()
+                .filter(|snapshot| snapshot.status == SubAgentStatus::Running)
+                .map(|snapshot| snapshot.agent_id)
+                .collect()
+        }
+    };
+
+    if watched.is_empty() {
+        let payload = json!({
+            "action": "wait",
+            "settled": [],
+            "running": 0,
+            "note": "No running sub-agents; nothing to wait for.",
+        });
+        let mut tool_result = ToolResult::json(&payload)
+            .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+        tool_result.metadata = Some(json!({ "action": "wait", "settled": 0, "running": 0 }));
+        return Ok(tool_result);
+    }
+
+    let started = Instant::now();
+    let cancelled = async {
+        match &context.cancel_token {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(cancelled);
+
+    loop {
+        let (settled, running) = {
+            let manager = manager.read().await;
+            let mut settled = Vec::new();
+            for agent_id in &watched {
+                if let Ok(snapshot) = manager.get_result_by_ref(agent_id)
+                    && snapshot.status != SubAgentStatus::Running
+                {
+                    settled.push(snapshot);
+                }
+            }
+            (settled, manager.running_count())
+        };
+
+        if !settled.is_empty() || running == 0 {
+            return wait_result_payload(&settled, running, started.elapsed().as_millis(), false)
+                .await;
+        }
+        if started.elapsed() >= timeout {
+            return wait_result_payload(&[], running, started.elapsed().as_millis(), true).await;
+        }
+
+        tokio::select! {
+            () = &mut cancelled => {
+                return Ok(ToolResult::success(
+                    "Wait interrupted by user cancellation before any sub-agent settled.",
+                ));
+            }
+            () = tokio::time::sleep(SUBAGENT_WAIT_CHECK_INTERVAL) => {}
+        }
+    }
+}
+
+/// Compact `action=wait` result. Deliberately not a full projection: the
+/// runtime's completion sentinels (and a follow-up peek on a settled child)
+/// carry the full payload; duplicating it here would double token cost.
+async fn wait_result_payload(
+    settled: &[SubAgentResult],
+    running: usize,
+    waited_ms: u128,
+    timed_out: bool,
+) -> Result<ToolResult, ToolError> {
+    let settled_entries: Vec<Value> = settled
+        .iter()
+        .map(|snapshot| {
+            json!({
+                "agent_id": snapshot.agent_id,
+                "name": snapshot.name,
+                "status": subagent_status_name(&snapshot.status),
+            })
+        })
+        .collect();
+    let note = if timed_out {
+        "Wait timed out with children still running. Do not poll — either wait again, continue independent work, or end your turn; results arrive automatically as <codewhale:subagent.done> sentinels."
+    } else if settled_entries.is_empty() {
+        "No sub-agents are running anymore."
+    } else {
+        "Full results arrive as <codewhale:subagent.done> sentinels — read those before synthesizing; do not re-peek settled children unless you need the full projection."
+    };
+    let payload = json!({
+        "action": "wait",
+        "settled": settled_entries,
+        "running": running,
+        "waited_ms": u64::try_from(waited_ms).unwrap_or(u64::MAX),
+        "timed_out": timed_out,
+        "note": note,
+    });
+    let mut tool_result =
+        ToolResult::json(&payload).map_err(|err| ToolError::execution_failed(err.to_string()))?;
+    tool_result.metadata = Some(json!({
+        "action": "wait",
+        "settled": settled.len(),
+        "running": running,
+        "timed_out": timed_out,
+    }));
+    Ok(tool_result)
+}
+
+fn provider_pin_matches_session(runtime: &SubAgentRuntime, provider_id: &str) -> bool {
+    let provider_id = provider_id.trim();
+    let session_provider = runtime.client.api_provider();
+    if let Some(provider) = crate::config::ApiProvider::parse(provider_id) {
+        return provider == session_provider;
+    }
+    session_provider == crate::config::ApiProvider::Custom
+        && runtime
+            .api_config
+            .as_ref()
+            .and_then(|config| config.provider.as_deref())
+            .map(str::trim)
+            .is_some_and(|active| active == provider_id)
+}
+
 /// Resolve the LLM client a freshly spawned in-process child should run on,
 /// honoring a fleet roster member's explicit provider pin (#4193).
 ///
@@ -3894,14 +4271,14 @@ fn child_client_for_member(
     member: Option<&crate::fleet::profile::AgentProfile>,
 ) -> Result<DeepSeekClient, ToolError> {
     let session_provider = runtime.client.api_provider();
-    match crate::fleet::worker_runtime::explicit_fleet_provider(member) {
-        Some(pinned) if pinned != session_provider => {
-            runtime.client_for_provider(pinned).map_err(|err| {
+    match crate::fleet::worker_runtime::explicit_fleet_provider_id(member) {
+        Some(pinned_id) if !provider_pin_matches_session(runtime, &pinned_id) => {
+            runtime.client_for_provider_id(&pinned_id).map_err(|err| {
                 ToolError::execution_failed(format!(
                     "fleet profile pins provider '{}' but its client could not be built \
                      ({err}). Configure that provider's credentials/base URL, or drop the \
                      provider pin to inherit the session provider '{}'.",
-                    pinned.as_str(),
+                    pinned_id,
                     session_provider.as_str()
                 ))
             })
@@ -3914,7 +4291,7 @@ async fn spawn_subagent_from_input(
     input: Value,
     manager: SharedSubAgentManager,
     runtime: SubAgentRuntime,
-) -> Result<(SubAgentResult, Option<String>), ToolError> {
+) -> Result<(SubAgentResult, Option<String>, WorkflowTaskSpawnMetadata), ToolError> {
     let mut spawn_request = parse_spawn_request(&input)?;
     let spawn_policy_note = apply_session_spawn_policy(&runtime, &mut spawn_request);
     let profile_member = apply_spawn_profile(&mut spawn_request, &runtime.fleet_roster)?;
@@ -3963,24 +4340,32 @@ async fn spawn_subagent_from_input(
     if let Some(workspace) = child_workspace {
         child_runtime.context.workspace = workspace;
     }
-    // #4193 seam 2: normalize/validate the requested model against the CHILD's
-    // (pinned) provider, not the session provider. `child_runtime` carries the
-    // provider-B client set above, so a profile-less/`inherit` member still
-    // sees the session provider here (no regression).
-    let configured_model = match spawn_request.model.clone() {
-        Some(model) => Some(normalize_requested_subagent_model(
-            &model,
-            "model",
-            child_runtime.client.api_provider(),
-        )?),
-        None => configured_model_for_role_or_type(
-            &child_runtime,
-            spawn_request.assignment.role.as_deref(),
-            &spawn_request.agent_type,
-        )?,
-    };
-    // Resolved before the prompt is moved out of the request below.
-    let requested_model_route = spawn_model_route(&spawn_request, profile_member.as_ref());
+    // #4042: merge the parent runtime's inherited deny-list with the caller's
+    // explicit `disallowed_tools`. `background_runtime()` already cloned the
+    // parent's `worker_profile.denied_tools` (the session `--disallowed-tools`),
+    // so by default the child inherits it. `inherit_disallowed_tools: false`
+    // drops *only* the inherited list; an explicit caller `disallowed_tools`
+    // always applies (union, deny never relaxes).
+    if !spawn_request.inherit_disallowed_tools {
+        child_runtime.worker_profile.denied_tools.clear();
+    }
+    if let Some(ref caller_deny) = spawn_request.disallowed_tools {
+        for tool in caller_deny {
+            if !child_runtime
+                .worker_profile
+                .denied_tools
+                .iter()
+                .any(|existing| existing == tool)
+            {
+                child_runtime.worker_profile.denied_tools.push(tool.clone());
+            }
+        }
+    }
+    // Resolve the model once against the CHILD's (possibly profile-pinned)
+    // provider. The typed selection carries both precedence and provenance so
+    // a role default cannot override a saved AgentProfile model (#4177).
+    let model_selection =
+        resolve_spawn_model_selection(&child_runtime, &spawn_request, profile_member.as_ref())?;
     let (effective_prompt, _resident_conflict) = if let Some(ref file_path) =
         spawn_request.resident_file
     {
@@ -4019,10 +4404,10 @@ async fn spawn_subagent_from_input(
     // fixed-model validation then all resolve against provider B.
     let route = resolve_subagent_assignment_route(
         &child_runtime,
-        configured_model,
+        None,
         &effective_prompt,
         &spawn_request.agent_type,
-        requested_model_route,
+        model_selection.model_route,
         spawn_request.thinking,
     )
     .await;
@@ -4032,6 +4417,28 @@ async fn spawn_subagent_from_input(
     child_runtime.reasoning_effort = route.reasoning_effort.clone();
     child_runtime.reasoning_effort_auto = false;
     let model_route = route.model_route;
+    let resolved_role = profile_member
+        .as_ref()
+        .map(|member| member.profile.role.name.clone())
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| spawn_request.assignment.role.clone());
+    let resolved_profile = profile_member
+        .as_ref()
+        .map(|member| member.id.clone())
+        .or_else(|| spawn_request.profile.clone());
+    let spawn_metadata = WorkflowTaskSpawnMetadata {
+        resolved_provider: child_runtime.client.api_provider().as_str().to_string(),
+        resolved_model: effective_model.clone(),
+        route_source: model_selection.source.as_str().to_string(),
+        resolved_role,
+        resolved_profile,
+        parent_task_id: child_runtime.parent_agent_id.clone(),
+        depth: child_runtime.spawn_depth,
+        workflow_run_id: None,
+        workflow_phase_id: None,
+        workflow_task_label: None,
+        workflow_child_index: None,
+    };
 
     let mut manager_guard = manager.write().await;
 
@@ -4065,7 +4472,7 @@ async fn spawn_subagent_from_input(
         }
     }
 
-    Ok((result, spawn_policy_note))
+    Ok((result, spawn_policy_note, spawn_metadata))
 }
 
 /// Mode-aware spawn defaults for the root orchestrator (Wave 7 M4/M5).
@@ -4077,18 +4484,6 @@ fn apply_session_spawn_policy(
         return None;
     }
     match runtime.parent_mode {
-        AppMode::Multitask => {
-            // Background-friendly fan-out: when the operator did not specify
-            // strength or an exact model, prefer the faster sibling for parallel
-            // lookup/review children.
-            if !request.model_strength_explicit
-                && request.model.is_none()
-                && request.agent_type != SubAgentType::Explore
-            {
-                request.model_strength = SubAgentModelStrength::Faster;
-            }
-            None
-        }
         AppMode::Operate => {
             if request.profile.is_some() || request.agent_type_explicit {
                 return None;
@@ -4105,17 +4500,38 @@ fn apply_session_spawn_policy(
 /// Spawn one Workflow `task(...)` through the same path as the public `agent`
 /// tool. Keeping this adapter inside the sub-agent module prevents the
 /// Workflow driver from copying Fleet roster/profile/depth/budget semantics.
+///
+/// `identity` is stamped onto the returned spawn metadata so panel/history
+/// consumers can render workflow children without parsing prompt text (#4119).
 pub(crate) async fn spawn_workflow_task(
     request: codewhale_workflow_js::TaskRequest,
     manager: SharedSubAgentManager,
-    runtime: SubAgentRuntime,
-) -> Result<SubAgentResult, ToolError> {
+    mut runtime: SubAgentRuntime,
+    identity: WorkflowTaskSpawnIdentity,
+) -> Result<WorkflowTaskSpawnResult, ToolError> {
+    // Capture identity fallbacks before consuming `request` fields into the
+    // agent-tool input JSON.
+    let request_label = request
+        .label
+        .as_ref()
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+        .map(str::to_string);
+    let request_phase = request
+        .phase
+        .as_ref()
+        .map(|phase| phase.trim())
+        .filter(|phase| !phase.is_empty())
+        .map(str::to_string);
     let mut input = json!({
         "prompt": request.description,
         "worktree": request.worktree,
     });
     if let Some(value) = request.subagent_type {
         input["type"] = json!(value);
+    }
+    if let Some(value) = request.role {
+        input["role"] = json!(value);
     }
     if let Some(value) = request.profile {
         input["profile"] = json!(value);
@@ -4138,9 +4554,25 @@ pub(crate) async fn spawn_workflow_task(
     if let Some(value) = request.token_budget {
         input["token_budget"] = json!(value);
     }
-    spawn_subagent_from_input(input, manager, runtime)
-        .await
-        .map(|(result, _)| result)
+    // Workflow children inherit the parent tool surface and auto-accept
+    // Suggest-level file edits for write-capable roles. Shell / network / MCP
+    // still require parent auto-approve (or fail closed).
+    runtime.accept_edits = true;
+    let (result, _, mut metadata) = spawn_subagent_from_input(input, manager, runtime).await?;
+    // Prefer the identity values the driver stamped; fall back to task options.
+    let workflow_task_label = identity
+        .workflow_task_label
+        .filter(|label| !label.trim().is_empty())
+        .or(request_label);
+    let workflow_phase_id = identity
+        .workflow_phase_id
+        .filter(|phase| !phase.trim().is_empty())
+        .or(request_phase);
+    metadata.workflow_run_id = Some(identity.workflow_run_id);
+    metadata.workflow_phase_id = workflow_phase_id;
+    metadata.workflow_task_label = workflow_task_label;
+    metadata.workflow_child_index = Some(identity.workflow_child_index);
+    Ok(WorkflowTaskSpawnResult { result, metadata })
 }
 
 // === Sub-agent Execution ===
@@ -5394,6 +5826,7 @@ async fn run_subagent(
         if let Some(mb) = runtime.mailbox.as_ref() {
             let _ = mb.send(MailboxMessage::token_usage(
                 &agent_id,
+                runtime.client.api_provider(),
                 response.model.clone(),
                 response.usage.clone(),
             ));
@@ -5902,15 +6335,11 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         })
         .transpose()?;
 
-    let parsed_role_type = role_input
-        .map(|role| {
-            SubAgentType::from_str(role).ok_or_else(|| {
-                ToolError::invalid_input(format!(
-                    "Invalid role alias '{role}'. Use: {VALID_ROLE_ALIASES}"
-                ))
-            })
-        })
-        .transpose()?;
+    // Role may be either a SubAgentType alias (reviewer → Review) or a fleet
+    // roster role / member id (scout, release_lead). Type aliases still set
+    // agent_type; non-alias roles defer to fleet profile resolution (#4177).
+    let parsed_role_type = role_input.and_then(SubAgentType::from_str);
+    let role_is_type_alias = parsed_role_type.is_some();
 
     if let (Some(type_kind), Some(role_kind)) = (&parsed_type, &parsed_role_type)
         && type_kind != role_kind
@@ -5925,22 +6354,39 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         .or(parsed_role_type)
         .unwrap_or(SubAgentType::General);
 
-    if let Some(role) = role_input
-        && normalize_role_alias(role).is_none()
-    {
-        return Err(ToolError::invalid_input(format!(
-            "Invalid role alias '{role}'. Use: {VALID_ROLE_ALIASES}"
-        )));
-    }
-
-    let role = role_input
+    let role_alias = role_input
         .and_then(normalize_role_alias)
         .or_else(|| type_input.and_then(normalize_role_alias))
         .map(str::to_string);
 
-    let profile = optional_input_str(input, &["profile", "fleet_profile", "roster_profile"])
+    // Fleet role token: the raw role only when it is not a descriptive type
+    // alias. Type aliases remain local SubAgentType vocabulary and must not be
+    // promoted into roster lookup keys.
+    let fleet_role_token = match role_input {
+        Some(raw) if !role_is_type_alias => {
+            let token = validate_role_name(raw)?;
+            Some(token)
+        }
+        _ => None,
+    };
+
+    let role = role_alias.or_else(|| fleet_role_token.clone()).or_else(|| {
+        type_input
+            .and_then(normalize_role_alias)
+            .map(str::to_string)
+    });
+
+    let mut profile = optional_input_str(input, &["profile", "fleet_profile", "roster_profile"])
         .map(validate_profile_name)
         .transpose()?;
+    // When the caller declared a non-type Fleet role, use it as the profile
+    // key so `apply_spawn_profile` is the single roster resolution path.
+    // Descriptive SubAgentType aliases (worker/review/plan/verify/...) keep
+    // profile=None; promoting those aliases to roster ids made valid direct
+    // agent calls fail because several are not member ids (#4177).
+    if profile.is_none() {
+        profile = fleet_role_token.clone();
+    }
 
     let allowed_tools = input
         .get("allowed_tools")
@@ -6016,6 +6462,15 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
     let token_budget =
         parse_optional_positive_u64(input, &["token_budget", "tokenBudget", "max_tokens"])?;
 
+    // #4042: optional caller-supplied tool deny-list (unioned with the parent's
+    // inherited deny-list) and the inheritance opt-out flag (default inherits).
+    let disallowed_tools = parse_disallowed_tools(input)?;
+    let inherit_disallowed_tools = parse_optional_bool(
+        input,
+        &["inherit_disallowed_tools", "inheritDisallowedTools"],
+    )
+    .unwrap_or(true);
+
     Ok(SpawnRequest {
         session_name,
         prompt: prompt.clone(),
@@ -6034,6 +6489,8 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         fork_context,
         max_depth,
         token_budget,
+        disallowed_tools,
+        inherit_disallowed_tools,
     })
 }
 
@@ -6063,17 +6520,25 @@ fn validate_session_name(name: &str) -> Result<String, ToolError> {
 /// whitespace, quotes, backticks, or '='), lowercased for the roster's
 /// case-insensitive lookup.
 fn validate_profile_name(value: &str) -> Result<String, ToolError> {
+    validate_roster_token(value, "profile")
+}
+
+fn validate_role_name(value: &str) -> Result<String, ToolError> {
+    validate_roster_token(value, "role")
+}
+
+fn validate_roster_token(value: &str, field: &str) -> Result<String, ToolError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(ToolError::invalid_input("profile cannot be blank"));
+        return Err(ToolError::invalid_input(format!("{field} cannot be blank")));
     }
     if !trimmed
         .chars()
         .all(|ch| ch.is_ascii_graphic() && !matches!(ch, '"' | '\'' | '`' | '='))
     {
-        return Err(ToolError::invalid_input(
-            "profile must be a bare roster member id without whitespace, quotes, backticks, or '='",
-        ));
+        return Err(ToolError::invalid_input(format!(
+            "{field} must be a bare roster member id without whitespace, quotes, backticks, or '='"
+        )));
     }
     Ok(trimmed.to_ascii_lowercase())
 }
@@ -6096,7 +6561,7 @@ fn apply_spawn_profile(
     let Some(profile_id) = request.profile.as_deref() else {
         return Ok(None);
     };
-    let Some(member) = roster.get(profile_id) else {
+    let Some(member) = resolve_roster_member(roster, profile_id) else {
         let available = roster
             .members()
             .iter()
@@ -6104,7 +6569,8 @@ fn apply_spawn_profile(
             .collect::<Vec<_>>()
             .join(", ");
         return Err(ToolError::invalid_input(format!(
-            "Unknown profile '{profile_id}'. Available fleet roster members: {available}. See /fleet."
+            "Unknown fleet role/profile '{profile_id}'. Available fleet roster members: {available}. \
+             Type aliases: {VALID_ROLE_ALIASES}. See /fleet."
         )));
     };
 
@@ -6118,6 +6584,8 @@ fn apply_spawn_profile(
         )));
     }
     request.agent_type = member_type;
+    // Record the canonical profile id after role→profile resolution.
+    request.profile = Some(member.id.clone());
 
     // Surface the member's role in prompts and ledger records.
     let role_name = member.profile.role.name.trim();
@@ -6132,6 +6600,39 @@ fn apply_spawn_profile(
     }
 
     Ok(Some(member.clone()))
+}
+
+/// Resolve a fleet role or profile token against the roster (#4177).
+///
+/// Lookup order:
+/// 1. Member id (case-insensitive)
+/// 2. Member role name
+/// 3. Common stopship aliases (`implementer` → `builder`, `release_lead` → `manager`)
+fn resolve_roster_member<'a>(
+    roster: &'a crate::fleet::roster::FleetRoster,
+    id_or_role: &str,
+) -> Option<&'a crate::fleet::profile::AgentProfile> {
+    let key = id_or_role.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if let Some(member) = roster.get(key) {
+        return Some(member);
+    }
+    if let Some(member) = roster
+        .members()
+        .iter()
+        .find(|member| member.profile.role.name.trim().eq_ignore_ascii_case(key))
+    {
+        return Some(member);
+    }
+    let alias = match key.to_ascii_lowercase().as_str() {
+        "implementer" | "implement" | "implementation" => Some("builder"),
+        "release_lead" | "release-lead" | "releaselead" => Some("manager"),
+        "scout" | "explore" | "explorer" | "exploration" => Some("scout"),
+        _ => None,
+    };
+    alias.and_then(|id| roster.get(id))
 }
 
 /// Compact profile block appended to the child prompt, mirroring the fleet
@@ -6163,39 +6664,111 @@ fn spawn_profile_prompt_overlay(member: &crate::fleet::profile::AgentProfile) ->
     Some(overlay)
 }
 
-/// Requested model route for a spawn, honoring fleet profile precedence:
-/// explicit `model` param > explicit `model_strength` param > member model
-/// pin (Fixed) > member loadout > parse-time default. An explicit `model`
-/// still wins downstream via the configured-model path (which turns it into
-/// a Fixed route), as does a `role_models` override where one matches today.
-fn spawn_model_route(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnRouteSource {
+    TaskModel,
+    TaskModelStrength,
+    AgentProfileModel,
+    AgentProfileLoadout,
+    RoleDefault,
+    RunModel,
+}
+
+impl SpawnRouteSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskModel => "task.model",
+            Self::TaskModelStrength => "task.model_strength",
+            Self::AgentProfileModel => "agent_profile.model",
+            Self::AgentProfileLoadout => "agent_profile.loadout",
+            Self::RoleDefault => "role.default",
+            Self::RunModel => "run.model",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnModelSelection {
+    model_route: ModelRoute,
+    source: SpawnRouteSource,
+}
+
+/// Resolve the child model once, with receipt-grade precedence provenance:
+/// explicit task field > saved AgentProfile > configured role/type default >
+/// operator run model. Keeping the route and its source together prevents a
+/// later configured-model lookup from silently overriding a profile pin.
+fn resolve_spawn_model_selection(
+    runtime: &SubAgentRuntime,
     request: &SpawnRequest,
     member: Option<&crate::fleet::profile::AgentProfile>,
-) -> ModelRoute {
-    let Some(member) = member else {
-        return request.model_strength.model_route();
-    };
-    if request.model.is_some() || request.model_strength_explicit {
-        return request.model_strength.model_route();
+) -> Result<SpawnModelSelection, ToolError> {
+    if let Some(model) = request.model.as_deref() {
+        let model =
+            normalize_requested_subagent_model(model, "model", runtime.client.api_provider())?;
+        return Ok(SpawnModelSelection {
+            model_route: ModelRoute::Fixed(model),
+            source: SpawnRouteSource::TaskModel,
+        });
     }
-    if let Some(model) = member
-        .profile
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("auto"))
-    {
-        return ModelRoute::Fixed(model.to_string());
+    if request.model_strength_explicit {
+        return Ok(SpawnModelSelection {
+            model_route: request.model_strength.model_route(),
+            source: SpawnRouteSource::TaskModelStrength,
+        });
     }
-    match member.profile.loadout {
-        codewhale_config::FleetLoadout::Fast => ModelRoute::Faster,
-        // Inherit and the richer loadout classes (strong/balanced/...) all
-        // inherit the parent model here. The fleet dispatcher maps those
-        // classes to Auto, but in this seam Auto routes to the cheap sibling —
-        // a silent downgrade for e.g. a "strong" member. Inheriting keeps the
-        // existing non-profile default behavior.
-        _ => ModelRoute::Inherit,
+    if let Some(member) = member {
+        if let Some(model) = member
+            .profile
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("auto"))
+        {
+            let model = normalize_requested_subagent_model(
+                model,
+                &format!("fleet.profiles.{}.model", member.id),
+                runtime.client.api_provider(),
+            )?;
+            return Ok(SpawnModelSelection {
+                model_route: ModelRoute::Fixed(model),
+                source: SpawnRouteSource::AgentProfileModel,
+            });
+        }
+        if member.profile.loadout == codewhale_config::FleetLoadout::Fast {
+            return Ok(SpawnModelSelection {
+                model_route: ModelRoute::Faster,
+                source: SpawnRouteSource::AgentProfileLoadout,
+            });
+        }
+        // Richer custom loadouts (strong/balanced/...) have no exact
+        // ModelRoute equivalent here. Auto means "cheap sibling" in the
+        // sub-agent router, so those and explicit Inherit both preserve the
+        // operator run model and report that model's actual source.
+        return Ok(SpawnModelSelection {
+            model_route: ModelRoute::Inherit,
+            source: SpawnRouteSource::RunModel,
+        });
     }
+    if let Some(model) = configured_model_for_role_or_type(
+        runtime,
+        request.assignment.role.as_deref(),
+        &request.agent_type,
+    )? {
+        return Ok(SpawnModelSelection {
+            model_route: ModelRoute::Fixed(model),
+            source: SpawnRouteSource::RoleDefault,
+        });
+    }
+    if request.model_strength == SubAgentModelStrength::Faster {
+        return Ok(SpawnModelSelection {
+            model_route: ModelRoute::Faster,
+            source: SpawnRouteSource::RoleDefault,
+        });
+    }
+    Ok(SpawnModelSelection {
+        model_route: ModelRoute::Inherit,
+        source: SpawnRouteSource::RunModel,
+    })
 }
 
 /// Effective absolute `max_spawn_depth` for a child, combining the inherited
@@ -6224,6 +6797,31 @@ fn parse_optional_bool(input: &Value, names: &[&str]) -> Option<bool> {
         .iter()
         .find_map(|name| input.get(*name))
         .and_then(Value::as_bool)
+}
+
+/// Parse an optional caller-supplied `disallowed_tools` array (#4042). Mirrors
+/// the `allowed_tools` parsing: trimmed, de-duplicated, non-empty-only. Returns
+/// `None` when the key is absent or yields no usable entries so the union merge
+/// in `spawn_subagent_from_input` only runs when there is something to add.
+fn parse_disallowed_tools(input: &Value) -> Result<Option<Vec<String>>, ToolError> {
+    let Some(array) = input.get("disallowed_tools").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let mut tools = Vec::new();
+    for item in array {
+        let Some(tool) = item.as_str() else {
+            continue;
+        };
+        let trimmed = tool.trim();
+        if !trimmed.is_empty() && !tools.iter().any(|existing: &String| existing == trimmed) {
+            tools.push(trimmed.to_string());
+        }
+    }
+    if tools.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(tools))
+    }
 }
 
 fn parse_optional_positive_u64(input: &Value, names: &[&str]) -> Result<Option<u64>, ToolError> {
@@ -6413,14 +7011,10 @@ fn fallback_subagent_assignment_route(
 /// must not cross namespaces (#3227, subagent route validation 2026-07-07).
 ///
 /// Enumerates through the catalog-backed [`crate::provider_lake`] facade rather
-/// than the raw legacy `model_completion_names_for_provider` table (#4116). The
-/// facade returns bundled+live catalog rows for the provider and, for providers
-/// with no catalog coverage, falls back to that same legacy table internally.
-/// This consumer only reads the first entry, and it already preferred the
-/// catalog facade before the migration — the removed raw-legacy tail only ran
-/// when the facade was empty, which never happens while the legacy table is
-/// non-empty. Dropping it is therefore behavior-preserving and never narrows
-/// the operator model chosen here.
+/// than the raw legacy `model_completion_names_for_provider` table (#4116 /
+/// #4188). The facade prefers live Models.dev, then the offline bundled
+/// snapshot, and only then the legacy hardcoded table for CodeWhale-only /
+/// unbundled providers. This consumer only reads the first entry.
 fn operator_model_for_subagent(runtime: &SubAgentRuntime) -> String {
     let provider = runtime.client.api_provider();
     if crate::config::validate_route(provider, &runtime.model).is_ok() {
@@ -7165,7 +7759,14 @@ struct SubAgentToolRegistry {
     /// `None` → full inheritance (no allowlist filter applied). `Some(list)` →
     /// only the listed tools are visible to the model and callable.
     allowed_tools: Option<Vec<String>>,
+    /// Tool deny-list inherited from the parent runtime's `worker_profile`
+    /// (#4042). Deny always wins over allow, even when a tool is in both the
+    /// allowlist and this list. Wildcard matching mirrors the session-side
+    /// `command_denies_tool` (exact + `prefix*`, case-insensitive).
+    disallowed_tools: Vec<String>,
     auto_approve: bool,
+    /// Workflow-spawned children auto-accept Suggest-level file edits.
+    accept_edits: bool,
     /// The role/type of the sub-agent that this registry belongs to. Used to
     /// decide whether `Suggest`-level tools (write/edit/patch) may run inside
     /// the child without the parent runtime being auto-approved (#1828, #1833).
@@ -7235,7 +7836,9 @@ impl SubAgentToolRegistry {
 
         Self {
             allowed_tools: explicit_allowed_tools,
+            disallowed_tools: runtime.worker_profile.denied_tools.clone(),
             auto_approve: runtime.context.auto_approve,
+            accept_edits: runtime.accept_edits,
             agent_type,
             runtime_profile: runtime.worker_profile,
             can_spawn_child,
@@ -7283,10 +7886,33 @@ impl SubAgentToolRegistry {
         }
     }
 
+    /// Check whether a tool name is denied by the `disallowed_tools` list, using
+    /// the same matching logic as the session-side `command_denies_tool`: exact
+    /// match + `prefix*` wildcard, case-insensitive (#4042, #3027).
+    fn is_tool_denied(&self, name: &str) -> bool {
+        if self.disallowed_tools.is_empty() {
+            return false;
+        }
+        let tool_name = name.to_ascii_lowercase();
+        self.disallowed_tools.iter().any(|rule| {
+            let rule = rule.to_ascii_lowercase();
+            if let Some(prefix) = rule.strip_suffix('*') {
+                tool_name.starts_with(prefix)
+            } else {
+                tool_name == rule
+            }
+        })
+    }
+
     /// Whether a given tool name is permitted under this child's filter.
     /// `None` filter = everything permitted.
     fn is_tool_allowed(&self, name: &str) -> bool {
         if name == "agent" && !self.can_spawn_child {
+            return false;
+        }
+        // Deny always wins over allow — check the deny-list first so a tool in
+        // both the allowlist and the deny-list is still blocked (#4042).
+        if self.is_tool_denied(name) {
             return false;
         }
         match &self.allowed_tools {
@@ -7308,6 +7934,10 @@ impl SubAgentToolRegistry {
         filtered
             .into_iter()
             .filter(|tool| tool.name != "agent" || self.can_spawn_child)
+            // #4042: hide explicitly disallowed tools so the model never sees
+            // them in the function-calling schema (defense-in-depth with the
+            // `is_tool_allowed` / `execute` guards).
+            .filter(|tool| !self.is_tool_denied(&tool.name))
             // #3217: hide tools the role posture forbids so the model never
             // even sees write/edit/patch (read-only roles) or shell (no-shell
             // roles). Defense-in-depth with the `execute` guard below.
@@ -7349,16 +7979,12 @@ impl SubAgentToolRegistry {
                 ApprovalRequirement::Suggest => {
                     // Write/edit/patch tools land here. Explicit
                     // write-capable roles (`implementer`, `custom`) may run them
-                    // without parent auto-approve so that delegated work
-                    // can actually land file changes; the previous
-                    // behavior blocked every write under `suggest` mode
-                    // even for the role explicitly chartered to write
-                    // (#1828, #1833). Read-only roles still bounce so
-                    // exploration/review/planning/verifier children
-                    // can't mutate the workspace behind the parent's back.
-                    if !self.runtime_profile.permissions.write
-                        || !Self::role_can_delegate_writes(&self.agent_type)
-                    {
+                    // without parent auto-approve (#1828, #1833). Workflow-spawned
+                    // children also accept Suggest edits for any write-capable
+                    // posture (including general). Read-only roles still bounce.
+                    let may_write = self.runtime_profile.permissions.write
+                        && (self.accept_edits || Self::role_can_delegate_writes(&self.agent_type));
+                    if !may_write {
                         return Err(anyhow!(
                             "Tool {name} requires approval and is not delegated to {role} sub-agents; rerun the parent with auto approval or pick a write-capable role",
                             role = self.agent_type.as_str()
@@ -7620,7 +8246,7 @@ const SUBAGENT_OUTPUT_FORMAT: &str = include_str!("../../prompts/subagent_output
 const GENERAL_AGENT_INTRO: &str = concat!(
     "You are a trusted general-purpose sub-agent. Your job is to complete the one task you were given, end-to-end, and report back concisely.\n",
     "Stay inside the assigned scope; put adjacent work under RISKS/BLOCKERS.\n",
-    "For genuinely multi-step work, track progress with `checklist_write` (and `update_plan` for complex strategy); skip it for short, focused tasks.\n",
+    "For genuinely multi-step work, track progress with `work_update` (and `update_plan` for Strategy metadata); skip it for short, focused tasks.\n",
     "**Stop quickly on failure**: if the same tool call fails 2 times in a row, stop retrying and return what you have so far with a one-line note explaining what's missing. Do not loop on impossible queries (e.g. external API unreachable, rate-limited, or returning empty).\n",
     "For implementer or repair-style work, keep going within the assigned scope; checkpoint before broadening the task or after repeated failures instead of forcing a tiny tool-call cap.\n\n"
 );
@@ -7638,7 +8264,7 @@ const EXPLORE_AGENT_INTRO: &str = concat!(
 const PLAN_AGENT_INTRO: &str = concat!(
     "You are a trusted planning sub-agent (role: `plan`). Your job is to produce a grounded, prioritized plan, not patches.\n",
     "Read enough code to avoid guessing; each step names its artifact and verification.\n",
-    "Use update_plan/checklist_write for plan artifacts and explain key trade-offs.\n",
+    "Use work_update for concrete To-do progress and update_plan only for Strategy metadata/context/route; explain key trade-offs.\n",
     "CHANGES should list plan artifacts only, not future speculative edits.\n\n"
 );
 

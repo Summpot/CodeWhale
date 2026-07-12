@@ -71,6 +71,8 @@ pub enum ApiProvider {
     Deepinfra,
     Sakana,
     LongCat,
+    Meta,
+    Xai,
     /// User-defined OpenAI-compatible endpoint (#1519).
     ///
     /// Selected when `provider = "<name>"` names a `[providers.<name>]
@@ -205,6 +207,8 @@ impl ApiProvider {
             Self::Deepinfra => "https://deepinfra.com/dash/api_keys",
             Self::Sakana => "https://api.sakana.ai/",
             Self::LongCat => "https://longcat.chat/platform",
+            Self::Meta => "https://developer.meta.com/ai/",
+            Self::Xai => "https://console.x.ai/",
             Self::OpenaiCodex | Self::Sglang | Self::Vllm | Self::Ollama => return None,
             // Custom endpoints have no canonical credential page; the user
             // supplies the key via their own `api_key_env`.
@@ -220,7 +224,7 @@ impl ApiProvider {
 
     /// `ApiProvider` discriminant → `ProviderKind` lookup.
     /// Index 1 is `None` for the legacy `DeepseekCN` variant.
-    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 32] = [
+    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 34] = [
         Some(codewhale_config::ProviderKind::Deepseek),
         None, // DeepseekCN
         Some(codewhale_config::ProviderKind::DeepseekAnthropic),
@@ -252,11 +256,13 @@ impl ApiProvider {
         Some(codewhale_config::ProviderKind::Deepinfra),
         Some(codewhale_config::ProviderKind::Sakana),
         Some(codewhale_config::ProviderKind::LongCat),
+        Some(codewhale_config::ProviderKind::Meta),
+        Some(codewhale_config::ProviderKind::Xai),
         Some(codewhale_config::ProviderKind::Custom),
     ];
 
     /// `ProviderKind` discriminant → `ApiProvider` lookup.
-    const FROM_KIND_LOOKUP: [Self; 31] = [
+    const FROM_KIND_LOOKUP: [Self; 33] = [
         Self::Deepseek,
         Self::DeepseekAnthropic,
         Self::NvidiaNim,
@@ -287,6 +293,8 @@ impl ApiProvider {
         Self::Deepinfra,
         Self::Sakana,
         Self::LongCat,
+        Self::Meta,
+        Self::Xai,
         Self::Custom,
     ];
 
@@ -380,6 +388,11 @@ fn subagent_provider_key_matches(key: &str, provider: ApiProvider) -> bool {
             normalized.as_str(),
             "longcat" | "long_cat" | "meituan_longcat" | "meituan"
         ),
+        ApiProvider::Meta => matches!(
+            normalized.as_str(),
+            "meta" | "meta_ai" | "meta_model_api" | "muse" | "muse_spark"
+        ),
+        ApiProvider::Xai => matches!(normalized.as_str(), "xai" | "x_ai" | "grok"),
         _ => false,
     }
 }
@@ -471,7 +484,10 @@ pub fn provider_capability(provider: ApiProvider, resolved_model: &str) -> Provi
             provider,
             resolved_model: resolved_model.to_string(),
             context_window: OPENAI_CODEX_EFFECTIVE_CONTEXT_WINDOW_TOKENS,
-            max_output: crate::models::max_output_tokens_for_model(resolved_model).unwrap_or(4096),
+            // The OAuth cache does not publish an output ceiling. Keep the
+            // compatibility capability conservative instead of inheriting the
+            // public API model's output limit.
+            max_output: 4096,
             thinking_supported: true,
             cache_telemetry_supported: false,
             request_payload_mode: RequestPayloadMode::Responses,
@@ -1101,6 +1117,14 @@ pub fn wire_model_for_provider(provider: ApiProvider, model: &str) -> String {
     normalize_model_name_for_provider(provider, trimmed).unwrap_or_else(|| trimmed.to_string())
 }
 
+/// Hardcoded per-provider model id list used **only as a compatibility
+/// fallback** (#4188).
+///
+/// Preferred sources are the live Models.dev catalog and the offline bundled
+/// snapshot via [`crate::provider_lake`]. Call this directly only for
+/// CodeWhale-only / local providers Models.dev does not represent, or when
+/// probing the fallback table in tests. Picker, inventory, and subagent
+/// surfaces must go through the provider lake.
 #[must_use]
 pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'static str> {
     match provider {
@@ -1164,6 +1188,15 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         ],
         ApiProvider::Sakana => vec![DEFAULT_SAKANA_MODEL, SAKANA_FUGU_ULTRA_MODEL],
         ApiProvider::LongCat => vec![DEFAULT_LONGCAT_MODEL],
+        ApiProvider::Meta => vec![DEFAULT_META_MODEL],
+        ApiProvider::Xai => vec![
+            DEFAULT_XAI_MODEL,
+            XAI_GROK_4_3_MODEL,
+            XAI_GROK_BUILD_MODEL,
+            XAI_GROK_COMPOSER_2_5_FAST_MODEL,
+            XAI_GROK_4_20_0309_REASONING_MODEL,
+            XAI_GROK_4_20_0309_NON_REASONING_MODEL,
+        ],
         // Custom endpoints expose no built-in completion names; the user
         // supplies their own model id (#1519).
         ApiProvider::Custom => Vec::new(),
@@ -2031,6 +2064,13 @@ pub struct Config {
     #[serde(default)]
     pub fleet: Option<codewhale_config::FleetConfigToml>,
 
+    /// Workflow automatic-launch, approval, isolation, and activity
+    /// persistence knobs (#4128). When absent, consumers use
+    /// [`codewhale_config::WorkflowConfigToml::default`] via
+    /// [`Self::workflow_config`].
+    #[serde(default)]
+    pub workflow: Option<codewhale_config::WorkflowConfigToml>,
+
     /// Sub-agent model overrides.
     #[serde(default)]
     pub subagents: Option<SubagentsConfig>,
@@ -2608,6 +2648,18 @@ pub struct ProvidersConfig {
         alias = "meituan"
     )]
     pub longcat: ProviderConfig,
+    #[serde(
+        default,
+        alias = "meta-ai",
+        alias = "meta_ai",
+        alias = "meta-model-api",
+        alias = "meta_model_api",
+        alias = "muse",
+        alias = "muse-spark"
+    )]
+    pub meta: ProviderConfig,
+    #[serde(default, alias = "x-ai", alias = "x_ai", alias = "grok")]
+    pub xai: ProviderConfig,
     /// Arbitrary user-named custom providers (#1519).
     ///
     /// Captures every `[providers.<name>]` table whose key is not one of the
@@ -2658,6 +2710,8 @@ impl ProvidersConfig {
             ("providers.stepfun", &self.stepfun),
             ("providers.minimax", &self.minimax),
             ("providers.sakana", &self.sakana),
+            ("providers.meta", &self.meta),
+            ("providers.xai", &self.xai),
         ];
         for (name, config) in builtins {
             validate_provider_context_window(name, config.context_window)?;
@@ -2694,6 +2748,40 @@ struct RequirementsFile {
 // === Config Loading ===
 
 impl Config {
+    /// Whether an explicit config or requirements file owns approval posture.
+    /// TUI preferences may supply a default only when this is false.
+    #[must_use]
+    pub fn approval_policy_is_managed(&self) -> bool {
+        if self.approval_policy.is_some() {
+            return true;
+        }
+        self.approval_policy_is_requirements_managed()
+    }
+
+    /// Whether organization requirements, rather than a user-editable config
+    /// key, own approval posture. User config still outranks TUI settings, but
+    /// `/config approval_mode ... --save` may edit that user-owned key.
+    #[must_use]
+    pub fn approval_policy_is_requirements_managed(&self) -> bool {
+        let path = self
+            .requirements_path
+            .as_deref()
+            .map(expand_path)
+            .or_else(default_requirements_path);
+        let Some(path) = path else {
+            return false;
+        };
+        if !path.exists() {
+            return false;
+        }
+        // Fail closed if a present requirements file becomes unreadable or
+        // malformed between Config::load and App::new.
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| toml::from_str::<RequirementsFile>(&contents).ok())
+            .is_none_or(|requirements| !requirements.allowed_approval_policies.is_empty())
+    }
+
     #[must_use]
     pub fn search_provider_resolution(&self) -> SearchProviderResolution {
         if let Ok(raw) = std::env::var("DEEPSEEK_SEARCH_PROVIDER")
@@ -2998,6 +3086,8 @@ impl Config {
             ApiProvider::Minimax => &providers.minimax,
             ApiProvider::Sakana => &providers.sakana,
             ApiProvider::LongCat => &providers.longcat,
+            ApiProvider::Meta => &providers.meta,
+            ApiProvider::Xai => &providers.xai,
             // Handled by the name-keyed early return above (#1519).
             ApiProvider::Custom => unreachable!("custom provider resolved by name above"),
         })
@@ -3059,6 +3149,8 @@ impl Config {
             ApiProvider::Minimax => &mut providers.minimax,
             ApiProvider::Sakana => &mut providers.sakana,
             ApiProvider::LongCat => &mut providers.longcat,
+            ApiProvider::Meta => &mut providers.meta,
+            ApiProvider::Xai => &mut providers.xai,
             // Handled by the name-keyed early return above (#1519).
             ApiProvider::Custom => unreachable!("custom provider resolved by name above"),
         }
@@ -3252,6 +3344,8 @@ impl Config {
             ApiProvider::Minimax => DEFAULT_MINIMAX_MODEL,
             ApiProvider::Sakana => DEFAULT_SAKANA_MODEL,
             ApiProvider::LongCat => DEFAULT_LONGCAT_MODEL,
+            ApiProvider::Meta => DEFAULT_META_MODEL,
+            ApiProvider::Xai => DEFAULT_XAI_MODEL,
             // Custom endpoints have no built-in default model; pass through the
             // descriptor placeholder when nothing is configured (#1519).
             ApiProvider::Custom => codewhale_config::ProviderKind::Custom
@@ -3306,6 +3400,8 @@ impl Config {
             | ApiProvider::Minimax
             | ApiProvider::Sakana
             | ApiProvider::LongCat
+            | ApiProvider::Meta
+            | ApiProvider::Xai
             // Custom reads its base_url from the named `[providers.<name>]`
             // table (via provider_base), never from the legacy root field.
             | ApiProvider::Custom => None,
@@ -3367,6 +3463,8 @@ impl Config {
                         ApiProvider::Minimax => DEFAULT_MINIMAX_BASE_URL,
                         ApiProvider::Sakana => DEFAULT_SAKANA_BASE_URL,
                         ApiProvider::LongCat => DEFAULT_LONGCAT_BASE_URL,
+                        ApiProvider::Meta => DEFAULT_META_BASE_URL,
+                        ApiProvider::Xai => DEFAULT_XAI_BASE_URL,
                         // No built-in endpoint; descriptor placeholder keeps the
                         // fallback total. A real custom route configures
                         // `[providers.<name>] base_url` which wins above (#1519).
@@ -3393,14 +3491,15 @@ impl Config {
 
     /// Read the API key.
     ///
-    /// Precedence: **explicit in-memory override → provider/root config
-    /// → environment**.
+    /// Precedence: **route-specific OAuth → source-marked explicit CLI key →
+    /// provider/root config → ambient provider environment**.
     ///
     /// The in-memory `self.api_key` override is only honored when the user
     /// explicitly set the field (not the legacy `API_KEYRING_SENTINEL`
     /// placeholder, not empty whitespace).
     pub fn deepseek_api_key(&self) -> Result<String> {
         let provider = self.api_provider();
+        let explicit_cli_key = explicit_cli_api_key_override();
 
         // 0. DeepSeek compatibility slot. The legacy top-level `api_key`
         // belongs to DeepSeek only; provider-specific keys below must win for
@@ -3414,7 +3513,10 @@ impl Config {
         //   codewhale --provider deepseek --api-key ark-... --base-url ... --model auto
         if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
             && std::env::var("DEEPSEEK_API_KEY_SOURCE").as_deref() == Ok("cli")
-            && let Some(env_key) = provider_env_api_key(provider)
+            && let Some(env_key) = explicit_cli_key
+                .as_ref()
+                .cloned()
+                .or_else(|| provider_env_api_key(provider))
             && !env_key.trim().is_empty()
         {
             return Ok(env_key);
@@ -3435,6 +3537,17 @@ impl Config {
             return kimi_cli_oauth_access_token();
         }
 
+        // xAI / Grok OAuth reuses ~/.grok/auth.json (Grok CLI) or a device-code
+        // login written in the same shape. Activated by
+        // [providers.xai] auth_mode = "oauth" (#4257 residual).
+        if provider == ApiProvider::Xai
+            && self
+                .provider_config_for(provider)
+                .is_some_and(provider_config_uses_xai_oauth)
+        {
+            return crate::xai_oauth::get_access_token();
+        }
+
         // OpenAI Codex (ChatGPT) reuses the existing Codex CLI OAuth login.
         // The access token lives in ~/.codex/auth.json (refreshed on demand)
         // rather than a stored API key, so resolve it before the config-file
@@ -3442,6 +3555,14 @@ impl Config {
         // `get_credentials`.
         if provider == ApiProvider::OpenaiCodex {
             return Ok(crate::oauth::get_credentials()?.access_token);
+        }
+
+        // The dispatcher cannot know the effective provider until the TUI
+        // applies `--profile`. A provider-neutral, source-marked CLI override
+        // therefore wins over saved API-key slots here, after OAuth routes
+        // have made their own credential decision.
+        if let Some(value) = explicit_cli_key {
+            return Ok(value);
         }
 
         // 1. Config file (provider-scoped slot). This intentionally wins
@@ -3530,6 +3651,24 @@ impl Config {
                 anyhow::bail!("{}", missing_provider_api_key_message(provider)?)
             }
             ApiProvider::OpenaiCodex => anyhow::bail!("{}", crate::oauth::missing_auth_message()),
+            ApiProvider::Xai => {
+                // Prefer OAuth guidance when auth_mode requests it or Grok CLI
+                // tokens already exist; otherwise show both API-key and OAuth.
+                if self
+                    .provider_config_for(provider)
+                    .is_some_and(provider_config_uses_xai_oauth)
+                    || crate::xai_oauth::credentials_present()
+                {
+                    anyhow::bail!("{}", crate::xai_oauth::missing_auth_message());
+                }
+                anyhow::bail!(
+                    "xAI API key not found. Get a key: https://console.x.ai/\n\
+                     Run 'codewhale auth set --provider xai', set XAI_API_KEY, or add \
+                     [providers.xai] api_key.\n\
+                     OAuth alternative: run `grok login` (or device-code login) and set \
+                     [providers.xai] auth_mode = \"oauth\"."
+                );
+            }
             // Self-hosted deployments commonly run without auth on localhost.
             // Return an empty key and let the client omit the Authorization header.
             ApiProvider::Sglang | ApiProvider::Vllm | ApiProvider::Ollama => Ok(String::new()),
@@ -4003,6 +4142,15 @@ impl Config {
     #[must_use]
     pub fn fleet_config(&self) -> codewhale_config::FleetConfigToml {
         self.fleet.clone().unwrap_or_default()
+    }
+
+    /// Parsed `[workflow]` table, or product defaults when the table is absent
+    /// (#4128 / Section 2.11). Automatic launch, approval, isolation, and
+    /// activity-persistence consumers should read through this accessor so
+    /// omitted keys share one model.
+    #[must_use]
+    pub fn workflow_config(&self) -> codewhale_config::WorkflowConfigToml {
+        self.workflow.clone().unwrap_or_default()
     }
 
     /// Return the configured DeepSeek reasoning-effort tier, if any.
@@ -4505,6 +4653,20 @@ fn apply_env_overrides(config: &mut Config) {
                     .longcat
                     .base_url = Some(value);
             }
+            ApiProvider::Meta => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .meta
+                    .base_url = Some(value);
+            }
+            ApiProvider::Xai => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .xai
+                    .base_url = Some(value);
+            }
             // Custom resolves to the named `[providers.<name>]` table; route the
             // override through the name-keyed mutable accessor (#1519).
             ApiProvider::Custom => {
@@ -4682,6 +4844,27 @@ fn apply_env_overrides(config: &mut Config) {
             .vllm
             .base_url = Some(value);
     }
+    if matches!(config.api_provider(), ApiProvider::Meta)
+        && let Ok(value) = std::env::var("META_MODEL_API_BASE_URL")
+            .or_else(|_| std::env::var("MODEL_API_BASE_URL"))
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .meta
+            .base_url = Some(value);
+    }
+    if matches!(config.api_provider(), ApiProvider::Xai)
+        && let Ok(value) = std::env::var("XAI_BASE_URL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .xai
+            .base_url = Some(value);
+    }
     if let Ok(value) = std::env::var("DEEPSEEK_HTTP_HEADERS")
         && let Ok(headers) = parse_http_headers(&value)
         && !headers.is_empty()
@@ -4734,6 +4917,8 @@ fn apply_env_overrides(config: &mut Config) {
             ApiProvider::Minimax => &mut providers.minimax,
             ApiProvider::Sakana => &mut providers.sakana,
             ApiProvider::LongCat => &mut providers.longcat,
+            ApiProvider::Meta => &mut providers.meta,
+            ApiProvider::Xai => &mut providers.xai,
             ApiProvider::Custom => providers
                 .custom
                 .entry(custom_key.expect("custom key captured for custom provider"))
@@ -4886,6 +5071,27 @@ fn apply_env_overrides(config: &mut Config) {
             .huggingface
             .model = Some(value);
     }
+    if matches!(config.api_provider(), ApiProvider::Meta)
+        && let Ok(value) =
+            std::env::var("META_MODEL_API_MODEL").or_else(|_| std::env::var("MODEL_API_MODEL"))
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .meta
+            .model = Some(value);
+    }
+    if matches!(config.api_provider(), ApiProvider::Xai)
+        && let Ok(value) = std::env::var("XAI_MODEL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .xai
+            .model = Some(value);
+    }
     if let Some(value) = codewhale_env_var("CODEWHALE_MODEL", "DEEPSEEK_MODEL")
         .ok()
         .or_else(|| {
@@ -4957,6 +5163,8 @@ fn apply_env_overrides(config: &mut Config) {
                 ApiProvider::Minimax => &mut providers.minimax,
                 ApiProvider::Sakana => &mut providers.sakana,
                 ApiProvider::LongCat => &mut providers.longcat,
+                ApiProvider::Meta => &mut providers.meta,
+                ApiProvider::Xai => &mut providers.xai,
             };
             entry.model = Some(value);
         }
@@ -5158,6 +5366,8 @@ pub(crate) fn provider_passes_model_through(provider: ApiProvider) -> bool {
             | ApiProvider::Openmodel
             | ApiProvider::Ollama
             | ApiProvider::Huggingface
+            | ApiProvider::Meta
+            | ApiProvider::Xai
             // Custom OpenAI-compatible endpoints preserve user-supplied model
             // ids verbatim (#1519); never normalize/rewrite them.
             | ApiProvider::Custom
@@ -5352,6 +5562,13 @@ fn auth_mode_uses_kimi_oauth(mode: &str) -> bool {
         normalize_auth_mode(mode).as_str(),
         "kimi" | "kimi_oauth" | "kimi_cli" | "oauth"
     )
+}
+
+fn provider_config_uses_xai_oauth(config: &ProviderConfig) -> bool {
+    config
+        .auth_mode
+        .as_deref()
+        .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth)
 }
 
 fn normalize_auth_mode(mode: &str) -> String {
@@ -5588,6 +5805,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
             seam_model: override_cfg.context.seam_model.or(base.context.seam_model),
         },
         fleet: override_cfg.fleet.or(base.fleet),
+        workflow: override_cfg.workflow.or(base.workflow),
         subagents: override_cfg.subagents.or(base.subagents),
         strict_tool_mode: override_cfg.strict_tool_mode.or(base.strict_tool_mode),
         runtime_api: override_cfg.runtime_api.or(base.runtime_api),
@@ -5728,6 +5946,8 @@ fn merge_providers(
             minimax: merge_provider_config(base.minimax, override_cfg.minimax),
             sakana: merge_provider_config(base.sakana, override_cfg.sakana),
             longcat: merge_provider_config(base.longcat, override_cfg.longcat),
+            meta: merge_provider_config(base.meta, override_cfg.meta),
+            xai: merge_provider_config(base.xai, override_cfg.xai),
             custom: merge_custom_providers(base.custom, override_cfg.custom),
         }),
     }
@@ -6118,6 +6338,18 @@ pub fn has_api_key(config: &Config) -> bool {
     has_api_key_for(config, config.api_provider())
 }
 
+fn provider_uses_oauth_credentials(config: &Config, provider: ApiProvider) -> bool {
+    provider == ApiProvider::OpenaiCodex
+        || (provider == ApiProvider::Moonshot
+            && config
+                .provider_config_for(provider)
+                .is_some_and(provider_config_uses_kimi_oauth))
+        || (provider == ApiProvider::Xai
+            && config
+                .provider_config_for(provider)
+                .is_some_and(provider_config_uses_xai_oauth))
+}
+
 #[must_use]
 pub fn active_provider_has_config_api_key(config: &Config) -> bool {
     let provider = config.api_provider();
@@ -6133,7 +6365,7 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
         // The persistent Codex login is the OAuth credential file, analogous to
         // a stored config key. Token env overrides are scored separately by
         // active_provider_has_env_api_key.
-        return crate::oauth::auth_file_path().exists();
+        return crate::oauth::stored_credentials_present();
     }
     if matches!(provider, ApiProvider::Huggingface)
         && std::env::var("HUGGINGFACE_API_KEY")
@@ -6166,7 +6398,10 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
 
 #[must_use]
 pub fn active_provider_has_env_api_key(config: &Config) -> bool {
-    provider_env_api_key(config.api_provider()).is_some()
+    let provider = config.api_provider();
+    (!provider_uses_oauth_credentials(config, provider)
+        && explicit_cli_api_key_override().is_some())
+        || provider_env_api_key(provider).is_some()
 }
 
 #[must_use]
@@ -6179,6 +6414,12 @@ pub fn active_provider_uses_env_only_api_key(config: &Config) -> bool {
 /// prompt for a key inline.
 #[must_use]
 pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
+    if provider == config.api_provider()
+        && !provider_uses_oauth_credentials(config, provider)
+        && explicit_cli_api_key_override().is_some()
+    {
+        return true;
+    }
     if provider
         .env_vars()
         .iter()
@@ -6197,7 +6438,13 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
     if provider == ApiProvider::OpenaiCodex {
         // Token env overrides are checked above; also honor the Codex CLI OAuth
         // login on disk.
-        return crate::oauth::auth_file_path().exists();
+        return crate::oauth::credentials_present();
+    }
+    if provider == ApiProvider::Xai && crate::xai_oauth::credentials_present() {
+        // xAI supports both API keys and OAuth. A Grok-compatible token file is
+        // sufficient, but its absence must fall through to the ordinary API-key
+        // checks below instead of masking a configured key.
+        return true;
     }
 
     // Self-hosted providers typically run without authentication.
@@ -6297,18 +6544,29 @@ pub(crate) fn provider_is_configured_for_active(
 /// isn't enough, since untouched providers still resolve to a
 /// `ProviderConfig::default()` there.
 fn provider_config_is_explicit(entry: &ProviderConfig) -> bool {
-    entry.api_key.is_some()
-        || entry.base_url.is_some()
-        || entry.model.is_some()
-        || entry.auth_mode.is_some()
-        || entry.auth.is_some()
+    let non_empty = |value: Option<&String>| value.is_some_and(|value| !value.trim().is_empty());
+
+    non_empty(entry.api_key.as_ref())
+        || non_empty(entry.base_url.as_ref())
+        || non_empty(entry.model.as_ref())
+        || non_empty(entry.auth_mode.as_ref())
+        || entry
+            .auth
+            .as_ref()
+            .is_some_and(|auth| auth.validate().is_ok())
         || entry.context_window.is_some()
-        || entry.mode.is_some()
+        || non_empty(entry.mode.as_ref())
         || entry.max_concurrency.is_some()
-        || entry.http_headers.is_some()
-        || entry.path_suffix.is_some()
-        || entry.reasoning_stream_style.is_some()
+        || entry.http_headers.as_ref().is_some_and(|headers| {
+            headers
+                .iter()
+                .any(|(name, value)| !name.trim().is_empty() && !value.trim().is_empty())
+        })
+        || non_empty(entry.path_suffix.as_ref())
+        || non_empty(entry.reasoning_stream_style.as_ref())
         || entry.insecure_skip_tls_verify.is_some()
+        || non_empty(entry.kind.as_ref())
+        || non_empty(entry.api_key_env.as_ref())
 }
 
 /// Save an API key to the appropriate place for the given provider.
@@ -6355,41 +6613,57 @@ pub fn save_api_key_for(provider: ApiProvider, api_key: &str) -> Result<PathBuf>
     Ok(config_path)
 }
 
-pub fn save_provider_auth_mode_for(provider: ApiProvider, auth_mode: &str) -> Result<PathBuf> {
+/// Persist a default model for `provider` via the comment-preserving config
+/// path used by guided provider setup (#3875). DeepSeek writes root
+/// `default_text_model`; other hosted providers write `[providers.<name>] model`.
+pub fn save_provider_model_for(provider: ApiProvider, model: &str) -> Result<PathBuf> {
+    let model = model.trim();
+    anyhow::ensure!(!model.is_empty(), "model cannot be empty");
+
     let config_path = default_config_path()
         .context("Failed to resolve config path: home directory not found.")?;
     ensure_parent_dir(&config_path)?;
 
-    let mut doc: toml::Value = if config_path.exists() {
-        let raw = fs::read_to_string(&config_path)?;
-        toml::from_str(&raw)
-            .with_context(|| format!("Failed to parse config at {}", config_path.display()))?
-    } else {
-        toml::Value::Table(toml::value::Table::new())
-    };
-
-    let table = doc
-        .as_table_mut()
-        .context("Config root must be a TOML table.")?;
-    let providers = table
-        .entry("providers".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
-        .as_table_mut()
-        .context("`providers` must be a table.")?;
-    let key_inside = provider_config_key(provider).context("provider auth mode key")?;
-    let entry = providers
-        .entry(key_inside.to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
-        .as_table_mut()
-        .with_context(|| format!("`providers.{key_inside}` must be a table."))?;
-    entry.insert(
-        "auth_mode".to_string(),
-        toml::Value::String(auth_mode.to_string()),
-    );
-
-    let serialized = toml::to_string_pretty(&doc).context("failed to serialize updated config")?;
-    write_config_file_secure(&config_path, &serialized)
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        crate::config_persistence::mutate_config_document(&config_path, |doc| {
+            crate::config_persistence::set_document_value(doc, &["default_text_model"], model)
+        })
         .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+        return Ok(config_path);
+    }
+
+    let key_inside = provider_config_key(provider).context("provider model table")?;
+    crate::config_persistence::mutate_config_document(&config_path, |doc| {
+        crate::config_persistence::set_document_value(
+            doc,
+            &["providers", key_inside, "model"],
+            model,
+        )
+    })
+    .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+    Ok(config_path)
+}
+
+pub fn save_provider_auth_mode_for_at(
+    provider: ApiProvider,
+    auth_mode: &str,
+    config_path: Option<&Path>,
+) -> Result<PathBuf> {
+    let config_path = match config_path {
+        Some(path) => path.to_path_buf(),
+        None => default_config_path()
+            .context("Failed to resolve config path: home directory not found.")?,
+    };
+    ensure_parent_dir(&config_path)?;
+    let key_inside = provider_config_key(provider).context("provider auth mode key")?;
+    crate::config_persistence::mutate_config_document(&config_path, |doc| {
+        crate::config_persistence::set_document_value(
+            doc,
+            &["providers", key_inside, "auth_mode"],
+            auth_mode,
+        )
+    })
+    .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
     log_sensitive_event(
         "credential.auth_mode.set",
         json!({
@@ -6433,6 +6707,16 @@ fn provider_env_api_key(provider: ApiProvider) -> Option<String> {
             .ok()
             .filter(|value| !value.trim().is_empty())
     })
+}
+
+fn explicit_cli_api_key_override() -> Option<String> {
+    (std::env::var("DEEPSEEK_API_KEY_SOURCE").as_deref() == Ok("cli"))
+        .then(|| {
+            std::env::var("CODEWHALE_CLI_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .flatten()
 }
 
 fn missing_provider_api_key_message(provider: ApiProvider) -> Result<String> {

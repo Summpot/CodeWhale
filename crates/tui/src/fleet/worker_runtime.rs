@@ -64,7 +64,8 @@ pub fn fleet_task_to_worker_spec_with_profiles(
     let objective = fleet_task_prompt_with_profile(task_spec, agent_profile);
     let max_spawn_depth = codewhale_config::FleetExecConfig::default().max_spawn_depth;
     let loadout = effective_fleet_loadout(worker_profile, agent_profile);
-    let effective_model = effective_fleet_model(model, worker_profile, agent_profile);
+    let (effective_model, model_source) =
+        effective_fleet_model_with_source(model, worker_profile, agent_profile);
     let mut requested_runtime = fleet_worker_runtime_profile_for_loadout(
         &agent_type,
         &tool_profile,
@@ -72,7 +73,10 @@ pub fn fleet_task_to_worker_spec_with_profiles(
         0,
         max_spawn_depth,
         &loadout,
+        model_source,
     );
+    requested_runtime.provider = explicit_fleet_provider_id(agent_profile);
+    requested_runtime.reasoning_effort = effective_fleet_reasoning_effort(agent_profile);
     if let Some(agent_profile) = agent_profile
         && let Some(profile_depth) = agent_profile.profile.delegation.max_spawn_depth
     {
@@ -154,8 +158,13 @@ pub(crate) fn resolve_fleet_route(
     // Resolve within the profile's own explicit provider scope when it has
     // one (#4093); otherwise fall back to the existing default scope (mirrors
     // `ProviderKind::default()`). The resolver is fully offline/hermetic and
-    // never reads secrets, env, or config.
-    let provider = effective_fleet_provider(agent_profile);
+    // never reads secrets, env, or config. User-named custom providers need the
+    // session Config to resolve their table, so this receipt path omits the
+    // route instead of fabricating DeepSeek details for them (#3965).
+    let provider = match explicit_fleet_provider_id(agent_profile).as_deref() {
+        Some(provider_id) => ApiProvider::parse(provider_id)?,
+        None => ApiProvider::Deepseek,
+    };
     let candidate = resolve_route_candidate(provider, model_selector, None, None, None).ok()?;
 
     Some(FleetResolvedRoute {
@@ -177,9 +186,7 @@ pub(crate) fn resolve_fleet_route(
             ))
             .to_string(),
         ),
-        // The offline resolver path does not know the concrete sub-agent
-        // thinking tier. Leave it absent rather than fabricating one.
-        reasoning_effort: None,
+        reasoning_effort: effective_fleet_reasoning_effort(agent_profile),
         role_source: role_source.map(str::to_string),
         loadout_source: loadout_source.map(str::to_string),
         model_class_source: model_class_source.map(str::to_string),
@@ -424,34 +431,68 @@ fn effective_fleet_model_with_source(
     (run_model.to_string(), "run.model")
 }
 
-/// The provider this task's resolved route should use (#4093).
+/// The provider id a resolved agent profile EXPLICITLY pins, if any (#4093).
 ///
-/// Only an explicit `provider` field on the resolved agent profile ever
-/// selects a provider here — EPIC #2608 forbids inferring one by sniffing a
-/// substring/prefix out of `model`. Absent an explicit pin (no profile, or a
-/// profile that never named a provider), the worker profile carries no
-/// provider authority and resolution falls back to the existing default
-/// scope, unchanged from prior behavior.
-fn effective_fleet_provider(agent_profile: Option<&AgentProfile>) -> ApiProvider {
-    explicit_fleet_provider(agent_profile).unwrap_or(ApiProvider::Deepseek)
+/// This preserves user-named OpenAI-compatible custom providers such as
+/// `lm-studio` instead of collapsing them through [`ApiProvider`]. Runtime
+/// launch paths can set `Config.provider` to this exact id so the normal config
+/// resolver finds `[providers.<id>]` (#3965).
+///
+/// Returns `None` when no profile names a provider — never invents a DeepSeek
+/// default — so launch paths can omit `--provider` and leave profile-less
+/// workers on their own session default. EPIC #2608: never inferred from
+/// `model`.
+pub(crate) fn explicit_fleet_provider_id(agent_profile: Option<&AgentProfile>) -> Option<String> {
+    agent_profile
+        .and_then(|profile| profile.profile.provider.as_deref())
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .map(str::to_string)
 }
 
-/// The provider a resolved agent profile EXPLICITLY pins, if any (#4093).
+/// The built-in provider a resolved agent profile EXPLICITLY pins, if any (#4093).
 ///
-/// Unlike [`effective_fleet_provider`], this returns `None` (never the DeepSeek
-/// default) when no profile names a provider, so the launch path can leave
-/// `--provider` off the worker argv and preserve today's behavior for
-/// profile-less / provider-less workers (they resolve their provider from
-/// their own session default). EPIC #2608: never inferred from `model`.
+/// This returns `None` (never the DeepSeek default) when no profile names a
+/// provider, so call sites can leave `--provider` off the worker argv and
+/// preserve today's behavior for profile-less / provider-less workers (they
+/// resolve their provider from their own session default). EPIC #2608: never
+/// inferred from `model`.
 ///
 /// `pub(crate)` so the interactive-TUI in-process spawn path
 /// (`tools::subagent`) resolves the pinned provider from the SAME
 /// explicit-only source as the headless `codewhale exec` launch route (#4193),
-/// instead of re-deriving it and risking a second, divergent policy.
+/// instead of re-deriving it and risking a second, divergent policy. User-named
+/// custom providers intentionally return `None` here; launch paths that can
+/// carry strings should use [`explicit_fleet_provider_id`].
 pub(crate) fn explicit_fleet_provider(agent_profile: Option<&AgentProfile>) -> Option<ApiProvider> {
-    agent_profile
-        .and_then(|profile| profile.profile.provider.as_deref())
+    explicit_fleet_provider_id(agent_profile)
+        .as_deref()
         .and_then(ApiProvider::parse)
+}
+
+pub(crate) fn effective_fleet_reasoning_effort(
+    agent_profile: Option<&AgentProfile>,
+) -> Option<String> {
+    agent_profile
+        .and_then(|profile| profile.profile.reasoning_effort.as_deref())
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .map(str::to_string)
+}
+
+/// The explicit reasoning/thinking tier a fleet worker should launch with.
+///
+/// This is the launch-side twin of the receipt/runtime-profile field: it reads
+/// only the resolved AgentProfile tier, so task model overrides can change the
+/// model without accidentally inventing a thinking tier.
+pub(crate) fn fleet_worker_launch_reasoning_effort(
+    task_spec: &FleetTaskSpec,
+    agent_profiles: &[AgentProfile],
+) -> Option<String> {
+    let agent_profile = resolve_task_agent_profile(task_spec, agent_profiles)
+        .ok()
+        .flatten();
+    effective_fleet_reasoning_effort(agent_profile)
 }
 
 /// The route (model selector + optional explicit provider id) that a fleet
@@ -460,18 +501,18 @@ pub(crate) fn explicit_fleet_provider(agent_profile: Option<&AgentProfile>) -> O
 /// This is the launch-side twin of [`resolve_fleet_route`] (the receipt): both
 /// read the worker's model from the same task/profile/run precedence
 /// ([`effective_fleet_model`]) and the provider from the same explicit-only
-/// source ([`explicit_fleet_provider`]), so a worker whose profile is pinned to
-/// provider B launches on provider B even when the parent session is on
+/// source ([`explicit_fleet_provider_id`]), so a worker whose profile is pinned
+/// to provider B launches on provider B even when the parent session is on
 /// provider A.
 ///
 /// - `model`: never empty in practice — falls back to `run_model` when neither
 ///   the task nor the profile pins a model, matching pre-#4093 dispatch.
-/// - `provider`: `Some(canonical_id)` ONLY when the resolved agent profile
+/// - `provider`: `Some(provider_id)` ONLY when the resolved agent profile
 ///   explicitly pins a provider. `None` means "no provider authority" — the
 ///   caller omits `--provider` and the worker keeps its own session default,
-///   preserving today's behavior for profile-less workers. The id is
-///   [`ApiProvider::as_str`], which round-trips through `ApiProvider::parse` on
-///   the worker's `--provider` flag.
+///   preserving today's behavior for profile-less workers. Built-ins use their
+///   canonical ids; user-named custom providers preserve the profile's id so
+///   `codewhale exec --provider <id>` can resolve `[providers.<id>]`.
 pub(crate) fn fleet_worker_launch_route(
     task_spec: &FleetTaskSpec,
     agent_profiles: &[AgentProfile],
@@ -482,8 +523,7 @@ pub(crate) fn fleet_worker_launch_route(
         .flatten();
     let worker_profile = task_spec.worker.as_ref();
     let model = effective_fleet_model(run_model, worker_profile, agent_profile);
-    let provider =
-        explicit_fleet_provider(agent_profile).map(|provider| provider.as_str().to_string());
+    let provider = explicit_fleet_provider_id(agent_profile);
     (model, provider)
 }
 
@@ -595,6 +635,7 @@ fn fleet_worker_runtime_profile_for_loadout(
     spawn_depth: u32,
     max_spawn_depth: u32,
     loadout: &codewhale_config::FleetLoadout,
+    model_source: &'static str,
 ) -> WorkerRuntimeProfile {
     let mut profile = fleet_worker_runtime_profile(
         agent_type,
@@ -603,7 +644,11 @@ fn fleet_worker_runtime_profile_for_loadout(
         spawn_depth,
         max_spawn_depth,
     );
-    profile.model = fleet_model_route_for_loadout(model, loadout);
+    profile.model = if matches!(model_source, "task.model" | "agent_profile.model") {
+        fleet_model_route_for_loadout(model, &codewhale_config::FleetLoadout::Inherit)
+    } else {
+        fleet_model_route_for_loadout("auto", loadout)
+    };
     profile
 }
 
@@ -652,6 +697,16 @@ pub fn apply_exec_hardening(
             AgentWorkerToolProfile::Inherited => ToolScope::Inherit,
             AgentWorkerToolProfile::Explicit(tools) => ToolScope::Explicit(tools.clone()),
         };
+    }
+    // #4042: thread `FleetExecConfig.disallowed_tools` into the runtime profile's
+    // deny-list so it is enforced at run time even for `Inherited` tool profiles,
+    // which `filter_tool_profile` cannot narrow at spec time. Union with any
+    // already-inherited entries (deny never relaxes). The subprocess Fleet exec
+    // path separately passes `--disallowed-tools` on the CLI.
+    for rule in &exec.disallowed_tools {
+        if !spec.runtime_profile.denied_tools.contains(rule) {
+            spec.runtime_profile.denied_tools.push(rule.clone());
+        }
     }
 
     // Append system prompt
@@ -823,6 +878,7 @@ mod tests {
                 loadout,
                 model: None,
                 provider: None,
+                reasoning_effort: None,
                 permissions: codewhale_config::FleetProfilePermissions::default(),
                 delegation: codewhale_config::FleetDelegationHints::default(),
             },
@@ -1281,6 +1337,7 @@ mod tests {
         );
         profile.profile.model = Some("deepseek-v4-flash".to_string());
         profile.profile.provider = Some("openrouter".to_string());
+        profile.profile.reasoning_effort = Some("max".to_string());
         let task = fleet_task(
             "route-cross-provider",
             Some(worker_profile(
@@ -1322,6 +1379,7 @@ mod tests {
             route.provider_kind,
             openrouter_candidate.provider_kind.as_str()
         );
+        assert_eq!(route.reasoning_effort.as_deref(), Some("max"));
         // Differs from DeepSeek — the pre-#4093 hardcoded default AND the
         // parent/session's provider.
         assert_ne!(route.provider_id, "deepseek");
@@ -1342,6 +1400,7 @@ mod tests {
             model_class_hint: None,
             model: Some("deepseek-v4-flash".to_string()),
             provider: Some("openrouter".to_string()),
+            reasoning_effort: Some("max".to_string()),
             instructions: None,
         };
 
@@ -1351,6 +1410,7 @@ mod tests {
             .expect("rendered profile TOML loads");
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].profile.provider.as_deref(), Some("openrouter"));
+        assert_eq!(profiles[0].profile.reasoning_effort.as_deref(), Some("max"));
         assert_eq!(
             profiles[0].profile.model.as_deref(),
             Some("deepseek-v4-flash")
@@ -1386,7 +1446,38 @@ mod tests {
             openrouter_candidate.wire_model_id.as_str()
         );
         assert_eq!(route.provider_id, openrouter_candidate.provider_id.as_str());
+        assert_eq!(route.reasoning_effort.as_deref(), Some("max"));
         assert_ne!(route.provider_id, "deepseek");
+    }
+
+    #[test]
+    fn resolve_fleet_route_omits_custom_provider_without_config_snapshot() {
+        let mut profile = agent_profile(
+            "local",
+            "scout",
+            None,
+            codewhale_config::FleetLoadout::Inherit,
+        );
+        profile.profile.model = Some("qwen-2.5-7b".to_string());
+        profile.profile.provider = Some("lm-studio".to_string());
+        let task = fleet_task(
+            "custom-receipt",
+            Some(worker_profile(
+                Some("local"),
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            )),
+        );
+
+        let route = resolve_fleet_route(&task, &[profile], Some("deepseek-v4-pro"));
+
+        assert!(
+            route.is_none(),
+            "custom providers need the session Config snapshot; do not fabricate a DeepSeek receipt"
+        );
     }
 
     #[test]
@@ -1405,6 +1496,7 @@ mod tests {
         );
         pinned.profile.model = Some("glm-5.2".to_string());
         pinned.profile.provider = Some("openrouter".to_string());
+        pinned.profile.reasoning_effort = Some("high".to_string());
         let pinned_task = fleet_task(
             "launch-pinned",
             Some(worker_profile(
@@ -1416,10 +1508,43 @@ mod tests {
                 vec![],
             )),
         );
+        let pinned_profiles = vec![pinned];
         let (model, provider) =
-            fleet_worker_launch_route(&pinned_task, &[pinned], "deepseek-v4-pro");
+            fleet_worker_launch_route(&pinned_task, &pinned_profiles, "deepseek-v4-pro");
         assert_eq!(model, "glm-5.2");
         assert_eq!(provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            fleet_worker_launch_reasoning_effort(&pinned_task, &pinned_profiles).as_deref(),
+            Some("high")
+        );
+
+        // 1b) User-named OpenAI-compatible providers are launchable too: keep
+        //     the exact provider id so `codewhale exec --provider lm-studio`
+        //     can resolve `[providers.lm-studio]` from config (#3965).
+        let mut custom = agent_profile(
+            "local",
+            "scout",
+            None,
+            codewhale_config::FleetLoadout::Inherit,
+        );
+        custom.profile.model = Some("qwen-2.5-7b".to_string());
+        custom.profile.provider = Some("lm-studio".to_string());
+        let custom_task = fleet_task(
+            "launch-custom",
+            Some(worker_profile(
+                Some("local"),
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            )),
+        );
+        let custom_profiles = vec![custom];
+        let (model, provider) =
+            fleet_worker_launch_route(&custom_task, &custom_profiles, "deepseek-v4-pro");
+        assert_eq!(model, "qwen-2.5-7b");
+        assert_eq!(provider.as_deref(), Some("lm-studio"));
 
         // 2) A DeepSeek-shaped model with NO explicit provider must NOT infer a
         //    provider — provider stays None so the worker keeps its own session
@@ -1442,10 +1567,15 @@ mod tests {
                 vec![],
             )),
         );
+        let model_only_profiles = vec![model_only];
         let (model, provider) =
-            fleet_worker_launch_route(&model_only_task, &[model_only], "deepseek-v4-pro");
+            fleet_worker_launch_route(&model_only_task, &model_only_profiles, "deepseek-v4-pro");
         assert_eq!(model, "deepseek-v4-flash");
         assert_eq!(provider, None);
+        assert_eq!(
+            fleet_worker_launch_reasoning_effort(&model_only_task, &model_only_profiles),
+            None
+        );
 
         // 3) No profile at all: run-level model, no provider (unchanged).
         let bare = fleet_task("launch-bare", None);
@@ -1551,6 +1681,177 @@ mod tests {
             task_model_spec.runtime_profile.model,
             ModelRoute::Fixed("deepseek-v4-pro".to_string())
         );
+    }
+
+    #[test]
+    fn fleet_worker_spec_carries_agent_profile_provider_through_runtime_contract() {
+        let mut profile = agent_profile(
+            "scout-openrouter",
+            "scout",
+            Some("Use the OpenRouter scout route."),
+            codewhale_config::FleetLoadout::Fast,
+        );
+        profile.profile.model = Some("deepseek-v4-flash".to_string());
+        profile.profile.provider = Some("openrouter".to_string());
+        profile.profile.reasoning_effort = Some("max".to_string());
+        let task = fleet_task(
+            "scout",
+            Some(worker_profile(
+                Some("scout-openrouter"),
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            )),
+        );
+        let worker = FleetWorkerSpec {
+            id: "worker-1".to_string(),
+            name: "Worker".to_string(),
+            host: FleetHostSpec::Local,
+            trust_level: None,
+            labels: Default::default(),
+            capabilities: vec![],
+            max_concurrent_tasks: None,
+        };
+        let mut parent = WorkerRuntimeProfile::for_role(SubAgentType::General);
+        parent.provider = Some("deepseek".to_string());
+        parent.reasoning_effort = Some("low".to_string());
+        parent.max_spawn_depth = 3;
+
+        let spec = fleet_task_to_worker_spec_with_profiles(
+            "worker-1",
+            "run-1",
+            &task,
+            &worker,
+            "deepseek-v4-pro",
+            std::path::Path::new("/tmp"),
+            &[profile],
+            Some(&parent),
+        )
+        .unwrap();
+
+        assert_eq!(spec.model, "deepseek-v4-flash");
+        assert_eq!(
+            spec.runtime_profile.model,
+            ModelRoute::Fixed("deepseek-v4-flash".to_string())
+        );
+        assert_eq!(spec.runtime_profile.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            spec.runtime_profile.reasoning_effort.as_deref(),
+            Some("max")
+        );
+        assert_eq!(spec.runtime_profile.max_spawn_depth, 2);
+    }
+
+    #[test]
+    fn fleet_worker_spec_model_route_precedence_is_task_profile_role_then_session() {
+        let worker = FleetWorkerSpec {
+            id: "worker-1".to_string(),
+            name: "Worker".to_string(),
+            host: FleetHostSpec::Local,
+            trust_level: None,
+            labels: Default::default(),
+            capabilities: vec![],
+            max_concurrent_tasks: None,
+        };
+        let run_model = "deepseek-v4-pro";
+
+        let mut profile =
+            agent_profile("scout", "scout", None, codewhale_config::FleetLoadout::Fast);
+        profile.profile.model = Some("deepseek-v4-flash".to_string());
+
+        let task_model = fleet_task_to_worker_spec_with_profiles(
+            "worker-task",
+            "run-1",
+            &fleet_task(
+                "task-model",
+                Some(worker_profile(
+                    Some("scout"),
+                    None,
+                    None,
+                    None,
+                    Some("deepseek-v4.1"),
+                    vec![],
+                )),
+            ),
+            &worker,
+            run_model,
+            std::path::Path::new("/tmp"),
+            &[profile.clone()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(task_model.model, "deepseek-v4.1");
+        assert_eq!(
+            task_model.runtime_profile.model,
+            ModelRoute::Fixed("deepseek-v4.1".to_string())
+        );
+
+        let profile_model = fleet_task_to_worker_spec_with_profiles(
+            "worker-profile",
+            "run-1",
+            &fleet_task(
+                "profile-model",
+                Some(worker_profile(
+                    Some("scout"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec![],
+                )),
+            ),
+            &worker,
+            run_model,
+            std::path::Path::new("/tmp"),
+            &[profile],
+            None,
+        )
+        .unwrap();
+        assert_eq!(profile_model.model, "deepseek-v4-flash");
+        assert_eq!(
+            profile_model.runtime_profile.model,
+            ModelRoute::Fixed("deepseek-v4-flash".to_string())
+        );
+
+        let role_default = fleet_task_to_worker_spec_with_profiles(
+            "worker-role",
+            "run-1",
+            &fleet_task(
+                "role-default",
+                Some(worker_profile(
+                    None,
+                    Some("scout"),
+                    Some("fast"),
+                    None,
+                    None,
+                    vec![],
+                )),
+            ),
+            &worker,
+            run_model,
+            std::path::Path::new("/tmp"),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(role_default.model, run_model);
+        assert_eq!(role_default.runtime_profile.model, ModelRoute::Faster);
+
+        let inherited = fleet_task_to_worker_spec_with_profiles(
+            "worker-inherit",
+            "run-1",
+            &fleet_task("inherit", None),
+            &worker,
+            run_model,
+            std::path::Path::new("/tmp"),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(inherited.model, run_model);
+        assert_eq!(inherited.runtime_profile.model, ModelRoute::Inherit);
     }
 
     #[test]
@@ -1783,7 +2084,7 @@ mod tests {
             );
             assert_eq!(
                 spec.runtime_profile.model,
-                ModelRoute::Fixed(model.to_string()),
+                ModelRoute::Inherit,
                 "role {role}"
             );
             assert_eq!(spec.runtime_profile.role, expected_type, "role {role}");

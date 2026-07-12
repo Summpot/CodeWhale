@@ -27,13 +27,14 @@
 //! happen *before* the view is constructed (see `tui/ui.rs`); this
 //! module always assumes the user is being asked.
 
-use crate::localization::Locale;
+use crate::localization::{Locale, MessageId, tr};
 use crate::sandbox::SandboxPolicy;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 use crate::tui::widgets::{ApprovalWidget, ElevationWidget, Renderable};
 use codewhale_config::ToolAskRule;
 use crossterm::event::{KeyCode, KeyEvent};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -72,10 +73,12 @@ impl ApprovalMode {
 
     pub fn from_config_value(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(ApprovalMode::Auto),
+            "auto" | "auto-review" | "auto_review" => Some(ApprovalMode::Auto),
             "bypass" | "yolo" | "dontask" | "dont_ask" | "bypass-permissions"
-            | "bypasspermissions" => Some(ApprovalMode::Bypass),
-            "suggest" | "suggested" | "on-request" | "untrusted" => Some(ApprovalMode::Suggest),
+            | "bypasspermissions" | "full-access" | "full" => Some(ApprovalMode::Bypass),
+            "suggest" | "suggested" | "on-request" | "untrusted" | "ask" => {
+                Some(ApprovalMode::Suggest)
+            }
             "never" | "deny" | "denied" => Some(ApprovalMode::Never),
             _ => None,
         }
@@ -527,6 +530,11 @@ fn build_impact_summary(tool_name: &str, category: ToolCategory, params: &Value)
             }
             impacts
         }
+        ToolCategory::Agent if tool_name == "workflow" => {
+            // #4126: elevated Workflow plan card — goal, children, capability flags, budget.
+            crate::tools::workflow_plan_approval::analyze_workflow_plan_approval(params)
+                .approval_impacts()
+        }
         ToolCategory::Agent => {
             let mut impacts = vec![
                 "Starts or inspects a child agent task; the child's own tool gates still apply."
@@ -554,17 +562,16 @@ fn build_impact_summary(tool_name: &str, category: ToolCategory, params: &Value)
 }
 
 fn localized_description_zh_hans(category: ToolCategory) -> String {
+    let locale = Locale::ZhHans;
     match category {
-        ToolCategory::Safe => "请求执行只读操作。".to_string(),
-        ToolCategory::FileWrite => "请求修改文件。请确认路径和内容符合预期。".to_string(),
-        ToolCategory::Shell => "请求执行 shell 命令。请先检查命令和工作目录。".to_string(),
-        ToolCategory::Network => "请求访问网络或远程内容。请确认目标可信。".to_string(),
-        ToolCategory::McpRead => "请求从 MCP 服务器读取信息。".to_string(),
-        ToolCategory::McpAction => "请求调用 MCP 服务器操作，可能产生副作用。".to_string(),
-        ToolCategory::Agent => {
-            "请求启动或查看子代理任务；子代理仍受其自身工具门控约束。".to_string()
-        }
-        ToolCategory::Unknown => "请求运行未分类工具。批准前请仔细检查参数。".to_string(),
+        ToolCategory::Safe => tr(locale, MessageId::ApprovalDescSafe).to_string(),
+        ToolCategory::FileWrite => tr(locale, MessageId::ApprovalDescFileWrite).to_string(),
+        ToolCategory::Shell => tr(locale, MessageId::ApprovalDescShell).to_string(),
+        ToolCategory::Network => tr(locale, MessageId::ApprovalDescNetwork).to_string(),
+        ToolCategory::McpRead => tr(locale, MessageId::ApprovalDescMcpRead).to_string(),
+        ToolCategory::McpAction => tr(locale, MessageId::ApprovalDescMcpAction).to_string(),
+        ToolCategory::Agent => tr(locale, MessageId::ApprovalDescAgent).to_string(),
+        ToolCategory::Unknown => tr(locale, MessageId::ApprovalDescUnknown).to_string(),
     }
 }
 
@@ -573,26 +580,27 @@ fn build_impact_summary_zh_hans(
     category: ToolCategory,
     params: &Value,
 ) -> Vec<String> {
+    let locale = Locale::ZhHans;
     match category {
         ToolCategory::Safe => {
-            let mut impacts = vec!["只读操作。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactSafe).to_string()];
             if let Some(path) = param_preview(params, &["path", "ref_id", "uri"], 72) {
                 impacts.push(format!("读取：{path}"));
             }
             impacts
         }
         ToolCategory::FileWrite => {
-            let mut impacts = vec!["会写入工作区或已批准写入范围内的文件。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactFileWrite).to_string()];
             if let Some(path) = param_preview(params, &["path", "target", "destination"], 72) {
                 impacts.push(format!("写入：{path}"));
             }
             impacts
         }
         ToolCategory::Shell => {
-            vec!["在工作区执行 Bash 命令。".to_string()]
+            vec![tr(locale, MessageId::ApprovalImpactShell).to_string()]
         }
         ToolCategory::Network => {
-            let mut impacts = vec!["可能访问网络服务或远程内容。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactNetwork).to_string()];
             if let Some(target) =
                 param_preview(params, &["url", "q", "query", "location", "repo"], 96)
             {
@@ -601,29 +609,28 @@ fn build_impact_summary_zh_hans(
             impacts
         }
         ToolCategory::McpRead => {
-            let mut impacts = vec!["从 MCP 服务器读取信息，不应产生本地写入。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactMcpRead).to_string()];
             if let Some(target) = mcp_target_hint(tool_name) {
                 impacts.push(format!("MCP 目标：{target}"));
             }
             impacts
         }
         ToolCategory::McpAction => {
-            let mut impacts = vec!["调用可能产生副作用的 MCP 服务器操作。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactMcpAction).to_string()];
             if let Some(target) = mcp_target_hint(tool_name) {
                 impacts.push(format!("MCP 目标：{target}"));
             }
             impacts
         }
         ToolCategory::Agent => {
-            let mut impacts =
-                vec!["启动或查看子代理任务；子代理仍受其自身工具门控约束。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactAgent).to_string()];
             if let Some(kind) = param_preview(params, &["type"], 40) {
                 impacts.push(format!("子代理类型：{kind}"));
             }
             impacts
         }
         ToolCategory::Unknown => {
-            let mut impacts = vec!["工具未分类。批准前请仔细检查参数。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactUnknown).to_string()];
             if let Some(target) = param_preview(
                 params,
                 &["path", "cmd", "command", "url", "q", "query", "ref_id"],
@@ -691,6 +698,18 @@ fn build_prominent_details(
                 details.push(ApprovalDetail {
                     label: "Target".to_string(),
                     value: target,
+                    shell_lines: None,
+                });
+            }
+        }
+        ToolCategory::Agent if tool_name == "workflow" => {
+            // #4126: elevated Workflow plan card fields.
+            let summary =
+                crate::tools::workflow_plan_approval::analyze_workflow_plan_approval(params);
+            for (label, value) in summary.card_fields() {
+                details.push(ApprovalDetail {
+                    label: label.to_string(),
+                    value,
                     shell_lines: None,
                 });
             }
@@ -912,36 +931,42 @@ fn param_text(params: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn localize_detail_label(label: &str, locale: Locale) -> &str {
+fn localize_detail_label(label: &str, locale: Locale) -> Cow<'static, str> {
     match locale {
         Locale::ZhHans => match label {
-            "Command" => "命令",
-            "Dir" => "目录",
-            "File" => "文件",
-            "Preview" => "预览",
-            "proposed content" => "拟写入内容",
-            "replace this" => "替换此内容",
-            "with this" => "替换为",
-            "replacement content" => "替换内容",
-            "Path" => "路径",
-            "Target" => "目标",
-            "Input" => "输入",
-            "Action" => "操作",
-            "Type" => "类型",
-            "Prompt" => "提示",
-            _ => label,
+            "Command" => tr(locale, MessageId::ApprovalLabelCommand),
+            "Dir" => tr(locale, MessageId::ApprovalLabelDir),
+            "File" => tr(locale, MessageId::ApprovalLabelFile),
+            "Preview" => tr(locale, MessageId::ApprovalLabelPreview),
+            "proposed content" => tr(locale, MessageId::ApprovalLabelProposedContent),
+            "replace this" => tr(locale, MessageId::ApprovalLabelReplaceThis),
+            "with this" => tr(locale, MessageId::ApprovalLabelWithThis),
+            "replacement content" => tr(locale, MessageId::ApprovalLabelReplacementContent),
+            "Path" => tr(locale, MessageId::ApprovalLabelPath),
+            "Target" => tr(locale, MessageId::ApprovalLabelTarget),
+            "Input" => tr(locale, MessageId::ApprovalLabelInput),
+            "Action" => tr(locale, MessageId::ApprovalLabelAction),
+            "Type" => tr(locale, MessageId::ApprovalLabelType),
+            "Prompt" => tr(locale, MessageId::ApprovalLabelPrompt),
+            "Goal" => "目标".into(),
+            "Children" => "子任务".into(),
+            "Writes" => "写入".into(),
+            "Shell" => "Shell".into(),
+            "Network" => "网络".into(),
+            "Budget" => "预算".into(),
+            _ => label.to_string().into(),
         },
-        _ => label,
+        _ => label.to_string().into(),
     }
 }
 
-fn localize_preview_shell_line<'a>(tool_name: &str, line: &'a str, locale: Locale) -> &'a str {
+fn localize_preview_shell_line(tool_name: &str, line: &str, locale: Locale) -> Cow<'static, str> {
     match tool_name {
         "write_file" if line == "proposed content" => localize_detail_label(line, locale),
         "edit_file" if matches!(line, "replace this" | "with this") => {
             localize_detail_label(line, locale)
         }
-        _ => line,
+        _ => line.to_string().into(),
     }
 }
 
@@ -1143,21 +1168,40 @@ impl ApprovalOption {
         ApprovalOption::Abort,
     ];
 
-    fn from_index(idx: usize) -> ApprovalOption {
-        Self::ORDER.get(idx).copied().unwrap_or(Self::Abort)
+    /// Workflow elevated-plan card (#4126): Approve / Edit plan / Cancel.
+    const WORKFLOW_ORDER: [ApprovalOption; 3] = [
+        ApprovalOption::ApproveOnce,
+        ApprovalOption::Deny,
+        ApprovalOption::Abort,
+    ];
+
+    fn order_for(tool_name: &str) -> &'static [ApprovalOption] {
+        if tool_name == "workflow" {
+            &Self::WORKFLOW_ORDER
+        } else {
+            &Self::ORDER
+        }
     }
 
-    fn index(self) -> usize {
-        Self::ORDER
+    fn from_index_for(tool_name: &str, idx: usize) -> ApprovalOption {
+        Self::order_for(tool_name)
+            .get(idx)
+            .copied()
+            .unwrap_or(Self::Abort)
+    }
+
+    fn index_for(self, tool_name: &str) -> usize {
+        Self::order_for(tool_name)
             .iter()
             .position(|o| *o == self)
-            .unwrap_or(Self::ORDER.len() - 1)
+            .unwrap_or(Self::order_for(tool_name).len().saturating_sub(1))
     }
 
     fn decision(self) -> ReviewDecision {
         match self {
             ApprovalOption::ApproveOnce => ReviewDecision::Approved,
             ApprovalOption::ApproveAlways => ReviewDecision::ApprovedForSession,
+            // Workflow maps Deny → "Edit plan" (model revises plan).
             ApprovalOption::Deny => ReviewDecision::Denied,
             ApprovalOption::Abort => ReviewDecision::Abort,
         }
@@ -1198,11 +1242,20 @@ impl ApprovalView {
     }
 
     fn select_next(&mut self) {
-        self.selected = (self.selected + 1).min(ApprovalOption::ORDER.len() - 1);
+        let max = ApprovalOption::order_for(&self.request.tool_name)
+            .len()
+            .saturating_sub(1);
+        self.selected = (self.selected + 1).min(max);
     }
 
     fn current_option(&self) -> ApprovalOption {
-        ApprovalOption::from_index(self.selected)
+        ApprovalOption::from_index_for(&self.request.tool_name, self.selected)
+    }
+
+    /// Whether this approval is the elevated Workflow plan card (#4126).
+    #[must_use]
+    pub fn is_workflow_plan_approval(&self) -> bool {
+        self.request.tool_name == "workflow"
     }
 
     /// Test-only accessor for the selected option's decision.
@@ -1228,7 +1281,7 @@ impl ApprovalView {
 
     /// Commit the given option and close the approval modal.
     fn commit_option(&mut self, option: ApprovalOption) -> ViewAction {
-        self.selected = option.index();
+        self.selected = option.index_for(&self.request.tool_name);
         self.emit_decision(option.decision(), false)
     }
 
@@ -1257,16 +1310,14 @@ impl ApprovalView {
         // The compact prompt keeps the about/impact dossier out of the
         // default band; the pager is where that context now lives.
         let locale = self.locale();
-        let (about_label, impact_label) = match locale {
-            Locale::ZhHans => ("说明：", "影响："),
-            _ => ("About: ", "Impact: "),
-        };
+        let about_label = tr(locale, MessageId::ApprovalLabelAbout);
+        let impact_label = tr(locale, MessageId::ApprovalLabelImpact);
         let mut content = String::new();
-        content.push_str(about_label);
+        content.push_str(&about_label);
         content.push_str(&self.request.description_for_locale(locale));
         content.push('\n');
         for impact in self.request.impacts_for_locale(locale) {
-            content.push_str(impact_label);
+            content.push_str(&impact_label);
             content.push_str(&impact);
             content.push('\n');
         }
@@ -1318,8 +1369,16 @@ impl ModalView for ApprovalView {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('1') => {
                 self.commit_option(ApprovalOption::ApproveOnce)
             }
-            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('2') => {
+            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('2')
+                if !self.is_workflow_plan_approval() =>
+            {
                 self.commit_option(ApprovalOption::ApproveAlways)
+            }
+            // Workflow plan card (#4126): [2/e] Edit plan, [3/n/d] Cancel.
+            KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Char('2')
+                if self.is_workflow_plan_approval() =>
+            {
+                self.commit_option(ApprovalOption::Deny)
             }
             KeyCode::Char('s') | KeyCode::Char('S') if self.request.can_save_ask_rule() => self
                 .emit_decision_with_rules(
@@ -1331,7 +1390,14 @@ impl ModalView for ApprovalView {
             | KeyCode::Char('N')
             | KeyCode::Char('d')
             | KeyCode::Char('D')
-            | KeyCode::Char('3') => self.commit_option(ApprovalOption::Deny),
+            | KeyCode::Char('3') => {
+                if self.is_workflow_plan_approval() {
+                    // Cancel (abort turn) rather than session-deny.
+                    self.commit_option(ApprovalOption::Abort)
+                } else {
+                    self.commit_option(ApprovalOption::Deny)
+                }
+            }
             KeyCode::Char('v') | KeyCode::Char('V') => self.emit_params_pager(),
             KeyCode::Esc => self.emit_decision(ReviewDecision::Abort, false),
             _ => ViewAction::None,
@@ -1677,6 +1743,8 @@ mod tests {
         assert_eq!(get_tool_category("read_file"), ToolCategory::Safe);
         assert_eq!(get_tool_category("list_dir"), ToolCategory::Safe);
         assert_eq!(get_tool_category("todo_write"), ToolCategory::Safe);
+        assert_eq!(get_tool_category("work_update"), ToolCategory::Safe);
+        assert_eq!(get_tool_category("checklist_write"), ToolCategory::Safe);
         assert_eq!(get_tool_category("todo_read"), ToolCategory::Safe);
         assert_eq!(get_tool_category("note"), ToolCategory::Safe);
         assert_eq!(get_tool_category("update_plan"), ToolCategory::Safe);
@@ -3557,6 +3625,121 @@ diff --git a/src/b.rs b/src/b.rs
                 .iter()
                 .any(|o| matches!(o, ElevationOption::Abort))
         );
+    }
+
+    // ========================================================================
+    // Workflow elevated plan approval card (#4126)
+    // ========================================================================
+
+    #[test]
+    fn workflow_tool_is_agent_category_and_shows_plan_card_fields() {
+        assert_eq!(get_tool_category("workflow"), ToolCategory::Agent);
+        let request = ApprovalRequest::new(
+            "wf-1",
+            "workflow",
+            "Launch workflow",
+            &json!({
+                "action": "start",
+                "plan": {
+                    "goal": "ship the fix",
+                    "risk": "writes",
+                    "token_budget": 80_000,
+                    "children": [
+                        {
+                            "id": "impl",
+                            "label": "builder",
+                            "prompt": "edit files",
+                            "type": "implementer",
+                            "mode": "read_write"
+                        }
+                    ]
+                }
+            }),
+            "tool:workflow",
+        );
+        assert_eq!(request.category, ToolCategory::Agent);
+        let details = request.prominent_detail_items(Locale::En);
+        let labels: Vec<_> = details.iter().map(|d| d.label.as_str()).collect();
+        assert!(labels.contains(&"Goal"), "{labels:?}");
+        assert!(labels.contains(&"Children"), "{labels:?}");
+        assert!(labels.contains(&"Writes"), "{labels:?}");
+        assert!(labels.contains(&"Shell"), "{labels:?}");
+        assert!(labels.contains(&"Network"), "{labels:?}");
+        assert!(labels.contains(&"Budget"), "{labels:?}");
+        assert!(
+            details
+                .iter()
+                .any(|d| d.label == "Goal" && d.value.contains("ship the fix")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.label == "Writes" && d.value == "yes"),
+            "{details:?}"
+        );
+        assert!(
+            request
+                .impacts
+                .iter()
+                .any(|i| i.contains("Approve to launch")),
+            "{:?}",
+            request.impacts
+        );
+
+        let view = ApprovalView::new(request);
+        assert!(view.is_workflow_plan_approval());
+        assert_eq!(view.current_decision(), ReviewDecision::Approved);
+    }
+
+    #[test]
+    fn workflow_plan_card_edit_plan_and_cancel_keys() {
+        let request = ApprovalRequest::new(
+            "wf-2",
+            "workflow",
+            "Launch workflow",
+            &json!({
+                "action": "start",
+                "plan": {
+                    "goal": "risky",
+                    "risk": "elevated",
+                    "children": [{ "prompt": "go", "type": "implementer" }]
+                }
+            }),
+            "tool:workflow",
+        );
+        let mut view = ApprovalView::new(request);
+        // [2 / e] → Edit plan → Denied
+        let action = view.handle_key(create_key_event(KeyCode::Char('e')));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision { decision, .. }) => {
+                assert_eq!(decision, ReviewDecision::Denied);
+            }
+            other => panic!("expected edit-plan denial, got {other:?}"),
+        }
+
+        let request = ApprovalRequest::new(
+            "wf-3",
+            "workflow",
+            "Launch workflow",
+            &json!({
+                "action": "start",
+                "plan": {
+                    "goal": "risky",
+                    "risk": "elevated",
+                    "children": [{ "prompt": "go", "type": "implementer" }]
+                }
+            }),
+            "tool:workflow",
+        );
+        let mut view = ApprovalView::new(request);
+        let action = view.handle_key(create_key_event(KeyCode::Char('3')));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision { decision, .. }) => {
+                assert_eq!(decision, ReviewDecision::Abort);
+            }
+            other => panic!("expected cancel abort, got {other:?}"),
+        }
     }
 
     // ========================================================================

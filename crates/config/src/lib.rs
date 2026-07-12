@@ -50,13 +50,23 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const PERMISSIONS_FILE_NAME: &str = "permissions.toml";
 
+fn http_headers_are_effectively_empty(headers: &BTreeMap<String, String>) -> bool {
+    !headers
+        .iter()
+        .any(|(name, value)| !name.trim().is_empty() && !value.trim().is_empty())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderConfigToml {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(
         default,
+        skip_serializing_if = "Option::is_none",
         alias = "contextWindow",
         alias = "context_window_tokens",
         alias = "contextWindowTokens",
@@ -64,66 +74,101 @@ pub struct ProviderConfigToml {
         alias = "contextLength"
     )]
     pub context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub insecure_skip_tls_verify: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "http_headers_are_effectively_empty")]
     pub http_headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_suffix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<ProviderAuthSourceToml>,
 }
 
+impl ProviderConfigToml {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        let blank = |value: Option<&String>| value.is_none_or(|value| value.trim().is_empty());
+
+        blank(self.api_key.as_ref())
+            && blank(self.base_url.as_ref())
+            && blank(self.model.as_ref())
+            && self.context_window.is_none()
+            && blank(self.mode.as_ref())
+            && blank(self.auth_mode.as_ref())
+            && self.insecure_skip_tls_verify.is_none()
+            && http_headers_are_effectively_empty(&self.http_headers)
+            && blank(self.path_suffix.as_ref())
+            && self.auth.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProvidersToml {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub deepseek: ProviderConfigToml,
     #[serde(
         default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
         alias = "deepseek-anthropic",
         alias = "deepseekAnthropic",
         alias = "deepseek-claude",
         alias = "deepseek_claude"
     )]
     pub deepseek_anthropic: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub nvidia_nim: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub openai: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub atlascloud: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub wanjie_ark: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub volcengine: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub openrouter: ProviderConfigToml,
-    #[serde(default, alias = "xiaomi", alias = "mimo", alias = "xiaomimimo")]
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "xiaomi",
+        alias = "mimo",
+        alias = "xiaomimimo"
+    )]
     pub xiaomi_mimo: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub novita: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub fireworks: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub siliconflow: ProviderConfigToml,
-    #[serde(default, alias = "siliconflow-CN", alias = "siliconflow-cn")]
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "siliconflow-CN",
+        alias = "siliconflow-cn"
+    )]
     pub siliconflow_cn: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub arcee: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub moonshot: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub sglang: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub vllm: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub ollama: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub huggingface: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub together: ProviderConfigToml,
     #[serde(
         default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
         alias = "baidu-qianfan",
         alias = "baidu_qianfan",
         alias = "baidu"
@@ -131,6 +176,7 @@ pub struct ProvidersToml {
     pub qianfan: ProviderConfigToml,
     #[serde(
         default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
         alias = "openai-codex",
         alias = "openai_codex",
         alias = "codex",
@@ -138,12 +184,18 @@ pub struct ProvidersToml {
         alias = "chatgpt-codex"
     )]
     pub openai_codex: ProviderConfigToml,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub anthropic: ProviderConfigToml,
-    #[serde(default, alias = "open-model", alias = "open_model")]
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "open-model",
+        alias = "open_model"
+    )]
     pub openmodel: ProviderConfigToml,
     #[serde(
         default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
         alias = "z-ai",
         alias = "z_ai",
         alias = "z.ai",
@@ -155,6 +207,7 @@ pub struct ProvidersToml {
     pub zai: ProviderConfigToml,
     #[serde(
         default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
         alias = "step-fun",
         alias = "step_fun",
         alias = "stepfun",
@@ -163,25 +216,62 @@ pub struct ProvidersToml {
         alias = "step_flash"
     )]
     pub stepfun: ProviderConfigToml,
-    #[serde(default, alias = "mini-max", alias = "mini_max", alias = "minimax")]
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "mini-max",
+        alias = "mini_max",
+        alias = "minimax"
+    )]
     pub minimax: ProviderConfigToml,
-    #[serde(default, alias = "deep-infra", alias = "deep_infra")]
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "deep-infra",
+        alias = "deep_infra"
+    )]
     pub deepinfra: ProviderConfigToml,
-    #[serde(default, alias = "sakana-ai", alias = "sakana_ai", alias = "fugu")]
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "sakana-ai",
+        alias = "sakana_ai",
+        alias = "fugu"
+    )]
     pub sakana: ProviderConfigToml,
     #[serde(
         default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
         alias = "long-cat",
         alias = "meituan-longcat",
         alias = "meituan"
     )]
     pub longcat: ProviderConfigToml,
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "meta-ai",
+        alias = "meta_ai",
+        alias = "meta-model-api",
+        alias = "meta_model_api",
+        alias = "muse",
+        alias = "muse-spark"
+    )]
+    pub meta: ProviderConfigToml,
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "x-ai",
+        alias = "x_ai",
+        alias = "grok"
+    )]
+    pub xai: ProviderConfigToml,
     /// Catch-all table for the dynamic OpenAI-compatible custom provider
     /// identity (#1519). Arbitrary `[providers.<name>]` tables are handled by
     /// the tui-side flatten map; this named slot keeps the canonical
     /// `ProviderKind::Custom` lookups total without leaking into another
     /// provider's config.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub custom: ProviderConfigToml,
 }
 
@@ -243,6 +333,13 @@ impl PermissionsToml {
 
 impl ProvidersToml {
     #[must_use]
+    pub fn is_empty(&self) -> bool {
+        ProviderKind::all()
+            .iter()
+            .all(|provider| self.for_provider(*provider).is_empty())
+    }
+
+    #[must_use]
     pub fn for_provider(&self, provider: ProviderKind) -> &ProviderConfigToml {
         match provider {
             ProviderKind::Deepseek => &self.deepseek,
@@ -275,6 +372,8 @@ impl ProvidersToml {
             ProviderKind::Deepinfra => &self.deepinfra,
             ProviderKind::Sakana => &self.sakana,
             ProviderKind::LongCat => &self.longcat,
+            ProviderKind::Meta => &self.meta,
+            ProviderKind::Xai => &self.xai,
             ProviderKind::Custom => &self.custom,
         }
     }
@@ -311,6 +410,8 @@ impl ProvidersToml {
             ProviderKind::Deepinfra => &mut self.deepinfra,
             ProviderKind::Sakana => &mut self.sakana,
             ProviderKind::LongCat => &mut self.longcat,
+            ProviderKind::Meta => &mut self.meta,
+            ProviderKind::Xai => &mut self.xai,
             ProviderKind::Custom => &mut self.custom,
         }
     }
@@ -324,7 +425,7 @@ pub struct ConfigToml {
     /// TUI-compatible DeepSeek base URL.
     pub base_url: Option<String>,
     /// Optional extra HTTP headers forwarded to model API requests.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "http_headers_are_effectively_empty")]
     pub http_headers: BTreeMap<String, String>,
     /// TUI-compatible default DeepSeek model.
     pub default_text_model: Option<String>,
@@ -341,7 +442,7 @@ pub struct ConfigToml {
     /// Native tool catalog controls shared with `codewhale-tui`.
     #[serde(default)]
     pub tools: Option<ToolsToml>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProvidersToml::is_empty")]
     pub providers: ProvidersToml,
     /// Provider fallback chain (#2574). TUI runtime code may advance through
     /// these providers after recoverable provider errors; config resolution
@@ -385,6 +486,11 @@ pub struct ConfigToml {
     /// workers inherit conservative Sandbox defaults.
     #[serde(default)]
     pub fleet: Option<FleetConfigToml>,
+    /// Workflow automatic-launch, approval, isolation, and activity
+    /// persistence knobs (#4128 / Section 2.11). When absent, consumers use
+    /// [`WorkflowConfigToml::default`].
+    #[serde(default)]
+    pub workflow: Option<WorkflowConfigToml>,
     #[serde(flatten)]
     pub extras: BTreeMap<String, toml::Value>,
 }
@@ -714,7 +820,7 @@ pub const DEFAULT_HOTBAR_ACTIONS: [&str; HOTBAR_SLOT_COUNT as usize] = [
     "session.compact",
     "mode.plan",
     "mode.agent",
-    "mode.yolo",
+    "mode.operate",
     "palette.open",
     "sidebar.toggle",
     "trust.toggle",
@@ -1160,6 +1266,13 @@ pub struct FleetProfile {
     /// this profile must read this field, not guess from the model id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Optional explicit reasoning/thinking tier for this profile (#4137).
+    ///
+    /// This is a safe, non-secret route tuning value. `None` means inherit the
+    /// operator/session reasoning tier. Concrete values are normalized by the
+    /// TUI loader before they are used at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Permission defaults requested by the profile.
     #[serde(default)]
     pub permissions: FleetProfilePermissions,
@@ -1464,6 +1577,121 @@ impl FleetConfigToml {
             .get(name)
             .cloned()
             .or_else(|| built_in_role_presets().get(name).cloned())
+    }
+}
+
+/// On-disk schema for the `[workflow]` table (#4128 / Section 2.11).
+///
+/// Automatic Workflow launch, write/approval gates, child/isolation budgets,
+/// and completed-activity persistence all read from this one model. When the
+/// table is absent, consumers resolve [`WorkflowConfigToml::default`].
+/// See `config.example.toml` for documentation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowConfigToml {
+    /// Allow the parent agent to auto-launch Workflow for multi-agent work.
+    /// Product default is on; set `false` to require explicit `/workflow`.
+    #[serde(default = "default_workflow_automatic")]
+    pub automatic: bool,
+    /// When automatic launch is enabled, start read-only child plans without
+    /// an approval card. Write/shell/network plans still consult
+    /// [`Self::require_approval_for_writes`].
+    #[serde(default = "default_workflow_auto_start_read_only")]
+    pub auto_start_read_only: bool,
+    /// Require an operator approval card before launching plans that write,
+    /// elevate shell/network, or otherwise leave the read-only envelope.
+    #[serde(default = "default_workflow_require_approval_for_writes")]
+    pub require_approval_for_writes: bool,
+    /// Soft upper bound on children admitted by automatic launch. Larger plans
+    /// should ask the operator or use explicit `/workflow`.
+    #[serde(default = "default_workflow_auto_start_child_limit")]
+    pub auto_start_child_limit: u32,
+    /// Hard ceiling on total children in one Workflow run (product: 1000).
+    #[serde(default = "default_workflow_max_children")]
+    pub max_children: u32,
+    /// Maximum concurrently live agents inside one Workflow run (product: 16).
+    #[serde(default = "default_workflow_max_concurrent")]
+    pub max_concurrent: u32,
+    /// Maximum nested Workflow / child-orchestration depth.
+    #[serde(default = "default_workflow_max_depth")]
+    pub max_depth: u32,
+    /// Default shared token budget for a Workflow run and its children.
+    #[serde(default = "default_workflow_default_token_budget")]
+    pub default_token_budget: u64,
+    /// How many parallel write children may share the parent worktree without
+    /// isolation. `0` forces worktree isolation for parallel writes.
+    #[serde(default = "default_workflow_max_parallel_writes_without_worktree")]
+    pub max_parallel_writes_without_worktree: u32,
+    /// Keep completed Workflow activity visible in the session activity surface
+    /// until the next run (or explicit clear).
+    #[serde(default = "default_workflow_persist_completed_activity")]
+    pub persist_completed_activity: bool,
+    /// Persist completed Workflow activity across process restarts via the
+    /// durable run journal.
+    #[serde(default = "default_workflow_persist_completed_across_restarts")]
+    pub persist_completed_across_restarts: bool,
+}
+
+fn default_workflow_automatic() -> bool {
+    true
+}
+
+fn default_workflow_auto_start_read_only() -> bool {
+    true
+}
+
+fn default_workflow_require_approval_for_writes() -> bool {
+    true
+}
+
+fn default_workflow_auto_start_child_limit() -> u32 {
+    // Soft auto stays small; explicit launches may use the full concurrent cap.
+    16
+}
+
+fn default_workflow_max_children() -> u32 {
+    1000
+}
+
+fn default_workflow_max_concurrent() -> u32 {
+    16
+}
+
+fn default_workflow_max_depth() -> u32 {
+    2
+}
+
+fn default_workflow_default_token_budget() -> u64 {
+    120_000
+}
+
+fn default_workflow_max_parallel_writes_without_worktree() -> u32 {
+    0
+}
+
+fn default_workflow_persist_completed_activity() -> bool {
+    true
+}
+
+fn default_workflow_persist_completed_across_restarts() -> bool {
+    true
+}
+
+impl Default for WorkflowConfigToml {
+    fn default() -> Self {
+        Self {
+            automatic: default_workflow_automatic(),
+            auto_start_read_only: default_workflow_auto_start_read_only(),
+            require_approval_for_writes: default_workflow_require_approval_for_writes(),
+            auto_start_child_limit: default_workflow_auto_start_child_limit(),
+            max_children: default_workflow_max_children(),
+            max_concurrent: default_workflow_max_concurrent(),
+            max_depth: default_workflow_max_depth(),
+            default_token_budget: default_workflow_default_token_budget(),
+            max_parallel_writes_without_worktree:
+                default_workflow_max_parallel_writes_without_worktree(),
+            persist_completed_activity: default_workflow_persist_completed_activity(),
+            persist_completed_across_restarts: default_workflow_persist_completed_across_restarts(),
+        }
     }
 }
 
@@ -2035,6 +2263,8 @@ impl ConfigToml {
                 ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL.to_string(),
                 ProviderKind::Sakana => DEFAULT_SAKANA_BASE_URL.to_string(),
                 ProviderKind::LongCat => DEFAULT_LONGCAT_BASE_URL.to_string(),
+                ProviderKind::Meta => DEFAULT_META_BASE_URL.to_string(),
+                ProviderKind::Xai => DEFAULT_XAI_BASE_URL.to_string(),
                 // The custom provider has no built-in endpoint; fall back to its
                 // descriptor placeholder so the lookup is total. Real custom
                 // routes always supply a configured base_url before this point.
@@ -2287,6 +2517,8 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
             | ProviderKind::Minimax
             | ProviderKind::Qianfan
             | ProviderKind::Ollama
+            | ProviderKind::Meta
+            | ProviderKind::Xai
     ) {
         return model.to_string();
     }
@@ -2612,6 +2844,8 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_MODEL,
         ProviderKind::Sakana => DEFAULT_SAKANA_MODEL,
         ProviderKind::LongCat => DEFAULT_LONGCAT_MODEL,
+        ProviderKind::Meta => DEFAULT_META_MODEL,
+        ProviderKind::Xai => DEFAULT_XAI_MODEL,
         // No built-in default model; the registry placeholder keeps this total.
         ProviderKind::Custom => provider.provider().default_model(),
     }
@@ -2649,6 +2883,8 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL,
         ProviderKind::Sakana => DEFAULT_SAKANA_BASE_URL,
         ProviderKind::LongCat => DEFAULT_LONGCAT_BASE_URL,
+        ProviderKind::Meta => DEFAULT_META_BASE_URL,
+        ProviderKind::Xai => DEFAULT_XAI_BASE_URL,
         // No built-in default base URL; the registry placeholder keeps this total.
         ProviderKind::Custom => provider.provider().default_base_url(),
     }
@@ -4194,6 +4430,10 @@ struct EnvRuntimeOverrides {
     sakana_model: Option<String>,
     longcat_base_url: Option<String>,
     longcat_model: Option<String>,
+    meta_base_url: Option<String>,
+    meta_model: Option<String>,
+    xai_base_url: Option<String>,
+    xai_model: Option<String>,
 }
 
 impl EnvRuntimeOverrides {
@@ -4438,6 +4678,28 @@ impl EnvRuntimeOverrides {
             longcat_model: std::env::var("LONGCAT_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            meta_base_url: std::env::var("META_MODEL_API_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("MODEL_API_BASE_URL")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                }),
+            meta_model: std::env::var("META_MODEL_API_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("MODEL_API_MODEL")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                }),
+            xai_base_url: std::env::var("XAI_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            xai_model: std::env::var("XAI_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         }
     }
 
@@ -4490,6 +4752,8 @@ impl EnvRuntimeOverrides {
             ProviderKind::Deepinfra => self.deepinfra_base_url.clone(),
             ProviderKind::Sakana => self.sakana_base_url.clone(),
             ProviderKind::LongCat => self.longcat_base_url.clone(),
+            ProviderKind::Meta => self.meta_base_url.clone(),
+            ProviderKind::Xai => self.xai_base_url.clone(),
             // No dedicated CODEWHALE_CUSTOM_BASE_URL env override: a custom
             // provider's base URL comes from its `[providers.<name>]` table.
             ProviderKind::Custom => None,
@@ -4521,6 +4785,8 @@ impl EnvRuntimeOverrides {
             ProviderKind::Deepinfra => self.deepinfra_model.clone(),
             ProviderKind::Sakana => self.sakana_model.clone(),
             ProviderKind::LongCat => self.longcat_model.clone(),
+            ProviderKind::Meta => self.meta_model.clone(),
+            ProviderKind::Xai => self.xai_model.clone(),
             _ => None,
         }?;
 

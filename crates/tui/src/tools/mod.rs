@@ -63,6 +63,8 @@ pub mod verifier;
 pub mod web_run;
 pub mod web_search;
 pub mod workflow;
+pub mod workflow_plan_approval;
+pub mod workflow_trigger;
 
 pub use registry::{AgentToolSurfaceOptions, ToolRegistry, ToolRegistryBuilder};
 pub use review::ReviewOutput;

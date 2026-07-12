@@ -121,7 +121,9 @@ pub const DEFAULT_QIANFAN_MODEL: &str = "ernie-4.0-turbo-8k";
 pub const DEFAULT_QIANFAN_BASE_URL: &str = "https://api.baiduqianfan.ai/v1";
 pub const DEFAULT_OPENAI_CODEX_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
-pub const OPENAI_CODEX_EFFECTIVE_CONTEXT_WINDOW_TOKENS: u32 = 400_000;
+/// Conservative offline floor for an OAuth model absent from a fresh Codex
+/// roster. Fresh account-scoped cache metadata overrides this in route_runtime.
+pub const OPENAI_CODEX_EFFECTIVE_CONTEXT_WINDOW_TOKENS: u32 = 128_000;
 /// Legacy `deepseek-cn` provider alias.
 ///
 /// DeepSeek's official API host is the same worldwide. Keep this alias for
@@ -165,3 +167,12 @@ pub const SAKANA_FUGU_ULTRA_MODEL: &str = "fugu-ultra-20260615";
 pub const DEFAULT_SAKANA_BASE_URL: &str = "https://api.sakana.ai/v1";
 pub const DEFAULT_LONGCAT_MODEL: &str = "LongCat-2.0";
 pub const DEFAULT_LONGCAT_BASE_URL: &str = "https://api.longcat.chat/openai/v1";
+pub const DEFAULT_META_MODEL: &str = "muse-spark-1.1";
+pub const DEFAULT_META_BASE_URL: &str = "https://api.meta.ai/v1";
+pub const DEFAULT_XAI_MODEL: &str = "grok-4.5";
+pub const XAI_GROK_4_3_MODEL: &str = "grok-4.3";
+pub const XAI_GROK_BUILD_MODEL: &str = "grok-build";
+pub const XAI_GROK_COMPOSER_2_5_FAST_MODEL: &str = "grok-composer-2.5-fast";
+pub const XAI_GROK_4_20_0309_REASONING_MODEL: &str = "grok-4.20-0309-reasoning";
+pub const XAI_GROK_4_20_0309_NON_REASONING_MODEL: &str = "grok-4.20-0309-non-reasoning";
+pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";

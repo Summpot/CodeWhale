@@ -951,7 +951,7 @@ impl From<&str> for TranscriptSpacingValue {
 impl From<&str> for DefaultModeValue {
     fn from(value: &str) -> Self {
         match AppMode::from_setting(value) {
-            AppMode::Agent | AppMode::Multitask | AppMode::Operate => Self::Agent,
+            AppMode::Agent | AppMode::Operate => Self::Agent,
             AppMode::Plan => Self::Plan,
             AppMode::Auto => Self::Agent,
             AppMode::Yolo => Self::Yolo,
@@ -1107,6 +1107,8 @@ mod tests {
         app.auto_model = false;
         app.api_provider = ApiProvider::Deepseek;
         app.model_ids_passthrough = false;
+        app.active_route_limits = None;
+        app.update_model_compaction_budget();
         app
     }
 

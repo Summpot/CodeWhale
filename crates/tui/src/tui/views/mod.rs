@@ -557,6 +557,9 @@ pub enum ViewEvent {
     SessionSelected {
         session_id: String,
     },
+    SessionRenamed {
+        metadata: crate::session_manager::SessionMetadata,
+    },
     SessionDeleted {
         session_id: String,
         title: String,
@@ -573,6 +576,23 @@ pub enum ViewEvent {
         previous_model: String,
         previous_effort: crate::tui::app::ReasoningEffort,
     },
+    /// Emitted by the `/model` picker on Esc so the next open can restore
+    /// the browsing context — view mode and highlighted row (#4109 / #4115).
+    ModelPickerDismissed {
+        /// True when the dismissed view browses beyond configured providers
+        /// (Catalog / Recent / Coding / Cheap / Long context).
+        catalog_view: bool,
+        /// Named view key (`configured`, `catalog`, `recent`, `coding`,
+        /// `cheap`, `long_context`) for reopen restore (#4115).
+        view: String,
+        selected_row_id: Option<String>,
+    },
+    /// Emitted by the `/provider` picker on Esc so the next open can restore
+    /// the browsing context — view mode and highlighted row.
+    ProviderPickerDismissed {
+        catalog_view: bool,
+        selected_provider_id: Option<String>,
+    },
     /// Emitted by the `/provider` picker when the user selects a provider
     /// that already has credentials — the handler should perform the same
     /// switch as `AppAction::SwitchProvider`.
@@ -581,12 +601,22 @@ pub enum ViewEvent {
         provider_id: Option<String>,
     },
     /// Emitted by the `/provider` picker after the user types an API key
-    /// inline for a provider that lacked one. The handler should persist
-    /// the key via `save_api_key_for` and then perform the provider switch.
+    /// inline for a provider that lacked one. The handler validates the key
+    /// live; on success it reopens the guided flow at the model-pick stage
+    /// without persisting yet (#3875).
     ProviderPickerApiKeySubmitted {
         provider: crate::config::ApiProvider,
         provider_id: Option<String>,
         api_key: String,
+    },
+    /// Emitted by the `/provider` guided setup confirm stage after the user
+    /// accepted provider + model. The handler persists the key (and model)
+    /// via the comment-preserving config path, then performs the switch.
+    ProviderPickerSetupConfirmed {
+        provider: crate::config::ApiProvider,
+        provider_id: Option<String>,
+        api_key: String,
+        model: String,
     },
     /// Emitted by the `/provider` picker after the custom provider form is
     /// completed. The handler persists a named OpenAI-compatible provider
@@ -602,6 +632,8 @@ pub enum ViewEvent {
     ProviderPickerKimiOAuthEnabled {
         provider: crate::config::ApiProvider,
     },
+    /// Emitted by provider/setup UI when xAI device-code OAuth is requested.
+    ProviderPickerXaiOAuthRequested,
     /// Emitted by the `/provider` picker (the `M` action) to jump straight to
     /// the `/model` picker pre-filtered to the highlighted provider (#3083).
     ProviderPickerOpenModels {
@@ -668,6 +700,11 @@ pub enum ViewEvent {
         /// keeps the picked provider instead of collapsing to an ambiguous,
         /// provider-scoped profile — the exact bug #4093 fixes.
         provider: Option<String>,
+        /// Canonical reasoning tier selected by the wizard, or `None` for
+        /// inherit (#4137). Carried with the async draft for the same reason
+        /// as `provider`: the ratified profile must preserve the operator's
+        /// explicit choice, not whatever the model echoed.
+        reasoning_effort: Option<String>,
         locale: crate::localization::Locale,
     },
     /// Emitted by the `/fleet` roster view (`s` / Enter) to hand off to the
@@ -1866,7 +1903,7 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "model" => "deepseek-v4-pro | deepseek-v4-flash | deepseek-*",
         "provider" => "deepseek | openrouter | xiaomi-mimo | fireworks | siliconflow | ...",
         "approval_mode" => "auto | suggest | never",
-        "allow_shell" => "true enables shell in Agent mode with approvals on the next turn",
+        "allow_shell" => "true enables shell in Act mode with approvals on the next turn",
         "auto_compact"
         | "calm_mode"
         | "low_motion"
@@ -2156,6 +2193,7 @@ impl ModalView for ConfigView {
             (lines, self.tr(MessageId::ConfigEditFooter).to_string())
         } else {
             let content_height = usize::from(inner.height);
+            // Title (with job subtitle), search, blank, column headers, separator.
             let header_lines = 5usize;
             let bottom_lines = 1usize;
             // The action footer now lives inside the modal body (reserved by
@@ -2181,10 +2219,16 @@ impl ModalView for ConfigView {
             let (key_column_width, value_column_width, scope_column_width) =
                 self.table_column_widths(usize::from(inner.width));
             let mut lines: Vec<Line> = vec![
-                Line::from(vec![Span::styled(
-                    self.tr(MessageId::ConfigTitle),
-                    Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
-                )]),
+                Line::from(vec![
+                    Span::styled(
+                        self.tr(MessageId::ConfigTitle),
+                        Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+                    ),
+                    Span::styled(
+                        format!(" — {}", self.tr(MessageId::ConfigSubtitle)),
+                        Style::default().fg(palette::TEXT_MUTED),
+                    ),
+                ]),
                 Line::from(vec![
                     Span::styled("  Search: ", Style::default().fg(palette::TEXT_MUTED)),
                     Span::raw(search_value),
@@ -3970,7 +4014,8 @@ base_url = "https://api.xiaomimimo.com/v1"
         // The dense bottom status line must truncate on a word boundary with an
         // ellipsis instead of leaving a mid-word fragment clipped by the
         // terminal (#3987).
-        let app = create_test_app();
+        let mut app = create_test_app();
+        app.ui_locale = Locale::En;
         let mut view = ConfigView::new_for_app(&app);
         view.status = Some(
             "CFGSTATUS persisted the configuration override to disk successfully \

@@ -1,6 +1,6 @@
 [package]
 name = "codewhale-state"
-version = "0.8.67"
+version = "0.8.68"
 edition.workspace = true
 license = "MIT"
 repository = "https://github.com/Hmbown/CodeWhale"
@@ -9,7 +9,7 @@ description = "Session/thread persistence and recovery model for CodeWhale"
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-codewhale-protocol = { path = "../protocol", version = "0.8.67" }
+codewhale-protocol.workspace = true
 dirs.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

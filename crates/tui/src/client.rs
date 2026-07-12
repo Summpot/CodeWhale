@@ -943,6 +943,58 @@ fn api_provider_skips_models_probe(api_provider: ApiProvider) -> bool {
     matches!(api_provider, ApiProvider::DeepseekAnthropic)
 }
 
+/// Verify a provider API key by hitting the `/models` endpoint
+/// (#3875). Builds a minimal HTTP client with the canonical auth
+/// headers for `provider`, issues a single GET, and returns
+/// `Ok(())` on a 2xx response or `Err(reason)` on any failure.
+///
+/// This is intentionally a one-shot call — no retry, no rate-limit
+/// wait — so a bad key is surfaced immediately.
+pub async fn verify_provider_api_key(
+    provider: ApiProvider,
+    api_key: &str,
+    base_url: &str,
+) -> Result<(), String> {
+    if api_provider_skips_models_probe(provider) {
+        // Providers without a /models endpoint can't be verified this
+        // way; accept the key optimistically (same as health_check).
+        return Ok(());
+    }
+    let headers = build_default_headers(api_key, &Default::default(), provider, base_url)
+        .map_err(|err| format!("failed to build auth headers: {err:#}"))?;
+    let client = crate::tls::reqwest_client_builder()
+        .default_headers(headers)
+        .user_agent(concat!(
+            "Mozilla/5.0 (compatible; codewhale/",
+            env!("CARGO_PKG_VERSION"),
+            "; +https://github.com/Hmbown/CodeWhale)"
+        ))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|err| format!("failed to build HTTP client: {err:#}"))?;
+    let url = api_url(base_url, "models");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("request failed: {err:#}"))?;
+    let status = response.status();
+    if status.is_success() {
+        // Consume the body so the connection returns to the pool.
+        let _ = response.text().await;
+        Ok(())
+    } else {
+        let body = response.text().await.unwrap_or_default();
+        let summary = if body.chars().count() > 200 {
+            format!("{}...", body.chars().take(200).collect::<String>())
+        } else {
+            body
+        };
+        Err(format!("HTTP {status}: {summary}"))
+    }
+}
+
 fn translation_system_prompt(target_language: &str) -> String {
     format!(
         "You are a professional translator. Your ONLY task is to translate text to {target_language}. \
@@ -1236,6 +1288,7 @@ impl DeepSeekClient {
                     cost: None,
                     modalities: None,
                     reasoning: None,
+                    tool_call: None,
                     reasoning_options: Vec::new(),
                     source: CatalogSource::Live {
                         base_url_fingerprint: fingerprint.clone(),
@@ -1735,7 +1788,10 @@ fn parse_openrouter_models_response(
 }
 
 fn publish_provider_lake_snapshot(cache: &ProviderCatalogCache) {
-    let offerings = cache.all_fresh_offerings(now_unix());
+    // Publish fresh *and* stale/prior rows so pickers keep live catalog coverage
+    // after TTL expiry or a failed refresh (#4139). Empty caches clear the live
+    // layer and fall back to the bundled snapshot.
+    let offerings = cache.all_visible_offerings(now_unix());
     if offerings.is_empty() {
         crate::provider_lake::clear_live_snapshot();
     } else {
@@ -1794,6 +1850,12 @@ fn openrouter_to_catalog_offering(
             .any(|p| p == "reasoning" || p == "include_reasoning" || p.contains("reasoning"))
     });
 
+    let tool_call = item.supported_parameters.as_ref().map(|params| {
+        params
+            .iter()
+            .any(|p| p == "tools" || p == "tool_choice" || p == "functions" || p.contains("tool"))
+    });
+
     let modalities = item.architecture.as_ref().map(|arch| {
         let mut input = arch.input_modalities.clone().unwrap_or_default();
         let mut output = arch.output_modalities.clone().unwrap_or_default();
@@ -1832,6 +1894,7 @@ fn openrouter_to_catalog_offering(
         cost,
         modalities,
         reasoning,
+        tool_call,
         reasoning_options: Vec::new(),
         source: CatalogSource::Live {
             base_url_fingerprint: base_url_fingerprint.to_string(),
@@ -1940,6 +2003,8 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::Stepfun => {}
             ApiProvider::Sakana => {}
             ApiProvider::LongCat => {}
+            ApiProvider::Meta => {}
+            ApiProvider::Xai => {}
         },
         "low" | "minimal" | "medium" | "mid" | "high" | "" => match provider {
             // DeepSeek compatibility: low/medium both map to high
@@ -2030,6 +2095,8 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::Stepfun => {}
             ApiProvider::Sakana => {}
             ApiProvider::LongCat => {}
+            ApiProvider::Meta => {}
+            ApiProvider::Xai => {}
         },
         "xhigh" | "max" | "highest" | "ultracode" => match provider {
             ApiProvider::Deepseek
@@ -2100,6 +2167,8 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::Stepfun => {}
             ApiProvider::Sakana => {}
             ApiProvider::LongCat => {}
+            ApiProvider::Meta => {}
+            ApiProvider::Xai => {}
         },
         _ => {}
     }
@@ -2271,7 +2340,7 @@ mod tests {
         ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent, Tool,
     };
     use serde_json::json;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_tool(name: &str) -> Tool {
@@ -4520,6 +4589,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_provider_api_key_accepts_mocked_models_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+            .mount(&server)
+            .await;
+
+        verify_provider_api_key(ApiProvider::Openrouter, "test-key", &server.uri())
+            .await
+            .expect("mocked /models success should verify");
+    }
+
+    #[tokio::test]
+    async fn verify_provider_api_key_returns_status_and_unicode_body_without_panic() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("密钥无效"))
+            .mount(&server)
+            .await;
+
+        let err = verify_provider_api_key(ApiProvider::Openrouter, "bad-key", &server.uri())
+            .await
+            .expect_err("mocked /models failure should be reported");
+
+        assert!(err.contains("HTTP 401"), "status is preserved: {err}");
+        assert!(err.contains("密钥无效"), "unicode body is preserved: {err}");
+    }
+
+    #[tokio::test]
     async fn fetch_catalog_delta_success_builds_scoped_secret_free_live_delta() {
         let server = MockServer::start().await;
         mount_models_json(
@@ -4640,6 +4741,16 @@ mod tests {
             "rows from the prior success must survive a failed refresh"
         );
         assert!(matches!(cached.status, CatalogStatus::Failed { .. }));
+
+        // #4139: failed/stale rows must still publish into ProviderLake so
+        // pickers keep live coverage instead of dropping back to bundled-only.
+        let visible = cache.all_visible_offerings(now_unix());
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].wire_model_id, "synthetic-model-gamma");
+        assert!(
+            cache.all_fresh_offerings(now_unix()).is_empty(),
+            "Failed entries are not fresh, but they remain visible"
+        );
     }
 
     #[tokio::test]

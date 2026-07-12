@@ -89,6 +89,31 @@ fn workflow_tool_renders_run_card_instead_of_generic_oneliner() {
         "workflow_goal": "audit the FLEET and WORKFLOW docs",
         "child_ids": ["a1", "a2", "a3"],
         "progress": ["phase: Scan", "log: 3 findings"],
+        "events": [
+            {
+                "type": "task_started",
+                "task_id": "a1",
+                "label": "scan-docs",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_phase_id": "Scan",
+                "workflow_task_label": "scan-docs",
+                "workflow_child_index": 0,
+            },
+            {
+                "type": "task_started",
+                "task_id": "a2",
+                "workflow_task_label": "check-fleet",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_child_index": 1,
+            },
+            {
+                "type": "task_started",
+                "task_id": "a3",
+                "label": "summarize",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_child_index": 2,
+            },
+        ],
         "schema_errors": [],
     })
     .to_string();
@@ -107,19 +132,108 @@ fn workflow_tool_renders_run_card_instead_of_generic_oneliner() {
         .iter()
         .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
         .collect();
-    assert!(joined.contains("workflow_2400c600"), "run_id: {joined:?}");
-    // Copy dedupe (Wave 5c #7): the header owns the lifecycle label; the body
-    // no longer repeats it as a `status:` KV row.
-    assert!(joined.contains("done"), "header lifecycle: {joined:?}");
+    // Compact (#4122): lifecycle, children, phases, failures, elapsed.
+    assert!(
+        joined.contains("3 children") || joined.contains("children"),
+        "child count: {joined:?}"
+    );
+    assert!(
+        joined.contains("success") || joined.contains("done"),
+        "header lifecycle: {joined:?}"
+    );
+    assert!(joined.contains("phase"), "phase count: {joined:?}");
+    assert!(joined.contains("fail"), "failure count present: {joined:?}");
+    assert!(
+        joined.contains('s') || joined.contains('m'),
+        "elapsed: {joined:?}"
+    );
     assert!(
         !joined.contains("status:"),
         "body must not repeat the header lifecycle: {joined:?}"
     );
-    assert!(joined.contains("audit the FLEET"), "goal: {joined:?}");
-    assert!(joined.contains("children: 3"), "child count: {joined:?}");
+}
+
+#[test]
+fn workflow_tool_expanded_card_shows_phase_child_result_and_failures() {
+    let output = serde_json::json!({
+        "run_id": "workflow_exp",
+        "status": "failed",
+        "workflow_goal": "ship v0.8.68",
+        "started_at_ms": 1000,
+        "completed_at_ms": 5000,
+        "source_path": "workflows/demo.workflow.js",
+        "error": "phase Verify failed",
+        "result": {"summary": "2 of 3 children ok"},
+        "events": [
+            {
+                "type": "run_started",
+                "at_ms": 1000,
+                "run_id": "workflow_exp",
+                "workflow_goal": "ship v0.8.68"
+            },
+            {"type": "phase_started", "at_ms": 1100, "title": "Verify"},
+            {
+                "type": "task_started",
+                "at_ms": 1200,
+                "task_id": "t1",
+                "label": "run tests",
+                "workflow_task_label": "run tests",
+                "profile": "implementer"
+            },
+            {
+                "type": "task_completed",
+                "at_ms": 4000,
+                "task_id": "t1",
+                "status": "failed"
+            },
+            {
+                "type": "run_completed",
+                "at_ms": 5000,
+                "status": "failed",
+                "error": "phase Verify failed"
+            }
+        ]
+    })
+    .to_string();
+    let cell = GenericToolCell {
+        name: "workflow".to_string(),
+        status: ToolStatus::Failed,
+        input_summary: Some("action: run".to_string()),
+        output: Some(output),
+        prompts: None,
+        spillover_path: Some(std::path::PathBuf::from("/tmp/wf-artifact.json")),
+        output_summary: None,
+        is_diff: false,
+    };
+    let joined: String = cell
+        .lines_with_mode(140, true, super::RenderMode::Transcript)
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("ship v0.8.68"), "goal: {joined}");
     assert!(
-        joined.contains("log: 3 findings"),
-        "last progress: {joined:?}"
+        joined.contains("phases:") || joined.contains("Verify"),
+        "phase: {joined}"
+    );
+    assert!(
+        joined.contains("children:") || joined.contains("child"),
+        "child: {joined}"
+    );
+    assert!(joined.contains("run tests"), "child label: {joined}");
+    assert!(
+        joined.contains("result:") || joined.contains("2 of 3"),
+        "final result: {joined}"
+    );
+    assert!(
+        joined.contains("artifact:")
+            || joined.contains("source:")
+            || joined.contains("transcript:"),
+        "links: {joined}"
+    );
+    assert!(
+        joined.contains("error:") || joined.contains("phase Verify failed"),
+        "failure details: {joined}"
     );
 }
 
@@ -347,7 +461,8 @@ fn extract_agent_id_returns_none_for_empty_id() {
 }
 
 #[test]
-fn agent_renders_single_compact_line_in_live_mode() {
+fn agent_spawn_suppresses_generic_card_in_live_mode() {
+    // #4133: spawn cards yield entirely to DelegateCard — no generic tool row.
     let cell = GenericToolCell {
         name: "agent".to_string(),
         status: ToolStatus::Running,
@@ -362,19 +477,38 @@ fn agent_renders_single_compact_line_in_live_mode() {
         is_diff: false,
     };
     let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
-    // One header line, no details/args/output expansion.
+    assert!(
+        lines.is_empty(),
+        "spawn generic tool card must be suppressed: {lines:?}"
+    );
+}
+
+#[test]
+fn agent_inspection_renders_single_compact_line_in_live_mode() {
+    let cell = GenericToolCell {
+        name: "agent".to_string(),
+        status: ToolStatus::Running,
+        input_summary: Some("action: peek agent_id: agent-abc12".to_string()),
+        output: Some(
+            r#"{"agent_id": "agent-abc12", "nickname": "Beluga", "model": "deepseek-v4-flash"}"#
+                .to_string(),
+        ),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+    let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
     assert_eq!(lines.len(), 1, "expected exactly 1 line, got {lines:?}");
     let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-    // Header carries the agent id and the running status.
     assert!(
         rendered.contains("agent-abc12"),
         "expected agent id in header: {rendered:?}"
     );
     assert!(
-        rendered.contains("running"),
-        "expected status in header: {rendered:?}"
+        rendered.contains("checking"),
+        "expected inspection status in header: {rendered:?}"
     );
-    // No verbose `args:` / `name:` rows.
     assert!(
         !rendered.contains("args"),
         "args should be hidden: {rendered:?}"
@@ -382,30 +516,32 @@ fn agent_renders_single_compact_line_in_live_mode() {
 }
 
 #[test]
-fn agent_pending_render_uses_fallback_token() {
+fn agent_pending_inspection_uses_fallback_token() {
+    // Pending inspection (no agent_id yet) still renders a compact check line.
     let cell = GenericToolCell {
         name: "agent".to_string(),
         status: ToolStatus::Running,
-        input_summary: Some("prompt: do thing".to_string()),
+        input_summary: Some("action: peek prompt: do thing".to_string()),
         output: None,
         prompts: None,
         spillover_path: None,
         output_summary: None,
         is_diff: false,
     };
-    let rendered: String = cell.lines_with_mode(80, true, super::RenderMode::Live)[0]
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect();
-    assert!(rendered.contains("do-thing"), "{rendered:?}");
+    let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
+    assert_eq!(lines.len(), 1, "inspection must stay compact: {lines:?}");
+    let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        rendered.contains("checking") || rendered.contains("subagent"),
+        "{rendered:?}"
+    );
     assert!(!rendered.contains('\u{2026}'), "{rendered:?}");
 }
 
 #[test]
-fn agent_transcript_mode_keeps_full_block() {
-    // Transcript mode is for replay/debug — preserve the full block
-    // so session export still carries the args/output verbatim.
+fn agent_spawn_suppresses_generic_card_in_transcript_mode() {
+    // #4133: spawn cards are suppressed in both Live and Transcript; DelegateCard
+    // is the sole visible spawn artifact.
     let cell = GenericToolCell {
         name: "agent".to_string(),
         status: ToolStatus::Success,
@@ -417,9 +553,10 @@ fn agent_transcript_mode_keeps_full_block() {
         is_diff: false,
     };
     let lines = cell.lines_with_mode(80, true, super::RenderMode::Transcript);
-    // Transcript mode emits header + name kv + (no args, output present)
-    // + output rows. At minimum more than the live one-liner.
-    assert!(lines.len() > 1, "expected verbose transcript render");
+    assert!(
+        lines.is_empty(),
+        "spawn generic tool card must be suppressed in transcript: {lines:?}"
+    );
 }
 
 #[test]
@@ -442,23 +579,21 @@ fn other_tools_are_unaffected_by_agent_compact_path() {
 
 #[test]
 fn agent_compact_header_omits_unknown_child_fallback() {
-    // #4148: an agent whose identity can't be resolved must not leak the raw
-    // internal "unknown child" token into the default transcript.
+    // #4148: an inspection whose identity can't be resolved must not leak the
+    // raw internal "unknown child" token into the default transcript.
     let cell = GenericToolCell {
         name: "agent".to_string(),
         status: ToolStatus::Running,
-        input_summary: Some("agent_type: delegate".to_string()),
+        input_summary: Some("action: peek agent_type: delegate".to_string()),
         output: None,
         prompts: None,
         spillover_path: None,
         output_summary: None,
         is_diff: false,
     };
-    let rendered: String = cell.lines_with_mode(80, true, super::RenderMode::Live)[0]
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect();
+    let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
+    assert_eq!(lines.len(), 1, "inspection must stay compact: {lines:?}");
+    let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(
         !rendered.contains("unknown child"),
         "raw fallback token must not leak: {rendered:?}"
@@ -472,28 +607,24 @@ fn agent_compact_header_omits_unknown_child_fallback() {
 #[test]
 fn agent_compact_header_does_not_duplicate_delegate_verb() {
     // #4148: when the resolved identity collapses to the "delegate" verb, the
-    // compact header must not render a redundant "delegate · delegate".
+    // compact inspection header must not render a redundant "delegate · delegate".
     let cell = GenericToolCell {
         name: "agent".to_string(),
         status: ToolStatus::Running,
-        input_summary: Some("role: delegate".to_string()),
+        input_summary: Some("action: peek role: delegate".to_string()),
         output: None,
         prompts: None,
         spillover_path: None,
         output_summary: None,
         is_diff: false,
     };
-    let rendered: String = cell.lines_with_mode(80, true, super::RenderMode::Live)[0]
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect();
+    let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
+    assert_eq!(lines.len(), 1, "inspection must stay compact: {lines:?}");
+    let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(
         !rendered.contains("delegate delegate"),
         "no adjacent duplicate: {rendered:?}"
     );
-    // The verb sits before the status; the redundant summary tail is dropped,
-    // so "delegate" appears exactly once.
     assert_eq!(
         rendered.matches("delegate").count(),
         1,
@@ -1338,10 +1469,12 @@ fn exec_cell_header_includes_compact_command_summary() {
 
 #[test]
 fn generic_tool_cell_picks_family_from_tool_name() {
+    // Use an inspection call so the compact Delegate header still renders;
+    // spawn cards are suppressed entirely (#4133).
     let cell = GenericToolCell {
         name: "agent".to_string(),
         status: ToolStatus::Running,
-        input_summary: Some("foo".to_string()),
+        input_summary: Some("action: peek foo".to_string()),
         output: None,
         prompts: None,
         spillover_path: None,
@@ -1349,6 +1482,7 @@ fn generic_tool_cell_picks_family_from_tool_name() {
         is_diff: false,
     };
     let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
+    assert_eq!(lines.len(), 1, "inspection must stay compact: {lines:?}");
     let header_visible: String = lines[0]
         .spans
         .iter()
@@ -1637,7 +1771,7 @@ fn plan_update_cell_renders_rich_artifact_metadata() {
             context_summary: Some("Grounded in issue #2691".to_string()),
             sources_used: vec!["gh issue view 2691".to_string()],
             critical_files: vec!["crates/tui/src/tools/plan.rs".to_string()],
-            constraints: vec!["Keep checklist primary".to_string()],
+            constraints: vec!["Keep To-do primary".to_string()],
             recommended_approach: Some(
                 "Enrich update_plan without breaking legacy calls".to_string(),
             ),
@@ -2746,4 +2880,128 @@ fn tool_run_summary_uses_metadata_fallback_for_unknown_groups() {
     };
 
     assert_eq!(super::tool_run_summary(&run), "Updated metadata");
+}
+
+// ---- #4112 / dogfood A5: transcript noise ----
+
+fn agent_cell(
+    action_summary: Option<&str>,
+    status: ToolStatus,
+    output: Option<&str>,
+) -> GenericToolCell {
+    GenericToolCell {
+        name: "agent".to_string(),
+        status,
+        input_summary: action_summary.map(str::to_string),
+        output: output.map(str::to_string),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    }
+}
+
+fn joined_lines(cell: &GenericToolCell, mode: super::RenderMode) -> String {
+    cell.lines_with_mode(120, true, mode)
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+        .collect()
+}
+
+#[test]
+fn unknown_tool_failure_collapses_to_one_line() {
+    let cell = GenericToolCell {
+        name: "item".to_string(),
+        status: ToolStatus::Failed,
+        input_summary: Some("status: pending".to_string()),
+        output: Some(
+            "Tool 'item' is not available in the current tool catalog. \
+             Checklist entries are not separate tool calls."
+                .to_string(),
+        ),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+    for mode in [super::RenderMode::Live, super::RenderMode::Transcript] {
+        let lines = cell.lines_with_mode(120, true, mode);
+        assert_eq!(
+            lines.len(),
+            1,
+            "unknown-tool failure should be a single header line in {mode:?}: {lines:?}"
+        );
+        let joined = joined_lines(&cell, mode);
+        assert!(
+            joined.contains("Tool 'item' is not available"),
+            "the catalog error is the useful part: {joined:?}"
+        );
+        assert!(
+            !joined.contains("name: item"),
+            "no name:/args:/result: block for unknown tools: {joined:?}"
+        );
+    }
+}
+
+#[test]
+fn agent_peek_renders_checked_not_done() {
+    let cell = agent_cell(
+        Some("action: peek agent_id: agent_scout_1"),
+        ToolStatus::Success,
+        Some(r#"{"agent_id":"agent_scout_1","status":"running"}"#),
+    );
+    let joined = joined_lines(&cell, super::RenderMode::Live);
+    assert!(
+        joined.contains("checked") && joined.contains("agent_scout_1"),
+        "peek should read as a check, not a completed delegate: {joined:?}"
+    );
+    assert!(
+        !joined.contains("delegate done"),
+        "peek must not draw the spawn-completion line: {joined:?}"
+    );
+}
+
+#[test]
+fn agent_wait_renders_waited_label() {
+    let cell = agent_cell(
+        Some("action: wait"),
+        ToolStatus::Success,
+        Some(r#"{"action":"wait","settled":[{"agent_id":"agent_scout_1"}]}"#),
+    );
+    let joined = joined_lines(&cell, super::RenderMode::Live);
+    assert!(
+        joined.contains("waited"),
+        "wait cells should read as a join: {joined:?}"
+    );
+}
+
+#[test]
+fn agent_inspection_stays_compact_in_transcript_mode() {
+    let cell = agent_cell(
+        Some("action: status agent_id: agent_scout_1"),
+        ToolStatus::Success,
+        Some(r#"{"agent_id":"agent_scout_1","status":"running","terminal":false}"#),
+    );
+    let lines = cell.lines_with_mode(120, true, super::RenderMode::Transcript);
+    assert_eq!(
+        lines.len(),
+        1,
+        "status checks should not dump full projections in the pager: {lines:?}"
+    );
+}
+
+#[test]
+fn agent_spawn_suppresses_generic_card_in_favor_of_delegate_card() {
+    let cell = agent_cell(
+        Some("prompt: map the repo"),
+        ToolStatus::Success,
+        Some(r#"{"agent_id":"agent_scout_1","status":"running"}"#),
+    );
+    for mode in [super::RenderMode::Live, super::RenderMode::Transcript] {
+        let lines = cell.lines_with_mode(120, true, mode);
+        assert!(
+            lines.is_empty(),
+            "spawn generic tool card must yield to DelegateCard (#4133): {mode:?} {lines:?}"
+        );
+    }
 }

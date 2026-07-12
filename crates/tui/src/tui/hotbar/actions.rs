@@ -571,36 +571,22 @@ impl HotbarActionSource for BuiltinHotbarActionSource {
             "mode.plan",
             "plan",
             "Plan mode",
-            "Switch the conversation into Plan mode.",
+            "Think through a plan before acting.",
             AppHotbarKind::Mode(AppMode::Plan),
         ));
         registry.register(AppHotbarAction::new(
             "mode.agent",
             "agent",
             "Act mode",
-            "Switch the conversation into Act (Agent) mode.",
+            "Do direct work in the current session.",
             AppHotbarKind::Mode(AppMode::Agent),
-        ));
-        registry.register(AppHotbarAction::new(
-            "mode.multitask",
-            "multi",
-            "Multitask mode",
-            "Switch into Multitask delegation mode.",
-            AppHotbarKind::Mode(AppMode::Multitask),
         ));
         registry.register(AppHotbarAction::new(
             "mode.operate",
             "operate",
             "Operate mode",
-            "Switch into Operate fleet/workflow conductor mode.",
+            "Manage Fleet workers, subagents, and workflow lanes.",
             AppHotbarKind::Mode(AppMode::Operate),
-        ));
-        registry.register(AppHotbarAction::new(
-            "mode.yolo",
-            "yolo",
-            "YOLO (deprecated)",
-            "Legacy shim: Act mode with Full Access permissions.",
-            AppHotbarKind::Mode(AppMode::Yolo),
         ));
         registry.register(AppHotbarAction::new(
             "reasoning.cycle",
@@ -922,7 +908,8 @@ impl AppHotbarAction {
             AppHotbarKind::Mode(AppMode::Plan) => MessageId::HotbarActionModePlanName,
             AppHotbarKind::Mode(AppMode::Agent) => MessageId::HotbarActionModeAgentName,
             AppHotbarKind::Mode(AppMode::Yolo) => MessageId::HotbarActionModeYoloName,
-            AppHotbarKind::Mode(AppMode::Auto | AppMode::Multitask | AppMode::Operate) => {
+            AppHotbarKind::Mode(AppMode::Operate) => MessageId::HotbarActionModeOperateName,
+            AppHotbarKind::Mode(AppMode::Auto) => {
                 return None;
             }
             AppHotbarKind::ReasoningCycle => MessageId::HotbarActionReasoningCycleName,
@@ -940,7 +927,8 @@ impl AppHotbarAction {
             AppHotbarKind::Mode(AppMode::Plan) => MessageId::HotbarActionModePlanDescription,
             AppHotbarKind::Mode(AppMode::Agent) => MessageId::HotbarActionModeAgentDescription,
             AppHotbarKind::Mode(AppMode::Yolo) => MessageId::HotbarActionModeYoloDescription,
-            AppHotbarKind::Mode(AppMode::Auto | AppMode::Multitask | AppMode::Operate) => {
+            AppHotbarKind::Mode(AppMode::Operate) => MessageId::HotbarActionModeOperateDescription,
+            AppHotbarKind::Mode(AppMode::Auto) => {
                 return None;
             }
             AppHotbarKind::ReasoningCycle => MessageId::HotbarActionReasoningCycleDescription,
@@ -1069,15 +1057,17 @@ impl HotbarAction for AppHotbarAction {
                 Ok(HotbarDispatch::Handled)
             }
             AppHotbarKind::PaletteOpen => {
-                app.view_stack
-                    .push(CommandPaletteView::new(build_command_palette_entries(
+                app.view_stack.push(CommandPaletteView::new_for_locale(
+                    app.ui_locale,
+                    build_command_palette_entries(
                         app.ui_locale,
                         &app.skills_dir,
                         app.skills_scan_codewhale_only,
                         &app.workspace,
                         &app.mcp_config_path,
                         app.mcp_snapshot.as_ref(),
-                    )));
+                    ),
+                ));
                 Ok(HotbarDispatch::Handled)
             }
             AppHotbarKind::TrustToggle => {
@@ -1456,7 +1446,11 @@ mod tests {
 
     use super::*;
 
-    fn test_app_with_paths(workspace: PathBuf, skills_dir: PathBuf) -> App {
+    fn test_app_with_paths_and_config(
+        workspace: PathBuf,
+        skills_dir: PathBuf,
+        config: &Config,
+    ) -> App {
         let options = TuiOptions {
             model: "deepseek-v4-pro".to_string(),
             workspace,
@@ -1478,9 +1472,13 @@ mod tests {
             resume_session_id: None,
             initial_input: None,
         };
-        let mut app = App::new(options, &Config::default());
+        let mut app = App::new(options, config);
         app.ui_locale = crate::localization::Locale::En;
         app
+    }
+
+    fn test_app_with_paths(workspace: PathBuf, skills_dir: PathBuf) -> App {
+        test_app_with_paths_and_config(workspace, skills_dir, &Config::default())
     }
 
     fn test_app() -> App {
@@ -1992,7 +1990,7 @@ mod tests {
                 (2, Some("compact")),
                 (3, Some("plan")),
                 (4, Some("agent")),
-                (5, Some("yolo")),
+                (5, Some("operate")),
                 (6, Some("palette")),
                 (7, Some("side")),
                 (8, Some("trust")),
@@ -2020,10 +2018,8 @@ mod tests {
             vec![
                 "filetree.toggle",
                 "mode.agent",
-                "mode.multitask",
                 "mode.operate",
                 "mode.plan",
-                "mode.yolo",
                 "palette.open",
                 "reasoning.cycle",
                 "session.compact",
@@ -2204,9 +2200,14 @@ mod tests {
             "---\nname: hotbar-demo-skill\ndescription: Demo skill for hotbar tests\n---\n\nFollow the demo instructions.\n",
         )
         .expect("write SKILL.md");
-        let mut app = test_app_with_paths(
+        let config = Config {
+            skills_dir: Some(skills_dir.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        let mut app = test_app_with_paths_and_config(
             workspace.path().to_path_buf(),
             skills_dir.path().to_path_buf(),
+            &config,
         );
 
         let action = app
@@ -2330,11 +2331,12 @@ mod tests {
         let registry = HotbarActionRegistry::with_builtins();
         let plan = registry.get("mode.plan").expect("plan action");
         let agent = registry.get("mode.agent").expect("agent action");
-        let yolo = registry.get("mode.yolo").expect("yolo action");
+        let operate = registry.get("mode.operate").expect("operate action");
         let mut app = test_app();
 
         assert!(agent.is_active(&app));
         assert!(!plan.is_active(&app));
+        assert!(registry.get("mode.yolo").is_none());
 
         assert_eq!(
             plan.dispatch(&mut app).expect("dispatch plan"),
@@ -2345,16 +2347,12 @@ mod tests {
         assert!(!agent.is_active(&app));
 
         assert_eq!(
-            yolo.dispatch(&mut app).expect("dispatch yolo"),
-            HotbarDispatch::AppAction(AppAction::ModeChanged(AppMode::Yolo))
+            operate.dispatch(&mut app).expect("dispatch operate"),
+            HotbarDispatch::AppAction(AppAction::ModeChanged(AppMode::Operate))
         );
-        assert!(app.allow_shell);
-        assert!(app.trust_mode);
-        // YOLO is a legacy compatibility alias: entering it resolves to Agent
-        // mode with the bypass mirrors set, so the Agent action lights up.
-        assert_eq!(app.mode, AppMode::Agent);
-        assert!(app.yolo);
-        assert!(agent.is_active(&app));
+        assert_eq!(app.mode, AppMode::Operate);
+        assert!(operate.is_active(&app));
+        assert!(!agent.is_active(&app));
     }
 
     #[test]

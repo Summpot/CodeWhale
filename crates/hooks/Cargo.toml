@@ -1,6 +1,6 @@
 [package]
 name = "codewhale-hooks"
-version = "0.8.67"
+version = "0.8.68"
 edition.workspace = true
 license = "MIT"
 repository = "https://github.com/Hmbown/CodeWhale"
@@ -11,6 +11,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 codewhale-protocol.workspace = true
+codewhale-release.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

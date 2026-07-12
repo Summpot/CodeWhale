@@ -17,6 +17,8 @@ pub use traits::CommandInfo;
 
 // Long-standing public paths that predate the group layout.
 pub use groups::project::share;
+#[cfg(test)]
+pub(crate) use groups::session::rename_with_manager as rename_session_with_manager;
 
 // Voice capture plumbing shared with the hotbar and the UI event loop.
 pub use groups::core::voice;
@@ -85,7 +87,7 @@ static REGISTRY: OnceLock<traits::CommandRegistry> = OnceLock::new();
 
 fn build_registry() -> traits::CommandRegistry {
     let mut registry = traits::CommandRegistry::empty();
-    for group in groups::all_command_groups() {
+    for &group in groups::all_command_groups() {
         registry.register_group(group);
     }
     registry
@@ -444,6 +446,17 @@ mod tests {
     }
 
     #[test]
+    fn xai_device_auth_slash_command_starts_login() {
+        let mut app = create_test_app();
+        let result = execute("/auth xai-device", &mut app);
+        assert!(!result.is_error);
+        assert!(matches!(
+            result.action,
+            Some(AppAction::StartXaiDeviceLogin)
+        ));
+    }
+
+    #[test]
     fn rlm_slash_command_routes_to_persistent_tool_instruction() {
         let mut app = create_test_app();
         let result = execute("/rlm 2 inspect this long corpus", &mut app);
@@ -488,9 +501,9 @@ mod tests {
                 critical_files: vec!["crates/tui/src/commands/mod.rs".to_string()],
                 constraints: vec!["Do not invent verification".to_string()],
                 verification_plan: Some("Check relay prompt assertions".to_string()),
-                handoff_packet: Some("Next thread should read the Work checklist".to_string()),
+                handoff_packet: Some("Next thread should read the To-do list".to_string()),
                 plan: vec![PlanItemArg {
-                    step: "keep checklist primary".to_string(),
+                    step: "keep To-do primary".to_string(),
                     status: StepStatus::InProgress,
                 }],
                 ..UpdatePlanArgs::default()
@@ -516,7 +529,7 @@ mod tests {
         assert!(message.contains("Requested relay focus: verify install"));
         assert!(message.contains("Goal objective: Unify the work surface"));
         assert!(message.contains("Goal token budget: 12000"));
-        assert!(message.contains("Work checklist (primary progress surface, 50% complete)"));
+        assert!(message.contains("To-do (primary progress surface, 50% complete)"));
         assert!(message.contains("#1 [completed] inspect workspace"));
         assert!(message.contains("#2 [in_progress] patch relay command"));
         assert!(message.contains("Optional strategy metadata from update_plan"));
@@ -526,8 +539,12 @@ mod tests {
         assert!(message.contains("Critical file: crates/tui/src/commands/mod.rs"));
         assert!(message.contains("Constraint: Do not invent verification"));
         assert!(message.contains("Verification plan: Check relay prompt assertions"));
-        assert!(message.contains("Handoff packet: Next thread should read the Work checklist"));
-        assert!(message.contains("[in_progress] keep checklist primary"));
+        assert!(message.contains("Handoff packet: Next thread should read the To-do list"));
+        assert!(message.contains("[in_progress] keep To-do primary"));
+        assert!(
+            !message.contains("Work checklist"),
+            "relay copy should use To-do vocabulary: {message}"
+        );
     }
 
     #[test]
@@ -608,13 +625,13 @@ mod tests {
         let mut total_commands = 0;
         let mut has_config = false;
         let mut has_debug = false;
-        for group in &groups {
+        for &group in groups {
             let commands = group.commands();
             assert!(
                 !commands.is_empty(),
                 "each group must have at least one command"
             );
-            for cmd in &commands {
+            for cmd in commands {
                 let info = cmd.info();
                 assert!(!info.name.is_empty(), "command name must not be empty");
                 assert!(
@@ -640,9 +657,9 @@ mod tests {
                 has_config = true;
                 assert_eq!(
                     commands.len(),
-                    11,
+                    12,
                     "config group (group-local metadata exception) expected \
-                     exactly 11 commands, got {}",
+                     exactly 12 commands, got {}",
                     commands.len()
                 );
             }
@@ -674,6 +691,25 @@ mod tests {
             command_infos().len(),
             "group-iterated command count must match registry infos count"
         );
+    }
+
+    #[test]
+    fn command_groups_are_cached_once() {
+        let first_groups = groups::all_command_groups();
+        let second_groups = groups::all_command_groups();
+        assert!(
+            std::ptr::eq(first_groups.as_ptr(), second_groups.as_ptr()),
+            "command group list should be cached"
+        );
+
+        for &group in first_groups {
+            let first_commands = group.commands();
+            let second_commands = group.commands();
+            assert!(
+                std::ptr::eq(first_commands.as_ptr(), second_commands.as_ptr()),
+                "command list should be cached per group"
+            );
+        }
     }
 
     #[test]
@@ -956,6 +992,14 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(app.sidebar_focus, SidebarFocus::Tasks);
         assert!(app.status_message.is_none());
+
+        let result = execute("/sidebar activity", &mut app);
+        assert!(!result.is_error);
+        assert_eq!(
+            app.sidebar_focus,
+            SidebarFocus::Tasks,
+            "activity is the user-facing alias for the Activity panel"
+        );
 
         let result = execute("/sidebar off", &mut app);
         assert!(!result.is_error);

@@ -18,6 +18,7 @@ use crate::tools::spec::{ToolError, ToolResult, optional_str, optional_u64, requ
 use crate::tui::app::AppMode;
 
 use crate::dependencies::ExternalTool;
+use crate::regex_cache::compile_user_regex;
 
 pub(super) const MULTI_TOOL_PARALLEL_NAME: &str = "multi_tool_use.parallel";
 pub(super) const REQUEST_USER_INPUT_NAME: &str = "request_user_input";
@@ -41,7 +42,6 @@ pub(super) fn is_tool_search_tool(name: &str) -> bool {
 pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     "agent",
     "apply_patch",
-    "checklist_write",
     "edit_file",
     "exec_interact",
     "exec_shell",
@@ -65,6 +65,7 @@ pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     "update_plan",
     "wait_for_dev_server",
     "web_search",
+    "work_update",
     "write_file",
 ];
 
@@ -424,7 +425,7 @@ fn unavailable_core_action_tools_with_regex(
     if max_results == 0 {
         return Ok(Vec::new());
     }
-    let regex = regex::Regex::new(query)
+    let regex = compile_user_regex(query)
         .map_err(|err| ToolError::invalid_input(format!("Invalid regex query: {err}")))?;
     Ok(cached_fallbacks()
         .iter()
@@ -485,7 +486,7 @@ fn discover_tools_with_regex(
     query: &str,
     max_results: usize,
 ) -> Result<Vec<String>, ToolError> {
-    let regex = regex::Regex::new(query)
+    let regex = compile_user_regex(query)
         .map_err(|err| ToolError::invalid_input(format!("Invalid regex query: {err}")))?;
 
     let mut matches = Vec::new();
@@ -658,6 +659,21 @@ pub(super) fn tool_catalog_consistency_issues(
 }
 
 pub(super) fn missing_tool_error_message(tool_name: &str, catalog: &[Tool]) -> String {
+    // Dogfood A5 (#4092): models mid-checklist sometimes emit each list entry
+    // as its own tool call named `item`/`todo`/... . Fuzzy suggestions are
+    // actively misleading there ("Did you mean: note, tts?"); name the actual
+    // fix instead.
+    if matches!(
+        tool_name,
+        "item" | "items" | "todo" | "todos" | "checklist" | "checklist_item" | "plan_item"
+    ) {
+        return format!(
+            "Tool '{tool_name}' is not available in the current tool catalog. \
+             Checklist entries are not separate tool calls — write the whole list \
+             in one `work_update` call with a `todos` array of \
+             {{content, status}} objects."
+        );
+    }
     let suggestions = suggest_tool_names(catalog, tool_name, 3);
     let shell_hint = if is_shell_tool_name(tool_name) {
         Some(shell_tool_allow_shell_hint())
@@ -695,7 +711,7 @@ pub(super) fn missing_tool_error_message(tool_name: &str, catalog: &[Tool]) -> S
 fn shell_tool_allow_shell_hint() -> &'static str {
     "Shell tools are absent because this session or profile disabled shell access, \
      commonly via top-level `allow_shell = false` or Plan mode. \
-     Interactive Agent mode exposes shell by default with approval gating unless disabled. \
+     Interactive Act mode exposes shell by default with approval gating unless disabled. \
      Run `/config allow_shell true` for this session or add `--save` for future sessions; \
      the next turn will expose shell again"
 }
@@ -920,9 +936,9 @@ fn likely_field_corrections(
     } else if has_received("replacement") && has_expected("replace") {
         corrections.push("replacement -> replace".to_string());
     }
-    if tool_name == "checklist_update" && has_received("todos") {
+    if matches!(tool_name, "checklist_update" | "todo_update") && has_received("todos") {
         corrections.push(
-            "Use checklist_write to replace the full list, or retry checklist_update with id and status."
+            "Use work_update to replace the full list, or retry checklist_update/todo_update with id and status."
                 .to_string(),
         );
     }

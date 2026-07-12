@@ -3,8 +3,10 @@
 use std::cell::Cell;
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{
     Arc, LazyLock,
     atomic::{AtomicBool, Ordering},
@@ -50,7 +52,7 @@ use crate::commands;
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::config::{
     ApiProvider, Config, ProviderConfig, ProvidersConfig, StatusItem, UpdateConfig,
-    provider_capability, save_provider_auth_mode_for,
+    save_provider_auth_mode_for_at,
 };
 use crate::config_ui::{self, ConfigUiMode, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
@@ -65,7 +67,7 @@ use crate::prompts;
 use crate::route_runtime::{resolve_route_candidate, resolve_runtime_route};
 use crate::session_manager::{
     OfflineQueueState, QueuedSessionMessage, SavedSession, SessionManager,
-    create_saved_session_with_id_and_mode, create_saved_session_with_mode, update_session,
+    create_saved_session_with_id_and_mode, create_saved_session_with_mode,
 };
 use crate::settings::Settings;
 use crate::task_manager::{
@@ -116,7 +118,8 @@ use crate::tui::subagent_routing::{
 #[cfg(test)]
 use crate::tui::tool_routing::exploring_label;
 use crate::tui::tool_routing::{
-    handle_tool_call_complete, handle_tool_call_started, maybe_add_patch_preview,
+    apply_workflow_ui_event, handle_tool_call_complete, handle_tool_call_started,
+    maybe_add_patch_preview,
 };
 use crate::tui::ui_text::{history_cell_to_text, text_display_width};
 use crate::tui::user_input::UserInputView;
@@ -151,12 +154,17 @@ use super::widgets::{ChatWidget, ComposerWidget, HeaderData, HeaderWidget, Rende
 // import the ui-internal entry points used from this file's own body.
 pub(crate) use self::activity_detail::{
     copy_cell_to_clipboard, detail_target_label, open_details_pager_for_cell,
-    selected_detail_footer_label,
+    selected_detail_footer_label, turn_handoff_markdown,
 };
 use self::activity_detail::{
-    copy_focused_cell, detail_target_cell_index, extract_reasoning_header,
-    open_activity_detail_pager, open_tool_details_pager,
+    copy_focused_cell, detail_target_cell_index, extract_reasoning_header, open_tool_details_pager,
+    open_turn_inspector_pager,
 };
+// Ctrl+O now opens the whole-turn Turn Inspector (#4104); the single-cell
+// Activity Detail pager is no longer bound to a key, so it is only referenced
+// from tests. (`v` raw leaf detail keeps using `open_tool_details_pager`.)
+#[cfg(test)]
+use self::activity_detail::open_activity_detail_pager;
 
 // === Constants ===
 
@@ -194,7 +202,9 @@ const TOOL_HANG_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(600);
 // the per-tool spinner pulse — keep this fast enough that the whale-spout
 // braille pattern reads as continuous motion instead of teleport-frames.
 const UI_STATUS_ANIMATION_MS: u64 = crate::tui::spinner::BRAILLE_SPINNER_FRAME_MS;
-pub(crate) const SIDEBAR_VISIBLE_MIN_WIDTH: u16 = 64;
+// At an 80-column terminal the file tree owns 20 columns, leaving a 60-column
+// chat host. Keep a compact 20-column sidebar plus a 40-column transcript.
+pub(crate) const SIDEBAR_VISIBLE_MIN_WIDTH: u16 = 60;
 const DEFAULT_TERMINAL_PROBE_TIMEOUT_MS: u64 = 500;
 const PERIODIC_FULL_REPAINT_EVERY_N: u64 = 50;
 const TURN_META_PREFIX: &str = "<turn_meta>";
@@ -203,6 +213,10 @@ const VERSION_HINT_TOAST_TTL_MS: u64 = 12_000;
 
 const REQUIRED_RELEASE_ASSETS: &[&str] = &[
     "codewhale-artifacts-sha256.txt",
+    "codew-android-arm64",
+    "codewhale-android-arm64",
+    "codewhale-android-arm64.tar.gz",
+    "codewhale-tui-android-arm64",
     "codewhale-linux-arm64",
     "codewhale-linux-arm64.tar.gz",
     "codewhale-linux-x64",
@@ -903,15 +917,18 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
             };
 
         match load_result {
-            Ok(Some(saved)) => {
-                let recovered = apply_loaded_session(&mut app, config, &saved);
-                if !recovered {
+            Ok(Some(saved)) => match apply_loaded_session(&mut app, config, &saved) {
+                Ok(false) => {
                     app.status_message = Some(format!(
                         "Resumed session: {}",
                         crate::session_manager::truncate_id(&saved.metadata.id)
                     ));
                 }
-            }
+                Ok(true) => {}
+                Err(err) => {
+                    app.status_message = Some(format!("Failed to restore session: {err}"));
+                }
+            },
             Ok(None) => {
                 app.status_message = Some("No sessions found to resume".to_string());
             }
@@ -1052,10 +1069,13 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
     // Spawn the persistence actor so checkpoint/session-save I/O stays off
     // the UI thread.  The actor serialises + writes to disk in a dedicated
     // task; the UI just `try_send`s a request and returns immediately.
-    if let Ok(persist_manager) = SessionManager::default_location() {
-        let handle = persistence_actor::spawn_persistence_actor(persist_manager);
-        persistence_actor::init_actor(handle);
-    }
+    let persistence_runtime = SessionManager::default_location()
+        .ok()
+        .map(|persist_manager| {
+            let (handle, task) = persistence_actor::spawn_persistence_actor(persist_manager);
+            persistence_actor::init_actor(handle.clone());
+            (handle, task)
+        });
 
     submit_initial_input_if_ready(&mut app, config, &engine_handle).await?;
 
@@ -1080,8 +1100,11 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
     }
 
     // Flush the persistence actor: clear checkpoint + graceful shutdown.
-    persistence_actor::persist(PersistRequest::ClearCheckpoint);
-    persistence_actor::persist(PersistRequest::Shutdown);
+    if let Some((handle, task)) = persistence_runtime {
+        handle.try_send(PersistRequest::ClearCheckpoint);
+        handle.try_send(PersistRequest::Shutdown);
+        let _ = task.await;
+    }
 
     cleanup_guard.defused = true;
     pop_keyboard_enhancement_flags(terminal.backend_mut());
@@ -1565,9 +1588,11 @@ fn build_app_system_prompt(app: &App, config: &Config) -> SystemPrompt {
             locale_tag: app.ui_locale.tag(),
             translation_enabled: app.translation_enabled,
             model_id: &app.model,
-            context_window_override: Some(
-                provider_capability(app.api_provider, &app.model).context_window,
-            ),
+            context_window_override: Some(crate::route_budget::route_context_window_tokens(
+                app.api_provider,
+                &app.model,
+                app.active_route_limits,
+            )),
             show_thinking: app.show_thinking,
             verbosity: app.verbosity.as_deref(),
             skills_scan_codewhale_only: app.skills_scan_codewhale_only,
@@ -2114,10 +2139,18 @@ async fn run_event_loop(
             .try_lock()
             .ok()
             .and_then(|mut guard| guard.take());
-        if let Some((draft_gen, model_label, picked_route, outcome)) = fleet_draft_delivery
+        if let Some((draft_gen, model_label, picked_route, reasoning_effort, outcome)) =
+            fleet_draft_delivery
             && draft_gen == app.current_draft_gen()
         {
-            deliver_fleet_draft_result(app, model_label, picked_route, outcome, app.ui_locale);
+            deliver_fleet_draft_result(
+                app,
+                model_label,
+                picked_route,
+                reasoning_effort,
+                outcome,
+                app.ui_locale,
+            );
         }
 
         // Poll the constitution model-draft cell (same background pattern).
@@ -2495,6 +2528,7 @@ async fn run_event_loop(
                         app.is_loading = true;
                         app.offline_mode = false;
                         app.turn_error_posted = false;
+                        app.lsp_repair = crate::tui::app::LspRepairState::default();
                         app.prompt_suggestion = None;
                         app.prompt_suggestion_gen
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2807,12 +2841,17 @@ async fn run_event_loop(
                         // Auto-save completed turn and clear crash checkpoint.
                         // Offloaded to the persistence actor so the UI
                         // stays responsive.
-                        if let Ok(manager) = SessionManager::default_location() {
-                            let session = build_session_snapshot(app, &manager);
+                        let mut completed_snapshot_queued = false;
+                        if let Ok(manager) = SessionManager::default_location()
+                            && let Ok(session) = build_session_snapshot(app, &manager)
+                        {
                             app.current_session_id = Some(session.metadata.id.clone());
                             persistence_actor::persist(PersistRequest::SessionSnapshot(session));
+                            completed_snapshot_queued = true;
                         }
-                        persistence_actor::persist(PersistRequest::ClearCheckpoint);
+                        if completed_snapshot_queued {
+                            persistence_actor::persist(PersistRequest::ClearCheckpoint);
+                        }
 
                         // Refresh DeepSeek account balance after each completed
                         // turn so the footer balance chip stays current without
@@ -2919,7 +2958,7 @@ async fn run_event_loop(
                         model,
                         workspace,
                     } => {
-                        app.current_session_id = Some(session_id);
+                        app.current_session_id = Some(session_id.clone());
                         app.api_messages = messages;
                         app.system_prompt = system_prompt;
                         if app.auto_model {
@@ -2932,25 +2971,21 @@ async fn run_event_loop(
                         if (app.is_loading || app.is_compacting || app.is_purging)
                             && let Ok(manager) = SessionManager::default_location()
                         {
-                            let session = build_session_snapshot(app, &manager);
-                            app.session_title = Some(session.metadata.title.clone());
-                            persistence_actor::persist(PersistRequest::Checkpoint(session));
+                            if let Ok(session) = build_session_snapshot(app, &manager) {
+                                app.session_title = Some(session.metadata.title.clone());
+                                persistence_actor::persist(PersistRequest::Checkpoint(session));
+                            }
                         } else if app.session_title.is_none() {
-                            // First turn on a brand-new session: persist hasn't fired yet so
-                            // read the title from the session file if it already exists,
-                            // otherwise fall back to deriving from messages.
-                            let persisted = app
-                                .current_session_id
-                                .as_deref()
-                                .and_then(|id| {
-                                    SessionManager::default_location()
-                                        .ok()?
-                                        .load_session(id)
-                                        .ok()
-                                })
-                                .map(|s| s.metadata.title);
+                            // Never synchronously reload the growing session
+                            // JSON on the event-loop task just to recover a
+                            // title. The in-memory metadata cache is authoritative.
+                            let cached = app
+                                .current_session_metadata
+                                .as_ref()
+                                .filter(|metadata| metadata.id == session_id)
+                                .map(|metadata| metadata.title.clone());
                             app.session_title =
-                                persisted.or_else(|| derive_session_title(&app.api_messages));
+                                cached.or_else(|| derive_session_title(&app.api_messages));
                         }
                     }
                     EngineEvent::CompactionStarted { message, .. } => {
@@ -2993,6 +3028,35 @@ async fn run_event_loop(
                             if !description.is_empty() {
                                 app.last_prefix_change_desc = Some(description);
                             }
+                        }
+                    }
+                    EngineEvent::LspRepairUpdate {
+                        diagnostics_found,
+                        files,
+                        injected,
+                    } => {
+                        let repair = &mut app.lsp_repair;
+                        repair.diagnostics_found =
+                            repair.diagnostics_found.saturating_add(diagnostics_found);
+                        repair.files_touched = repair.files_touched.saturating_add(files);
+                        if injected {
+                            // Injection itself is not a repair attempt — the model
+                            // has only been shown the diagnostics so far (#4107).
+                            repair.injected = true;
+                            if repair.latest == "unavailable" || repair.latest.is_empty() {
+                                repair.latest = "unknown";
+                            }
+                        } else if repair.injected {
+                            // Diagnostics after a prior injection imply the model
+                            // edited again (a repair attempt). Zero findings = resolved.
+                            repair.repair_attempted = true;
+                            repair.latest = if diagnostics_found == 0 {
+                                "resolved"
+                            } else {
+                                "still_failing"
+                            };
+                        } else {
+                            repair.latest = "unknown";
                         }
                     }
                     EngineEvent::PauseEvents { ack } => {
@@ -3229,6 +3293,28 @@ async fn run_event_loop(
                             // AgentProgress redraw throttle.
                             received_engine_event = redraw_requested_before_event;
                         }
+                    }
+                    EngineEvent::WorkflowUi { run_id, event } => {
+                        // #4122: live typed workflow events → panel + history card.
+                        apply_workflow_ui_event(app, &run_id, &event);
+                        // #4095 residual: budget_updated is high-frequency under
+                        // multi-agent fan-out. Data is already applied; pace the
+                        // repaint like AgentProgress so the panel does not churn.
+                        let is_budget = event
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|t| t == "budget_updated");
+                        if is_budget {
+                            if workflow_budget_redraw_permitted(
+                                &mut app.last_workflow_budget_redraw,
+                                Instant::now(),
+                            ) {
+                                app.needs_redraw = true;
+                            } else {
+                                received_engine_event = redraw_requested_before_event;
+                            }
+                        }
+                        transcript_batch_updated = true;
                     }
                     EngineEvent::ApprovalRequired {
                         id,
@@ -3578,6 +3664,13 @@ async fn run_event_loop(
         let pending_bg_cost = crate::cost_status::drain();
         if pending_bg_cost.is_positive() {
             app.accrue_subagent_cost_estimate(pending_bg_cost);
+            app.needs_redraw = true;
+        }
+        // Drain completed file-tree walks (initial build / expands) so the
+        // spliced children repaint without waiting for an input event (#3900).
+        if let Some(tree) = app.file_tree.as_mut()
+            && tree.poll_background()
+        {
             app.needs_redraw = true;
         }
         // Expire the "Press Ctrl+C again to quit" prompt silently after its
@@ -3956,6 +4049,50 @@ async fn run_event_loop(
                 continue;
             }
 
+            // WorkflowPanel keyboard surface (#4121): after a click grants
+            // focus, t/space toggles expand, c/x cancels, j/k changes phase.
+            // Esc drops focus back to the composer without cancelling the run.
+            if app.view_stack.is_empty()
+                && app
+                    .workflow_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.keyboard_focus)
+            {
+                let mut handled = false;
+                match key.code {
+                    KeyCode::Esc => {
+                        if let Some(panel) = app.workflow_panel.as_mut() {
+                            panel.keyboard_focus = false;
+                        }
+                        app.needs_redraw = true;
+                        handled = true;
+                    }
+                    KeyCode::Char(ch)
+                        if key.modifiers == KeyModifiers::NONE
+                            || key.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        if let Some(panel) = app.workflow_panel.as_mut()
+                            && panel.handle_key(ch)
+                        {
+                            if matches!(ch, 'c' | 'C' | 'x' | 'X')
+                                && let Some(run_id) = panel.take_cancel_emit()
+                            {
+                                app.status_message = Some(format!(
+                                    "Cancelling workflow {run_id}… (dispatch via /workflow cancel {run_id})"
+                                ));
+                            }
+                            app.needs_redraw = true;
+                            handled = true;
+                        }
+                    }
+                    _ => {}
+                }
+                if handled {
+                    submit_initial_input_if_ready(app, config, &engine_handle).await?;
+                    continue;
+                }
+            }
+
             // Handle onboarding flow
             if app.onboarding != OnboardingState::None {
                 match key.code {
@@ -4175,19 +4312,21 @@ async fn run_event_loop(
                 if app.view_stack.is_empty() && app.kill_to_end_of_line() {
                     continue;
                 }
-                app.view_stack
-                    .push(CommandPaletteView::new(build_command_palette_entries(
+                app.view_stack.push(CommandPaletteView::new_for_locale(
+                    app.ui_locale,
+                    build_command_palette_entries(
                         app.ui_locale,
                         &app.skills_dir,
                         app.skills_scan_codewhale_only,
                         &app.workspace,
                         &app.mcp_config_path,
                         app.mcp_snapshot.as_ref(),
-                    )));
+                    ),
+                ));
                 continue;
             }
 
-            // y / Y in the Tasks sidebar: yank the current turn id (y)
+            // y / Y in the Activity sidebar: yank the current turn id (y)
             // or copy full task detail (Y) to the system clipboard.
             // Only active when the composer is empty to avoid stealing
             // keystrokes from typed input (#2000).
@@ -4449,7 +4588,7 @@ async fn run_event_loop(
                 KeyCode::Char('o')
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && app.input.is_empty()
-                        && open_activity_detail_pager(app) =>
+                        && open_turn_inspector_pager(app) =>
                 {
                     continue;
                 }
@@ -4514,7 +4653,7 @@ async fn run_event_loop(
                         && key_shortcuts::has_control_like_modifier(key.modifiers) =>
                 {
                     app.set_sidebar_focus(SidebarFocus::Tasks);
-                    app.status_message = Some("Sidebar focus: tasks".to_string());
+                    app.status_message = Some("Sidebar focus: activity".to_string());
                     continue;
                 }
                 KeyCode::Char('3')
@@ -4551,7 +4690,7 @@ async fn run_event_loop(
                         && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     app.set_sidebar_focus(SidebarFocus::Tasks);
-                    app.status_message = Some("Sidebar focus: tasks".to_string());
+                    app.status_message = Some("Sidebar focus: activity".to_string());
                     continue;
                 }
                 KeyCode::Char('#')
@@ -5722,6 +5861,7 @@ async fn handle_fleet_profile_model_draft(
     role: String,
     model: String,
     provider: Option<String>,
+    reasoning_effort: Option<String>,
     locale: crate::localization::Locale,
 ) {
     // The route the operator actually picked at `m`-press time (#4093). A
@@ -5744,6 +5884,7 @@ async fn handle_fleet_profile_model_draft(
                 app,
                 model_label.clone(),
                 picked_route.clone(),
+                reasoning_effort.clone(),
                 Err(format!("provider not ready: {err:#}")),
                 locale,
             );
@@ -5795,7 +5936,13 @@ async fn handle_fleet_profile_model_draft(
             Ok(result) => result,
         };
         if let Ok(mut guard) = cell.lock() {
-            *guard = Some((request_gen, spawn_label, picked_route, outcome));
+            *guard = Some((
+                request_gen,
+                spawn_label,
+                picked_route,
+                reasoning_effort,
+                outcome,
+            ));
         }
     });
 }
@@ -5813,6 +5960,7 @@ fn deliver_fleet_draft_result(
     app: &mut App,
     model_label: String,
     picked_route: Option<(String, String)>,
+    reasoning_effort: Option<String>,
     outcome: Result<Box<crate::fleet::profile::FleetProfileDraft>, String>,
     locale: crate::localization::Locale,
 ) {
@@ -5825,7 +5973,12 @@ fn deliver_fleet_draft_result(
                     .as_any_mut()
                     .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
                     .map(|wizard| {
-                        wizard.install_model_draft(draft, model_label.clone(), picked_route.clone())
+                        wizard.install_model_draft(
+                            draft,
+                            model_label.clone(),
+                            picked_route.clone(),
+                            reasoning_effort.clone(),
+                        )
                     })
                     .is_some();
                 app.view_stack.push_boxed(boxed);
@@ -5857,51 +6010,69 @@ fn deliver_fleet_draft_result(
 
 // `format_*` chip/message builders moved to `tui/format_helpers.rs`.
 
-fn build_session_snapshot(app: &App, manager: &SessionManager) -> SavedSession {
+fn build_session_snapshot(
+    app: &mut App,
+    _manager: &SessionManager,
+) -> Result<SavedSession, String> {
     let model = app.model_selection_for_persistence();
-    if let Some(ref existing_id) = app.current_session_id
-        && let Ok(existing) = manager.load_session(existing_id)
-    {
-        let mut updated = update_session(
-            existing,
+    let work_state = match app.try_work_state_snapshot() {
+        Ok(work_state) => work_state,
+        Err(err) => app.last_known_work_state.clone().ok_or_else(|| {
+            format!("automatic session snapshot skipped while Work state is busy: {err}")
+        })?,
+    };
+    let mut session = if let Some(existing_id) = app.current_session_id.as_ref() {
+        create_saved_session_with_id_and_mode(
+            existing_id.clone(),
             &app.api_messages,
+            &model,
+            &app.workspace,
             u64::from(app.session.total_tokens),
             app.system_prompt.as_ref(),
-        );
-        updated.metadata.model = model;
-        updated.metadata.model_provider = app.api_provider.as_str().to_string();
-        updated.metadata.mode = Some(app.mode.as_setting().to_string());
-        app.sync_cost_to_metadata(&mut updated.metadata);
-        updated.context_references = app.session_context_references.clone();
-        updated.artifacts = app.session_artifacts.clone();
-        updated
+            Some(app.mode.as_setting()),
+        )
     } else {
-        let mut session = if let Some(existing_id) = app.current_session_id.as_ref() {
-            create_saved_session_with_id_and_mode(
-                existing_id.clone(),
-                &app.api_messages,
-                &model,
-                &app.workspace,
-                u64::from(app.session.total_tokens),
-                app.system_prompt.as_ref(),
-                Some(app.mode.as_setting()),
-            )
-        } else {
-            create_saved_session_with_mode(
-                &app.api_messages,
-                &model,
-                &app.workspace,
-                u64::from(app.session.total_tokens),
-                app.system_prompt.as_ref(),
-                Some(app.mode.as_setting()),
-            )
-        };
-        session.metadata.model_provider = app.api_provider.as_str().to_string();
-        app.sync_cost_to_metadata(&mut session.metadata);
-        session.context_references = app.session_context_references.clone();
-        session.artifacts = app.session_artifacts.clone();
+        create_saved_session_with_mode(
+            &app.api_messages,
+            &model,
+            &app.workspace,
+            u64::from(app.session.total_tokens),
+            app.system_prompt.as_ref(),
+            Some(app.mode.as_setting()),
+        )
+    };
+    if let Some(cached) = app
+        .current_session_metadata
+        .as_ref()
+        .filter(|cached| cached.id == session.metadata.id)
+    {
+        session.metadata.created_at = cached.created_at;
+        session.metadata.title.clone_from(&cached.title);
         session
+            .metadata
+            .parent_session_id
+            .clone_from(&cached.parent_session_id);
+        session.metadata.forked_from_message_count = cached.forked_from_message_count;
     }
+    session.metadata.model_provider = app.api_provider.as_str().to_string();
+    app.sync_cost_to_metadata(&mut session.metadata);
+    session.context_references = app.session_context_references.clone();
+    session.artifacts = app.session_artifacts.clone();
+    session.work_state = work_state;
+    app.current_session_metadata = Some(session.metadata.clone());
+    Ok(session)
+}
+
+fn apply_picker_session_rename_to_active_app(
+    app: &mut App,
+    metadata: crate::session_manager::SessionMetadata,
+) -> bool {
+    if app.current_session_id.as_deref() != Some(metadata.id.as_str()) {
+        return false;
+    }
+    app.session_title = Some(metadata.title.clone());
+    app.current_session_metadata = Some(metadata);
+    true
 }
 
 fn queued_ui_to_session(msg: &QueuedMessage) -> QueuedSessionMessage {
@@ -6024,13 +6195,27 @@ fn turn_stall_watchdog_timeout(app: &App) -> Duration {
 /// written to disk, so `--continue` loads the *previous* save — effectively
 /// losing the entire in-progress turn.
 fn persist_recovery_snapshot(app: &mut App) {
-    if let Ok(manager) = SessionManager::default_location() {
-        let session = build_session_snapshot(app, &manager);
+    if let Ok(manager) = SessionManager::default_location()
+        && let Ok(session) = build_session_snapshot(app, &manager)
+    {
         if app.current_session_id.is_none() {
             app.current_session_id = Some(session.metadata.id.clone());
         }
         persistence_actor::persist(PersistRequest::SessionSnapshot(session));
     }
+}
+
+fn persist_full_reset_snapshot(app: &mut App) {
+    if let Ok(manager) = SessionManager::default_location()
+        && let Ok(session) = build_session_snapshot(app, &manager)
+    {
+        app.current_session_id = Some(session.metadata.id.clone());
+        persistence_actor::persist(PersistRequest::SessionSnapshot(session));
+    }
+    // `/clear` and `/new` are explicit boundaries. Never let an older
+    // in-flight checkpoint resurrect the session the user just discarded,
+    // even if the replacement snapshot could not be constructed.
+    persistence_actor::persist(PersistRequest::ClearCheckpoint);
 }
 
 fn maybe_throttled_recovery_snapshot(
@@ -6095,6 +6280,14 @@ fn agent_progress_redraw_permitted(last_redraw: &mut Option<Instant>, now: Insta
             true
         }
     }
+}
+
+/// #4095 residual: pace workflow budget-only repaints under fan-out.
+///
+/// Same 100ms floor as AgentProgress. High-signal workflow lifecycle events
+/// bypass this gate and always paint.
+fn workflow_budget_redraw_permitted(last_redraw: &mut Option<Instant>, now: Instant) -> bool {
+    agent_progress_redraw_permitted(last_redraw, now)
 }
 
 fn agent_progress_redraw_permitted_for_drain(
@@ -6540,7 +6733,13 @@ async fn tool_result_content_for_api_message(
     }
 
     if matches!(name, "run_tests" | "run_verifiers" | "task_gate_run") {
-        return crate::core::engine::compact_tool_result_for_context(&app.model, name, output);
+        return crate::core::engine::compact_tool_result_for_route(
+            app.api_provider,
+            &app.model,
+            app.active_route_limits,
+            name,
+            output,
+        );
     }
 
     if raw.chars().count() > crate::tool_output_receipts::RAW_TOOL_OUTPUT_RECEIPT_THRESHOLD_CHARS {
@@ -6560,7 +6759,13 @@ async fn tool_result_content_for_api_message(
         }
     }
 
-    crate::core::engine::compact_tool_result_for_context(&app.model, name, output)
+    crate::core::engine::compact_tool_result_for_route(
+        app.api_provider,
+        &app.model,
+        app.active_route_limits,
+        name,
+        output,
+    )
 }
 
 fn live_tool_receipt_messages(app: &App, id: &str, raw: &str, success: bool) -> Vec<Message> {
@@ -7057,8 +7262,9 @@ async fn dispatch_user_message(
     app.session.last_reasoning_replay_tokens = None;
     // Persist immediately so abrupt termination can recover this in-flight turn.
     // Offloaded to the persistence actor.
-    if let Ok(manager) = SessionManager::default_location() {
-        let session = build_session_snapshot(app, &manager);
+    if let Ok(manager) = SessionManager::default_location()
+        && let Ok(session) = build_session_snapshot(app, &manager)
+    {
         persistence_actor::persist(PersistRequest::Checkpoint(session));
     }
 
@@ -7122,6 +7328,8 @@ async fn dispatch_user_message(
             mode: app.mode,
             provider: Some(effective_provider),
             model: effective_model,
+            route_limits: app.active_route_limits,
+            compaction: Box::new(app.compaction_config()),
             goal_objective: app.hunt.quarry.clone(),
             goal_token_budget: app.hunt.token_budget,
             goal_status: app.hunt.verdict.goal_status(),
@@ -7990,6 +8198,38 @@ async fn apply_command_result(
                     app.current_session_id = Some(new_session_id.clone());
                     session_id = Some(new_session_id);
                 }
+                let workspace_changed = task_manager.default_workspace().await != workspace;
+                if workspace_changed {
+                    apply_workspace_runtime_state(app, config, workspace.clone());
+                    sync_runtime_workspace_state(task_manager, workspace.clone()).await;
+                }
+                let provider_changed = config.api_provider() != app.api_provider;
+                if provider_changed {
+                    let provider_name = app.api_provider.as_str().to_string();
+                    restore_loaded_session_provider(app, config, &provider_name);
+                    config.provider_config_for_mut(app.api_provider).model = Some(model.clone());
+                }
+                // Re-resolve from the live config even when the provider did
+                // not change. The command layer intentionally has no Config
+                // handle, so its provisional limits cannot include current
+                // provider overrides.
+                resolve_loaded_session_route(app, config);
+                app.update_model_compaction_budget();
+                if provider_changed || workspace_changed {
+                    let _ = engine_handle.send(Op::Shutdown).await;
+                    *engine_handle = spawn_engine(build_engine_config(app, config), config);
+                }
+                // SyncSession carries the conversation but not resolved route
+                // limits. Refresh the engine's model first so a loaded,
+                // forked, or freshly reset session cannot retain the previous
+                // route's context/output facts.
+                let _ = engine_handle
+                    .send(Op::SetModel {
+                        model: model.clone(),
+                        mode,
+                        route_limits: app.active_route_limits,
+                    })
+                    .await;
                 let _ = engine_handle
                     .send(Op::SyncSession {
                         session_id,
@@ -8007,12 +8247,7 @@ async fn apply_command_result(
                     })
                     .await;
                 if is_full_reset {
-                    if let Ok(manager) = SessionManager::default_location() {
-                        let session = build_session_snapshot(app, &manager);
-                        app.current_session_id = Some(session.metadata.id.clone());
-                        persistence_actor::persist(PersistRequest::SessionSnapshot(session));
-                    }
-                    persistence_actor::persist(PersistRequest::ClearCheckpoint);
+                    persist_full_reset_snapshot(app);
                 }
             }
             AppAction::ModeChanged(_mode) => {
@@ -8083,6 +8318,34 @@ async fn apply_command_result(
                         });
                     }
                 }
+            }
+            AppAction::RefreshModelsDevCatalog => {
+                app.status_message = Some("Refreshing Models.dev catalog...".to_string());
+                let message = match crate::models_dev_live::refresh(true).await {
+                    Ok(count) => {
+                        let status = crate::models_dev_live::status();
+                        let source = if status.source_label.is_empty() {
+                            "unknown"
+                        } else {
+                            status.source_label.as_str()
+                        };
+                        format!(
+                            "Models.dev catalog refreshed: {count} offerings ({:?}, source {source})",
+                            status.freshness
+                        )
+                    }
+                    Err(err) => {
+                        let status = crate::models_dev_live::status();
+                        format!(
+                            "Models.dev refresh failed ({err}); keeping prior/bundled rows ({} offerings, {:?})",
+                            status.offering_count, status.freshness
+                        )
+                    }
+                };
+                app.add_message(HistoryCell::System {
+                    content: message.clone(),
+                });
+                app.status_message = Some(message);
             }
             AppAction::CacheWarmup => {
                 app.status_message = Some("Warming DeepSeek cache...".to_string());
@@ -8288,10 +8551,11 @@ async fn apply_command_result(
                 if app.view_stack.top_kind() != Some(ModalKind::ProviderPicker) {
                     let runtime_status = query_provider_runtime_status(engine_handle).await;
                     app.view_stack.push(
-                        crate::tui::provider_picker::ProviderPickerView::new_with_runtime_status(
+                        crate::tui::provider_picker::ProviderPickerView::new_with_runtime_status_and_memory(
                             app.api_provider,
                             config,
                             runtime_status,
+                            app.provider_picker_memory.as_ref(),
                         ),
                     );
                 }
@@ -8309,6 +8573,9 @@ async fn apply_command_result(
                     );
                     app.status_message = Some("Provider setup catalog opened.".to_string());
                 }
+            }
+            AppAction::StartXaiDeviceLogin => {
+                run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
             }
             AppAction::OpenModePicker => {
                 if app.view_stack.top_kind() != Some(ModalKind::ModePicker) {
@@ -8473,7 +8740,7 @@ async fn apply_command_result(
             AppAction::ShellJob(action) => {
                 handle_shell_job_action(app, action);
                 // Immediately sync the task panel after cancel/poll so the
-                // Tasks sidebar stays accurate without waiting for the
+                // Activity sidebar stays accurate without waiting for the
                 // next 2.5 s periodic refresh (#2937).
                 refresh_active_task_panel(app, task_manager).await;
             }
@@ -8965,7 +9232,7 @@ fn parse_queue_send_command(input: &str) -> Option<Result<usize, String>> {
     let rest = strip_queue_command_prefix(input.trim())?;
     let mut parts = rest.split_whitespace();
     let action = parts.next()?;
-    if !matches!(action.to_ascii_lowercase().as_str(), "send" | "now") {
+    if !action.eq_ignore_ascii_case("send") && !action.eq_ignore_ascii_case("now") {
         return None;
     }
     let Some(raw_index) = parts.next() else {
@@ -9194,10 +9461,10 @@ enum PlanChoice {
 fn plan_next_step_prompt() -> String {
     [
         "Action required: choose the next step for this plan.",
-        "  1) Accept + implement in Agent mode",
-        "  2) Accept + implement in YOLO mode",
+        "  1) Accept + implement in Act mode",
+        "  2) Accept + implement with Full Access (Act + bypass)",
         "  3) Revise the plan / ask follow-ups",
-        "  4) Return to Agent mode without implementing",
+        "  4) Return to Act mode without implementing",
         "",
         "Use the plan confirmation popup, or type 1-4 and press Enter.",
     ]
@@ -9236,14 +9503,13 @@ async fn apply_plan_choice(
         PlanChoice::AcceptAgent => {
             apply_mode_update(app, engine_handle, AppMode::Agent).await;
             app.add_message(HistoryCell::System {
-                content: "Plan accepted. Switching to Agent mode and starting implementation."
+                content: "Plan accepted. Switching to Act mode and starting implementation."
                     .to_string(),
             });
             let followup = QueuedMessage::new("Proceed with the accepted plan.".to_string(), None);
             if app.is_loading {
                 app.queue_message(followup);
-                app.status_message =
-                    Some("Queued accepted plan execution (agent mode).".to_string());
+                app.status_message = Some("Queued accepted plan execution (Act mode).".to_string());
             } else {
                 dispatch_user_message(app, config, engine_handle, followup).await?;
             }
@@ -9251,14 +9517,15 @@ async fn apply_plan_choice(
         PlanChoice::AcceptYolo => {
             apply_mode_update(app, engine_handle, AppMode::Yolo).await;
             app.add_message(HistoryCell::System {
-                content: "Plan accepted. Switching to YOLO mode and starting implementation."
-                    .to_string(),
+                content:
+                    "Plan accepted. Switching to Act + Full Access and starting implementation."
+                        .to_string(),
             });
             let followup = QueuedMessage::new("Proceed with the accepted plan.".to_string(), None);
             if app.is_loading {
                 app.queue_message(followup);
                 app.status_message =
-                    Some("Queued accepted plan execution (YOLO mode).".to_string());
+                    Some("Queued accepted plan execution (Act + Full Access).".to_string());
             } else {
                 dispatch_user_message(app, config, engine_handle, followup).await?;
             }
@@ -9273,7 +9540,7 @@ async fn apply_plan_choice(
             apply_mode_update(app, engine_handle, AppMode::Agent).await;
             app.add_message(HistoryCell::System {
                 content: concat!(
-                    "Exited Plan mode. Switched to Agent mode.\n\n",
+                    "Exited Plan mode. Switched to Act mode.\n\n",
                     "The plan above is for reference only. ",
                     "Do NOT execute it until the user explicitly asks you to. ",
                     "Wait for the user's next instruction before taking any action.",
@@ -9425,23 +9692,36 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
     let pending_preview = build_pending_input_preview(app);
     let preview_height = pending_preview.desired_height(size.width);
 
+    // WorkflowPanel unified activity surface (#4121). Collapsed to one row
+    // while finished, expanded while running; zero height when no panel.
+    let workflow_panel_height = app
+        .workflow_panel
+        .as_ref()
+        .map(|panel| panel.desired_height(size.width))
+        .unwrap_or(0);
+
     let body_chunks = Layout::default()
         .direction(Direction::Vertical)
         .flex(ratatui::layout::Flex::Start)
         .constraints([
-            Constraint::Min(1),                  // Chat area
-            Constraint::Length(preview_height),  // Pending input preview (0 if empty)
-            Constraint::Length(composer_height), // Composer
-            Constraint::Length(footer_height),   // Footer
+            Constraint::Min(1),                        // Chat area
+            Constraint::Length(workflow_panel_height), // Workflow panel (#4121)
+            Constraint::Length(preview_height),        // Pending input preview (0 if empty)
+            Constraint::Length(composer_height),       // Composer
+            Constraint::Length(footer_height),         // Footer
         ])
         .split(body_area);
 
     // Render header
     {
-        let sanitized_context_window = context_usage
-            .as_ref()
-            .map(|(_, max, _)| *max)
-            .or_else(|| crate::models::context_window_for_model(&app.model));
+        let sanitized_context_window =
+            context_usage.as_ref().map(|(_, max, _)| *max).or_else(|| {
+                Some(crate::route_budget::route_context_window_tokens(
+                    app.api_provider,
+                    app.effective_model_for_budget(),
+                    app.active_route_limits,
+                ))
+            });
         let sanitized_prompt_tokens = context_usage
             .as_ref()
             .and_then(|(used, _, _)| u32::try_from(*used).ok());
@@ -9486,6 +9766,8 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
             crate::config::ApiProvider::Minimax => Some("MiniMax"),
             crate::config::ApiProvider::Sakana => Some("Sakana"),
             crate::config::ApiProvider::LongCat => Some("Meituan LongCat"),
+            crate::config::ApiProvider::Meta => Some("Meta"),
+            crate::config::ApiProvider::Xai => Some("xAI"),
             crate::config::ApiProvider::Custom => Some("Custom"),
         };
         let status_indicator_started_at = if app.low_motion {
@@ -9691,10 +9973,22 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
         }
     }
 
+    // Workflow panel between chat and pending-input preview (#4121).
+    if workflow_panel_height > 0 {
+        if let Some(panel) = app.workflow_panel.as_ref() {
+            let area = body_chunks[1];
+            app.viewport.last_workflow_panel_area = Some(area);
+            let buf = f.buffer_mut();
+            panel.render(area, buf);
+        }
+    } else {
+        app.viewport.last_workflow_panel_area = None;
+    }
+
     // Render pending-input preview (queued/steered messages, if any).
     if preview_height > 0 {
         let buf = f.buffer_mut();
-        pending_preview.render(body_chunks[1], buf);
+        pending_preview.render(body_chunks[2], buf);
     }
 
     // Render composer
@@ -9706,12 +10000,12 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
             &mention_menu_entries,
         );
         let buf = f.buffer_mut();
-        composer_widget.render(body_chunks[2], buf);
-        composer_widget.cursor_pos(body_chunks[2])
+        composer_widget.render(body_chunks[3], buf);
+        composer_widget.cursor_pos(body_chunks[3])
     };
-    app.viewport.last_composer_area = Some(body_chunks[2]);
+    app.viewport.last_composer_area = Some(body_chunks[3]);
     {
-        let area = body_chunks[2];
+        let area = body_chunks[3];
         let has_panel = app.composer_border && area.height >= 3 && area.width >= 12;
         let inner = if has_panel {
             ratatui::widgets::Block::default()
@@ -9763,11 +10057,11 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
     }
 
     // Render footer
-    render_footer(f, body_chunks[3], app);
+    render_footer(f, body_chunks[4], app);
     // Toast stack overlay (#439): when multiple status toasts are queued,
     // surface the older ones as a 1-2 line strip above the footer so a
     // burst of events isn't collapsed to a single visible message.
-    render_toast_stack_overlay(f, size, body_chunks[2], body_chunks[3], app);
+    render_toast_stack_overlay(f, size, body_chunks[3], body_chunks[4], app);
 
     // Decision card overlay (v0.8.43 truth-surface). When a decision card is
     // active, render it centered on top of the transcript.
@@ -10213,8 +10507,31 @@ async fn handle_view_events(
 
                 match manager.load_session(&session_id) {
                     Ok(session) => {
-                        let recovered = apply_loaded_session(app, config, &session);
+                        let previous_provider = app.api_provider;
+                        let previous_workspace = app.workspace.clone();
+                        let recovered = match apply_loaded_session(app, config, &session) {
+                            Ok(recovered) => recovered,
+                            Err(err) => {
+                                app.status_message =
+                                    Some(format!("Failed to restore session: {err}"));
+                                continue;
+                            }
+                        };
                         sync_runtime_workspace_state(task_manager, app.workspace.clone()).await;
+                        if app.api_provider != previous_provider
+                            || app.workspace != previous_workspace
+                        {
+                            let _ = engine_handle.send(Op::Shutdown).await;
+                            *engine_handle = spawn_engine(build_engine_config(app, config), config);
+                        } else {
+                            let _ = engine_handle
+                                .send(Op::SetModel {
+                                    model: app.model.clone(),
+                                    mode: app.mode,
+                                    route_limits: app.active_route_limits,
+                                })
+                                .await;
+                        }
                         let _ = engine_handle
                             .send(Op::SyncSession {
                                 session_id: app.current_session_id.clone(),
@@ -10245,6 +10562,31 @@ async fn handle_view_events(
                         ));
                     }
                 }
+            }
+            ViewEvent::SessionRenamed { metadata } => {
+                let session_id = metadata.id.clone();
+                let title = metadata.title.clone();
+                if apply_picker_session_rename_to_active_app(app, metadata)
+                    && let Ok(manager) = SessionManager::default_location()
+                {
+                    match build_session_snapshot(app, &manager) {
+                        Ok(session) => {
+                            persistence_actor::persist(PersistRequest::SessionSnapshot(session))
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                error = %err,
+                                "Could not queue active session rename snapshot"
+                            );
+                        }
+                    }
+                }
+                app.status_message = Some(format!(
+                    "Renamed session {} to \"{}\"",
+                    crate::session_manager::truncate_id(&session_id),
+                    title
+                ));
             }
             ViewEvent::SessionDeleted { session_id, title } => {
                 app.status_message = Some(format!(
@@ -10381,9 +10723,19 @@ async fn handle_view_events(
                 role,
                 model,
                 provider,
+                reasoning_effort,
                 locale,
             } => {
-                handle_fleet_profile_model_draft(app, config, role, model, provider, locale).await;
+                handle_fleet_profile_model_draft(
+                    app,
+                    config,
+                    role,
+                    model,
+                    provider,
+                    reasoning_effort,
+                    locale,
+                )
+                .await;
             }
             ViewEvent::FleetRosterOpenSetupRequested => {
                 // The roster view hands off to the authoring wizard (same
@@ -10640,6 +10992,26 @@ async fn handle_view_events(
                 )
                 .await;
             }
+            ViewEvent::ModelPickerDismissed {
+                catalog_view,
+                view,
+                selected_row_id,
+            } => {
+                app.model_picker_memory = Some(crate::tui::app::ModelPickerMemory {
+                    catalog_view,
+                    view: Some(view),
+                    selected_row_id,
+                });
+            }
+            ViewEvent::ProviderPickerDismissed {
+                catalog_view,
+                selected_provider_id,
+            } => {
+                app.provider_picker_memory = Some(crate::tui::app::ProviderPickerMemory {
+                    catalog_view,
+                    selected_provider_id,
+                });
+            }
             ViewEvent::ProviderPickerApplied {
                 provider,
                 provider_id,
@@ -10659,6 +11031,25 @@ async fn handle_view_events(
                     set_active_custom_provider_in_memory(config, &provider_id);
                 }
                 apply_provider_picker_api_key(app, engine_handle, config, provider, api_key).await;
+            }
+            ViewEvent::ProviderPickerSetupConfirmed {
+                provider,
+                provider_id,
+                api_key,
+                model,
+            } => {
+                if let Some(provider_id) = provider_id {
+                    set_active_custom_provider_in_memory(config, &provider_id);
+                }
+                apply_provider_picker_setup_confirmed(
+                    app,
+                    engine_handle,
+                    config,
+                    provider,
+                    api_key,
+                    model,
+                )
+                .await;
             }
             ViewEvent::ProviderPickerCustomProviderSubmitted {
                 provider_id,
@@ -10687,6 +11078,9 @@ async fn handle_view_events(
                     "Linked Kimi CLI OAuth",
                 )
                 .await;
+            }
+            ViewEvent::ProviderPickerXaiOAuthRequested => {
+                run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
             }
             ViewEvent::ProviderPickerOpenModels {
                 provider,
@@ -11175,15 +11569,158 @@ async fn apply_provider_picker_api_key(
     provider: ApiProvider,
     api_key: String,
 ) {
-    use crate::config::save_api_key_for;
+    apply_provider_picker_api_key_with_verifier(
+        app,
+        engine_handle,
+        config,
+        provider,
+        api_key,
+        &LiveProviderKeyVerifier,
+    )
+    .await;
+}
 
+type ProviderKeyVerification<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+trait ProviderKeyVerifier {
+    fn verify<'a>(
+        &'a self,
+        provider: ApiProvider,
+        api_key: &'a str,
+        base_url: &'a str,
+    ) -> ProviderKeyVerification<'a>;
+}
+
+struct LiveProviderKeyVerifier;
+
+impl ProviderKeyVerifier for LiveProviderKeyVerifier {
+    fn verify<'a>(
+        &'a self,
+        provider: ApiProvider,
+        api_key: &'a str,
+        base_url: &'a str,
+    ) -> ProviderKeyVerification<'a> {
+        Box::pin(crate::client::verify_provider_api_key(
+            provider, api_key, base_url,
+        ))
+    }
+}
+
+async fn apply_provider_picker_api_key_with_verifier(
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+    provider: ApiProvider,
+    api_key: String,
+    verifier: &dyn ProviderKeyVerifier,
+) {
+    // #3875: verify the key against the provider before opening the rest of
+    // the guided flow. Nothing is persisted until the confirm stage.
+    // Use the provider's configured base URL (or the default) for the
+    // models-endpoint probe so custom endpoints are also verified.
+    let base_url = config
+        .provider_config_for(provider)
+        .and_then(|entry| entry.base_url.as_deref())
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| provider.default_base_url());
+    match verifier.verify(provider, &api_key, base_url).await {
+        Ok(()) => {
+            // Key is valid — continue the guided flow at model pick without
+            // writing the secret yet.
+            let runtime_status = query_provider_runtime_status(engine_handle).await;
+            if let Some(picker) =
+                crate::tui::provider_picker::ProviderPickerView::new_for_model_pick_after_validation(
+                    app.api_provider,
+                    provider,
+                    config,
+                    runtime_status,
+                    api_key,
+                )
+            {
+                app.view_stack.push(picker);
+                app.status_message = Some(format!(
+                    "{} API key verified — pick a default model.",
+                    provider.as_str()
+                ));
+            } else {
+                app.status_message = Some(format!(
+                    "{} API key verified, but the guided setup could not be re-opened.",
+                    provider.as_str()
+                ));
+            }
+            app.needs_redraw = true;
+        }
+        Err(reason) => {
+            // Verification failed - keep the picker open at the key-entry
+            // stage with the provider's actual error so the user can fix
+            // the key instead of dead-ending with a status toast.
+            let runtime_status = query_provider_runtime_status(engine_handle).await;
+            if let Some(picker) =
+                crate::tui::provider_picker::ProviderPickerView::new_for_key_entry_with_error(
+                    app.api_provider,
+                    provider,
+                    config,
+                    runtime_status,
+                    reason,
+                )
+            {
+                app.view_stack.push(picker);
+                app.status_message = Some(format!(
+                    "{} API key verification failed - check the key and try again.",
+                    provider.as_str()
+                ));
+            } else {
+                app.status_message = Some(format!(
+                    "{} API key verification failed, but the provider could not be re-opened.",
+                    provider.as_str()
+                ));
+            }
+            app.needs_redraw = true;
+        }
+    }
+}
+
+async fn apply_provider_picker_setup_confirmed(
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+    provider: ApiProvider,
+    api_key: String,
+    model: String,
+) {
+    use crate::config::{save_api_key_for, save_provider_model_for};
+
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        app.add_message(HistoryCell::System {
+            content: format!(
+                "Cannot finish {} setup: default model is empty.\nProvider unchanged.",
+                provider.as_str()
+            ),
+        });
+        return;
+    }
+
+    // Persist key first via the existing comment-preserving path, then pin the
+    // chosen default model on the same document when the provider uses a
+    // `[providers.<name>]` table.
     match save_api_key_for(provider, &api_key) {
         Ok(path) => {
-            app.status_message = Some(format!(
-                "Saved {} API key to {}",
-                provider.as_str(),
-                path.display()
-            ));
+            if let Err(err) = save_provider_model_for(provider, &model) {
+                app.add_message(HistoryCell::System {
+                    content: format!(
+                        "Saved {} API key to {}, but failed to pin model `{model}`: {err}",
+                        provider.as_str(),
+                        path.display()
+                    ),
+                });
+            } else {
+                app.status_message = Some(format!(
+                    "Saved {} API key and model to {}",
+                    provider.as_str(),
+                    path.display()
+                ));
+            }
             app.api_key_env_only = false;
         }
         Err(err) => {
@@ -11198,7 +11735,16 @@ async fn apply_provider_picker_api_key(
     }
 
     mirror_saved_api_key_in_config(config, provider, api_key);
-    switch_provider(app, engine_handle, config, provider, None).await;
+    mirror_saved_model_in_config(config, provider, model.clone());
+    switch_provider(app, engine_handle, config, provider, Some(model)).await;
+}
+
+fn mirror_saved_model_in_config(config: &mut Config, provider: ApiProvider, model: String) {
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        config.default_text_model = Some(model);
+        return;
+    }
+    config.provider_config_for_mut(provider).model = Some(model);
 }
 
 fn mirror_saved_api_key_in_config(config: &mut Config, provider: ApiProvider, api_key: String) {
@@ -11249,6 +11795,8 @@ fn mirror_saved_api_key_in_config(config: &mut Config, provider: ApiProvider, ap
         ApiProvider::Minimax => &mut providers.minimax,
         ApiProvider::Sakana => &mut providers.sakana,
         ApiProvider::LongCat => &mut providers.longcat,
+        ApiProvider::Meta => &mut providers.meta,
+        ApiProvider::Xai => &mut providers.xai,
     };
     entry.api_key = Some(api_key);
 }
@@ -11261,7 +11809,7 @@ async fn apply_provider_picker_auth_mode(
     auth_mode: &str,
     status_prefix: &str,
 ) {
-    match save_provider_auth_mode_for(provider, auth_mode) {
+    match save_provider_auth_mode_for_at(provider, auth_mode, app.config_path.as_deref()) {
         Ok(path) => {
             set_provider_auth_mode_in_memory(config, provider, auth_mode.to_string());
             app.status_message = Some(format!("{status_prefix}; saved to {}", path.display()));
@@ -11279,6 +11827,51 @@ async fn apply_provider_picker_auth_mode(
     }
 
     switch_provider(app, engine_handle, config, provider, None).await;
+}
+
+async fn run_xai_device_login_from_tui(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+) -> Result<()> {
+    pause_terminal(
+        terminal,
+        app.use_alt_screen,
+        app.use_mouse_capture,
+        app.use_bracketed_paste,
+    )?;
+    let login_result = tokio::task::block_in_place(crate::xai_oauth::device_code_login);
+    resume_terminal(
+        terminal,
+        app.use_alt_screen,
+        app.use_mouse_capture,
+        app.use_bracketed_paste,
+        app.synchronized_output_enabled,
+    )?;
+
+    match login_result {
+        Ok(_) => {
+            apply_provider_picker_auth_mode(
+                app,
+                engine_handle,
+                config,
+                ApiProvider::Xai,
+                "oauth",
+                "xAI device login complete",
+            )
+            .await;
+        }
+        Err(err) => {
+            let message = format!("xAI device login failed: {err}");
+            app.add_message(HistoryCell::System {
+                content: message.clone(),
+            });
+            app.status_message = Some(message);
+        }
+    }
+    app.needs_redraw = true;
+    Ok(())
 }
 
 fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, auth_mode: String) {
@@ -11327,11 +11920,26 @@ fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, 
         ApiProvider::Minimax => &mut providers.minimax,
         ApiProvider::Sakana => &mut providers.sakana,
         ApiProvider::LongCat => &mut providers.longcat,
+        ApiProvider::Meta => &mut providers.meta,
+        ApiProvider::Xai => &mut providers.xai,
     };
     entry.auth_mode = Some(auth_mode);
 }
 
-fn apply_loaded_session(app: &mut App, config: &mut Config, session: &SavedSession) -> bool {
+fn apply_loaded_session(
+    app: &mut App,
+    config: &mut Config,
+    session: &SavedSession,
+) -> Result<bool, String> {
+    if app.session_transition_blocked() {
+        return Err(
+            "runtime work is active; wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work before switching sessions".to_string(),
+        );
+    }
+    // Restore/validate the contended state before mutating conversation or
+    // workspace fields. A failed session switch must leave the current session
+    // wholly intact.
+    app.restore_work_state(session.work_state.as_ref())?;
     let (messages, recovered_draft) = recover_interrupted_user_tail(&session.messages);
     app.api_messages = messages;
     app.clear_history();
@@ -11346,7 +11954,6 @@ fn apply_loaded_session(app: &mut App, config: &mut Config, session: &SavedSessi
     app.ignored_tool_calls.clear();
     app.pending_tool_uses.clear();
     app.last_exec_wait_command = None;
-
     let messages = app.api_messages.clone();
     let mut message_to_cell = std::collections::HashMap::new();
     for (message_index, msg) in messages.iter().enumerate() {
@@ -11378,6 +11985,7 @@ fn apply_loaded_session(app: &mut App, config: &mut Config, session: &SavedSessi
     app.viewport.transcript_selection.clear();
     restore_loaded_session_provider(app, config, &session.metadata.model_provider);
     app.set_model_selection(session.metadata.model.clone());
+    resolve_loaded_session_route(app, config);
     app.provider_models.insert(
         app.api_provider.as_str().to_string(),
         app.model_selection_for_persistence(),
@@ -11425,6 +12033,7 @@ fn apply_loaded_session(app: &mut App, config: &mut Config, session: &SavedSessi
     app.cumulative_turn_duration =
         std::time::Duration::from_secs(session.metadata.cumulative_turn_secs);
     app.current_session_id = Some(session.metadata.id.clone());
+    app.current_session_metadata = Some(session.metadata.clone());
     app.session_artifacts = session.artifacts.clone();
     app.session_title = Some(session.metadata.title.clone());
     app.workspace_context = None;
@@ -11441,7 +12050,7 @@ fn apply_loaded_session(app: &mut App, config: &mut Config, session: &SavedSessi
         false
     };
     app.scroll_to_bottom();
-    recovered
+    Ok(recovered)
 }
 
 fn restore_loaded_session_provider(app: &mut App, config: &mut Config, model_provider: &str) {
@@ -11463,6 +12072,29 @@ fn restore_loaded_session_provider(app: &mut App, config: &mut Config, model_pro
     app.reasoning_effort = app.reasoning_effort.normalize_for_provider(provider);
     app.set_active_context_window_override(config.context_window_for_provider_config(provider));
     app.active_route_limits = app.context_window_override_limits();
+}
+
+fn resolve_loaded_session_route(app: &mut App, config: &Config) {
+    let context_override = config.context_window_for_provider_config(app.api_provider);
+    app.set_active_context_window_override(context_override);
+    if app.auto_model {
+        app.active_route_limits = app.context_window_override_limits();
+        return;
+    }
+
+    let saved_provider_model = config
+        .provider_config_for(app.api_provider)
+        .and_then(|provider| provider.model.as_deref());
+    app.active_route_limits = resolve_route_candidate(
+        app.api_provider,
+        Some(&app.model),
+        saved_provider_model,
+        Some(config.deepseek_base_url()),
+        context_override,
+    )
+    .ok()
+    .and_then(|candidate| crate::route_budget::known_route_limits(candidate.limits))
+    .or_else(|| app.context_window_override_limits());
 }
 
 /// Derive a short display title from the API message list.
@@ -12315,8 +12947,9 @@ fn open_pager_for_last_message(app: &mut App) -> bool {
     true
 }
 
-/// Compatibility wrapper for the old test name. The user-facing Ctrl+O
-/// surface is now Activity Detail, not a thinking-only pager.
+/// Compatibility wrapper for the old test name. Exercises the single-cell
+/// Activity Detail helper (still used by `v`-adjacent detail paths); the
+/// user-facing Ctrl+O surface is now the whole-turn Turn Inspector (#4104).
 #[cfg(test)]
 fn open_thinking_pager(app: &mut App) -> bool {
     open_activity_detail_pager(app)
@@ -12498,6 +13131,315 @@ fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
 }
 
 mod activity_detail;
+
+#[cfg(test)]
+mod provider_key_validation_tests {
+    use super::*;
+    use crate::core::engine::mock_engine_handle;
+    use ratatui::{buffer::Buffer, layout::Rect};
+    use std::ffi::OsString;
+    use std::sync::MutexGuard;
+    use tempfile::TempDir;
+
+    struct ConfigPathEnvGuard {
+        _tmp: TempDir,
+        previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ConfigPathEnvGuard {
+        fn new() -> Self {
+            let lock = crate::test_support::lock_test_env();
+            let tmp = TempDir::new().expect("config tempdir");
+            let config_path = tmp.path().join(".codewhale").join("config.toml");
+            std::fs::create_dir_all(config_path.parent().expect("config parent"))
+                .expect("config dir");
+            let previous = std::env::var_os("DEEPSEEK_CONFIG_PATH");
+            // Safety: test-only environment mutation guarded by a global mutex.
+            unsafe {
+                std::env::set_var("DEEPSEEK_CONFIG_PATH", &config_path);
+            }
+            Self {
+                _tmp: tmp,
+                previous,
+                _lock: lock,
+            }
+        }
+
+        fn config_path(&self) -> PathBuf {
+            std::env::var_os("DEEPSEEK_CONFIG_PATH")
+                .map(PathBuf::from)
+                .expect("config path set")
+        }
+    }
+
+    impl Drop for ConfigPathEnvGuard {
+        fn drop(&mut self) {
+            // Safety: test-only environment mutation guarded by a global mutex.
+            unsafe {
+                if let Some(previous) = self.previous.take() {
+                    std::env::set_var("DEEPSEEK_CONFIG_PATH", previous);
+                } else {
+                    std::env::remove_var("DEEPSEEK_CONFIG_PATH");
+                }
+            }
+        }
+    }
+
+    fn create_test_app() -> App {
+        let options = TuiOptions {
+            model: "deepseek-v4-pro".to_string(),
+            workspace: PathBuf::from("."),
+            config_path: None,
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: true,
+            use_mouse_capture: false,
+            use_bracketed_paste: true,
+            max_subagents: 1,
+            skills_dir: PathBuf::from("."),
+            memory_path: PathBuf::from("memory.md"),
+            notes_path: PathBuf::from("notes.txt"),
+            mcp_config_path: PathBuf::from("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: true,
+            skip_onboarding: false,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        let mut app = App::new(options, &Config::default());
+        app.api_provider = ApiProvider::Deepseek;
+        app.model = "deepseek-v4-pro".to_string();
+        app.auto_model = false;
+        app
+    }
+
+    struct MockProviderKeyVerifier {
+        result: Result<(), String>,
+        calls: std::sync::Mutex<Vec<(ApiProvider, String, String)>>,
+    }
+
+    impl MockProviderKeyVerifier {
+        fn new(result: Result<(), String>) -> Self {
+            Self {
+                result,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(ApiProvider, String, String)> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    impl ProviderKeyVerifier for MockProviderKeyVerifier {
+        fn verify<'a>(
+            &'a self,
+            provider: ApiProvider,
+            api_key: &'a str,
+            base_url: &'a str,
+        ) -> ProviderKeyVerification<'a> {
+            self.calls.lock().expect("calls lock").push((
+                provider,
+                api_key.to_string(),
+                base_url.to_string(),
+            ));
+            Box::pin(std::future::ready(self.result.clone()))
+        }
+    }
+
+    fn openrouter_config(base_url: &str) -> Config {
+        Config {
+            providers: Some(ProvidersConfig {
+                openrouter: ProviderConfig {
+                    base_url: Some(base_url.to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_key_submit_opens_model_pick_without_persisting_on_validation_success() {
+        let config_env = ConfigPathEnvGuard::new();
+        let mut app = create_test_app();
+        let mut engine = mock_engine_handle();
+        let mut config = openrouter_config("https://mock.openrouter.test/v1");
+        let verifier = MockProviderKeyVerifier::new(Ok(()));
+
+        apply_provider_picker_api_key_with_verifier(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            ApiProvider::Openrouter,
+            "sk-verified".to_string(),
+            &verifier,
+        )
+        .await;
+
+        assert_eq!(
+            verifier.calls(),
+            vec![(
+                ApiProvider::Openrouter,
+                "sk-verified".to_string(),
+                "https://mock.openrouter.test/v1".to_string()
+            )]
+        );
+        // Validation success must not persist or switch yet (#3875 residual):
+        // the guided flow continues at model pick first.
+        assert_eq!(app.api_provider, ApiProvider::Deepseek);
+        assert_eq!(config.provider.as_deref(), None);
+        assert_eq!(
+            config
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.openrouter.api_key.as_deref()),
+            None
+        );
+        let saved = std::fs::read_to_string(config_env.config_path()).unwrap_or_default();
+        assert!(!saved.contains("sk-verified"));
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ProviderPicker));
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|status| status.contains("API key verified")),
+            "status names verification success: {:?}",
+            app.status_message
+        );
+
+        let picker = app.view_stack.pop().expect("provider picker reopened");
+        let area = Rect::new(0, 0, 90, 16);
+        let mut buf = Buffer::empty(area);
+        picker.render(area, &mut buf);
+        let rendered = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("Default model") || rendered.contains("Pick a default model"),
+            "expected model-pick stage UI, got:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_setup_confirm_persists_provider_model_and_preserves_comments() {
+        let config_env = ConfigPathEnvGuard::new();
+        // Seed a commented config so the confirm path must preserve it.
+        std::fs::write(
+            config_env.config_path(),
+            r#"# keep-me-comment
+[providers.openrouter]
+# openrouter-table-comment
+base_url = "https://mock.openrouter.test/v1"
+"#,
+        )
+        .expect("seed config");
+
+        let mut app = create_test_app();
+        let mut engine = mock_engine_handle();
+        let mut config = openrouter_config("https://mock.openrouter.test/v1");
+        let model = "deepseek/deepseek-v4-pro".to_string();
+
+        apply_provider_picker_setup_confirmed(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            ApiProvider::Openrouter,
+            "sk-confirmed".to_string(),
+            model.clone(),
+        )
+        .await;
+
+        assert_eq!(app.api_provider, ApiProvider::Openrouter);
+        assert_eq!(config.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            config
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.openrouter.api_key.as_deref()),
+            Some("sk-confirmed")
+        );
+        assert_eq!(
+            config
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.openrouter.model.as_deref()),
+            Some(model.as_str())
+        );
+        let saved = std::fs::read_to_string(config_env.config_path()).expect("saved config");
+        assert!(
+            saved.contains("# keep-me-comment"),
+            "root comment lost:\n{saved}"
+        );
+        assert!(
+            saved.contains("# openrouter-table-comment"),
+            "table comment lost:\n{saved}"
+        );
+        assert!(saved.contains("[providers.openrouter]"));
+        assert!(saved.contains("api_key = \"sk-confirmed\""));
+        assert!(saved.contains(&format!("model = \"{model}\"")));
+    }
+
+    #[tokio::test]
+    async fn provider_key_submit_reopens_picker_without_persisting_on_validation_failure() {
+        let config_env = ConfigPathEnvGuard::new();
+        let mut app = create_test_app();
+        let mut engine = mock_engine_handle();
+        let mut config = openrouter_config("https://mock.openrouter.test/v1");
+        let verifier = MockProviderKeyVerifier::new(Err("HTTP 401: unauthorized".to_string()));
+
+        apply_provider_picker_api_key_with_verifier(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            ApiProvider::Openrouter,
+            "sk-rejected".to_string(),
+            &verifier,
+        )
+        .await;
+
+        assert_eq!(app.api_provider, ApiProvider::Deepseek);
+        assert_eq!(config.provider.as_deref(), None);
+        assert_eq!(
+            config
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.openrouter.api_key.as_deref()),
+            None
+        );
+        let saved = std::fs::read_to_string(config_env.config_path()).unwrap_or_default();
+        assert!(!saved.contains("sk-rejected"));
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ProviderPicker));
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|status| status.contains("API key verification failed")),
+            "status names validation failure: {:?}",
+            app.status_message
+        );
+
+        let picker = app.view_stack.pop().expect("provider picker reopened");
+        let area = Rect::new(0, 0, 90, 14);
+        let mut buf = Buffer::empty(area);
+        picker.render(area, &mut buf);
+        let rendered = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Verification failed: HTTP 401: unauthorized"));
+    }
+}
 
 #[cfg(test)]
 mod tests;

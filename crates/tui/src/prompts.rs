@@ -877,7 +877,6 @@ pub const PLAYFUL_PERSONALITY: &str = include_str!("prompts/personalities/playfu
 pub const AGENT_MODE: &str = include_str!("prompts/modes/agent.md");
 pub const PLAN_MODE: &str = include_str!("prompts/modes/plan.md");
 pub const YOLO_MODE: &str = include_str!("prompts/modes/yolo.md");
-pub const MULTITASK_MODE: &str = include_str!("prompts/modes/multitask.md");
 pub const OPERATE_MODE: &str = include_str!("prompts/modes/operate.md");
 
 /// Approval-policy overlays — whether tool calls are auto-approved,
@@ -1626,7 +1625,12 @@ mod tests {
             "### Ground truth",
             "### Verify before you claim",
             "### Do what's asked",
+            "### Keep momentum",
+            "### Think in causes",
+            "### Honor constraints before preferences",
             "### Restraint",
+            "### Put guarantees in mechanism",
+            "### Leave continuity",
             "### Whose word wins",
         ] {
             assert!(
@@ -1634,6 +1638,28 @@ mod tests {
                 "BASE_PROMPT missing Constitutional phrase {phrase:?}"
             );
         }
+    }
+
+    #[test]
+    fn base_prompt_carries_balanced_behavioral_priors() {
+        for phrase in [
+            "action is the default",
+            "Autonomy has a boundary",
+            "Hold more than one plausible cause",
+            "Hard constraints are gates",
+            "mechanism carries it",
+            "so the next turn can continue",
+        ] {
+            assert!(
+                BASE_PROMPT.contains(phrase),
+                "BASE_PROMPT missing behavioral prior {phrase:?}"
+            );
+        }
+        assert!(
+            !BASE_PROMPT.contains("## STATUTES (Tier 2)")
+                && !BASE_PROMPT.contains("## REGULATIONS (Tier 3)"),
+            "the balanced Constitution must not restore the old procedural policy tail"
+        );
     }
 
     #[test]
@@ -2744,7 +2770,7 @@ mod tests {
     #[test]
     fn compose_prompt_includes_all_layers() {
         let prompt = compose_prompt(Personality::Calm);
-        // Base layer — 0.9.0 compact Constitution
+        // Base layer — balanced Constitution; procedural recipes stay out.
         assert!(prompt.contains("## CodeWhale"));
         assert!(prompt.contains("### Whose word wins"));
         assert!(!prompt.contains("## STATUTES (Tier 2)"));
@@ -2755,7 +2781,7 @@ mod tests {
         assert!(!prompt.contains("Approval Policy:"));
     }
 
-    /// `constitution.md` is the single hand-maintained source of the compact
+    /// `constitution.md` is the single hand-maintained source of the balanced
     /// constitutional core. This replaces the old 600-line policy tail: a
     /// hand-edit that drops a core section or reorders the skeleton fails the
     /// build instead of silently shipping a malformed prompt.
@@ -2769,7 +2795,12 @@ mod tests {
             "### Ground truth",
             "### Verify before you claim",
             "### Do what's asked",
+            "### Keep momentum",
+            "### Think in causes",
+            "### Honor constraints before preferences",
             "### Restraint",
+            "### Put guarantees in mechanism",
+            "### Leave continuity",
             "### Whose word wins",
         ] {
             let pos = md
@@ -2860,8 +2891,12 @@ mod tests {
             ("plan", PLAN_MODE),
             ("yolo", YOLO_MODE),
         ] {
-            let word_count = prompt.split_whitespace().count();
-            let estimated_tokens = crate::compaction::estimate_text_tokens_conservative(prompt);
+            // Measure semantic size on LF so Windows autocrlf checkouts do not
+            // inflate char/3 token estimates via extra `\r` bytes.
+            let normalized = prompt.replace("\r\n", "\n").replace('\r', "\n");
+            let word_count = normalized.split_whitespace().count();
+            let estimated_tokens =
+                crate::compaction::estimate_text_tokens_conservative(&normalized);
             let max_words = if name == "agent" { 800 } else { 350 };
             let max_tokens = if name == "agent" { 1600 } else { 700 };
 
@@ -2882,7 +2917,7 @@ mod tests {
                 "## Runtime Policy Reference",
             ] {
                 assert!(
-                    !prompt.contains(forbidden),
+                    !normalized.contains(forbidden),
                     "{name} mode prompt duplicated shared base section {forbidden:?}"
                 );
             }
@@ -3255,6 +3290,53 @@ mod tests {
         assert!(prompt.contains("3-5 tool calls"));
         assert!(prompt.contains("Review/verifier children stop after decisive evidence"));
         assert!(prompt.contains("No fan-out without a fan-in owner"));
+    }
+
+    #[test]
+    fn agent_mode_prompt_teaches_automatic_workflow_use() {
+        // #4125: parent decides Workflow without the user saying the word;
+        // indicates the shape and may ask setup questions before launch.
+        let prompt = AGENT_MODE;
+        for phrase in [
+            "You decide when to use Workflow",
+            "need **not** say \"workflow\"",
+            "broad, independent, or staged",
+            "This looks set up for a Workflow",
+            "`request_user_input`",
+            "TUI question modal",
+            "Pass **paths**, not file contents",
+            "Prefer `responseSchema`",
+            "one compact summary",
+        ] {
+            assert!(
+                prompt.contains(phrase),
+                "AGENT_MODE missing automatic-workflow phrase {phrase:?}"
+            );
+        }
+        // Explicitly not the old opt-in-only framing.
+        assert!(
+            !prompt.contains("The `workflow` tool is opt-in"),
+            "AGENT_MODE must not describe Workflow as opt-in only"
+        );
+    }
+
+    #[test]
+    fn operate_mode_prompt_prefers_workflow_plan_over_handwritten_files() {
+        // #4125 companion: Operate mode matches soft-auto Workflow guidance.
+        for phrase in [
+            "Decide to use Workflow yourself",
+            "does not need to say \"workflow\"",
+            "This looks like a Workflow",
+            "do not ask the operator to write workflow files",
+            "Pass **paths** not file dumps",
+            "Prefer `responseSchema`",
+            "labels and phase titles",
+        ] {
+            assert!(
+                OPERATE_MODE.contains(phrase),
+                "OPERATE_MODE missing automatic-workflow phrase {phrase:?}"
+            );
+        }
     }
 
     #[test]

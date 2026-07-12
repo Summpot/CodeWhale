@@ -439,18 +439,19 @@ pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
             "off" | "hide" | "hidden" | "closed" | "none" => SidebarFocus::Hidden,
             "auto" => SidebarFocus::Auto,
             "work" | "plan" | "todos" => SidebarFocus::Pinned,
-            "tasks" => SidebarFocus::Tasks,
+            // Panel label is Activity; "tasks" remains the config/compat key (#4147/#4135).
+            "tasks" | "activity" | "live" | "running" => SidebarFocus::Tasks,
             "agents" | "subagents" | "sub-agents" => SidebarFocus::Agents,
             "context" | "session" => SidebarFocus::Context,
             _ => {
                 return CommandResult::error(
-                    "Usage: /sidebar [on|off|pinned|auto|tasks|agents|context] [--save]",
+                    "Usage: /sidebar [on|off|pinned|auto|activity|tasks|agents|context] [--save]",
                 );
             }
         },
         _ => {
             return CommandResult::error(
-                "Usage: /sidebar [on|off|pinned|auto|tasks|agents|context] [--save]",
+                "Usage: /sidebar [on|off|pinned|auto|activity|tasks|agents|context] [--save]",
             );
         }
     };
@@ -725,6 +726,19 @@ fn config_editability_audit(app: &App) -> CommandResult {
     } else {
         app.model.clone()
     };
+    let saved_permission_posture = Settings::load()
+        .ok()
+        .and_then(|settings| settings.permission_posture)
+        .unwrap_or_else(|| "(unset)".to_string());
+    let configured_approval_policy = config
+        .approval_policy
+        .clone()
+        .unwrap_or_else(|| "(unset)".to_string());
+    let effective_permissions = if app.mode == AppMode::Plan {
+        "Read Only"
+    } else {
+        app.approval_mode.permission_chip_label()
+    };
 
     let rows = [
         (
@@ -742,11 +756,25 @@ fn config_editability_audit(app: &App) -> CommandResult {
             "Switches the active model now; use default_text_model in config.toml for startup default.",
         ),
         (
+            "effective_permissions",
+            effective_permissions.to_string(),
+            "runtime",
+            "Shift+Tab",
+            "Shows the effective Act/Operate posture; Plan remains Read Only.",
+        ),
+        (
+            "permission_posture",
+            saved_permission_posture,
+            "TUI settings",
+            "Shift+Tab",
+            "Saved in settings.toml and ignored when config/requirements manage approval policy.",
+        ),
+        (
             "approval_policy",
-            approval_mode_config_value(app.approval_mode).to_string(),
-            "runtime+persisted",
+            configured_approval_policy,
+            "persisted config",
             "/config approval_mode <auto|on-request|never> --save",
-            "Writes top-level approval_policy and updates the current session.",
+            "Top-level managed policy; Full Access is not a valid value here.",
         ),
         (
             "allow_shell",
@@ -1420,8 +1448,13 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
         "approval_mode" | "approval" => {
             let mode = ApprovalMode::from_config_value(value);
             return match mode {
+                Some(_) if app.approval_policy_requirements_managed() => CommandResult::error(
+                    "Approval posture is controlled by managed requirements; edit the controlling policy source.",
+                ),
+                Some(ApprovalMode::Bypass) if persist => CommandResult::error(
+                    "Full Access is not a valid top-level approval_policy. Use Shift+Tab to save the TUI-only posture.",
+                ),
                 Some(m) => {
-                    app.approval_mode = m;
                     if persist {
                         let saved = approval_mode_config_value(m);
                         match persist_root_string_key(
@@ -1429,23 +1462,34 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                             "approval_policy",
                             saved,
                         ) {
-                            Ok(path) => CommandResult::message(format!(
-                                "approval_mode = {} (saved to {} as approval_policy = \"{}\")",
-                                m.label(),
-                                path.display(),
-                                saved
-                            )),
+                            Ok(path) => {
+                                app.set_agent_approval_posture(m);
+                                app.mark_approval_policy_locked();
+                                CommandResult::with_message_and_action(
+                                    format!(
+                                        "approval_mode = {} (saved to {} as approval_policy = \"{}\")",
+                                        m.label(),
+                                        path.display(),
+                                        saved
+                                    ),
+                                    AppAction::ModeChanged(app.mode),
+                                )
+                            }
                             Err(err) => CommandResult::error(format!("Failed to save: {err}")),
                         }
                     } else {
-                        CommandResult::message(format!(
-                            "approval_mode = {} (session only, add --save to persist)",
-                            m.label()
-                        ))
+                        app.set_agent_approval_posture(m);
+                        CommandResult::with_message_and_action(
+                            format!(
+                                "approval_mode = {} (session only, add --save to persist)",
+                                m.label()
+                            ),
+                            AppAction::ModeChanged(app.mode),
+                        )
                     }
                 }
                 None => CommandResult::error(
-                    "Invalid approval_mode. Use: auto, suggest/on-request/untrusted, never/deny",
+                    "Invalid approval_mode. Use: auto, suggest/on-request/untrusted, bypass/full-access, never/deny",
                 ),
             };
         }
@@ -1464,7 +1508,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 " (session only, add --save to persist)".to_string()
             };
             let mode_hint = if enabled {
-                " Agent mode will expose shell on the next turn with approval gating. YOLO also enables shell and auto-approves."
+                " Act mode will expose shell on the next turn with approval gating. Bypass permissions (Shift+Tab) also enables shell and auto-approves."
             } else {
                 " Shell tools will be hidden on the next turn. Re-enable with `/config allow_shell true`."
             };
@@ -1853,9 +1897,7 @@ pub fn mode(app: &mut App, arg: Option<&str>) -> CommandResult {
                 CommandResult::message(message)
             }
         }
-        None => {
-            CommandResult::error("Usage: /mode [act|agent|plan|multitask|operate|yolo|1|2|3|5|4]")
-        }
+        None => CommandResult::error("Usage: /mode [act|agent|plan|operate|1|2|3]"),
     }
 }
 
@@ -2195,7 +2237,7 @@ mod tests {
         }
     }
 
-    fn create_test_app() -> App {
+    fn create_test_app_with_config(config: &Config) -> App {
         let options = TuiOptions {
             model: "test-model".to_string(),
             workspace: PathBuf::from("."),
@@ -2221,7 +2263,7 @@ mod tests {
             resume_session_id: None,
             initial_input: None,
         };
-        let mut app = App::new(options, &Config::default());
+        let mut app = App::new(options, config);
         // App::new folds in saved TUI settings from the developer machine.
         // Pin command tests back to DeepSeek semantics so model aliases are
         // not normalized through a provider selected in an interactive run.
@@ -2230,6 +2272,10 @@ mod tests {
         app.api_provider = crate::config::ApiProvider::Deepseek;
         app.model_ids_passthrough = false;
         app
+    }
+
+    fn create_test_app() -> App {
+        create_test_app_with_config(&Config::default())
     }
 
     #[test]
@@ -2425,7 +2471,7 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
         );
         assert_eq!(
             app.transcript_spacing,
-            crate::tui::app::TranscriptSpacing::Comfortable
+            crate::tui::app::TranscriptSpacing::Compact
         );
         // Evidence preserved: thinking is not hidden by the preset.
         assert!(app.show_thinking, "calm preset must not hide thinking");
@@ -2471,7 +2517,7 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
     fn sidebar_config_command_reports_width_suppression() {
         let mut app = create_test_app();
         app.sidebar_focus = SidebarFocus::Hidden;
-        app.last_sidebar_host_width = Some(63);
+        app.last_sidebar_host_width = Some(59);
 
         let result = sidebar(&mut app, Some("on"));
 
@@ -2480,7 +2526,7 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
         assert_eq!(
             result.message.as_deref(),
             Some(
-                "Sidebar is on, but hidden because the terminal is too narrow (63 cols; needs at least 64)"
+                "Sidebar is on, but hidden because the terminal is too narrow (59 cols; needs at least 60)"
             )
         );
     }
@@ -2489,7 +2535,7 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
     fn sidebar_config_command_is_visible_at_minimum_width() {
         let mut app = create_test_app();
         app.sidebar_focus = SidebarFocus::Hidden;
-        app.last_sidebar_host_width = Some(64);
+        app.last_sidebar_host_width = Some(60);
 
         let result = sidebar(&mut app, Some("on"));
 
@@ -2521,7 +2567,8 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
         // user settings on the host machine.
         let _ = mode(&mut app, Some("agent"));
         let result = mode(&mut app, Some("yolo"));
-        assert!(result.message.unwrap().contains("Switched to YOLO mode"));
+        // YOLO is invisible Act+Bypass shorthand — user-facing copy says Act.
+        assert!(result.message.unwrap().contains("Switched to Act mode"));
         assert_eq!(result.action, Some(AppAction::ModeChanged(AppMode::Yolo)));
         assert!(app.allow_shell);
         assert!(app.trust_mode);
@@ -2547,14 +2594,11 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
         let result = mode(&mut app, Some("3"));
         assert_eq!(
             result.action,
-            Some(AppAction::ModeChanged(AppMode::Multitask))
-        );
-        assert_eq!(app.mode, AppMode::Multitask);
-        let result = mode(&mut app, Some("5"));
-        assert_eq!(
-            result.action,
             Some(AppAction::ModeChanged(AppMode::Operate))
         );
+        assert_eq!(app.mode, AppMode::Operate);
+        let result = mode(&mut app, Some("5"));
+        assert!(result.is_error);
         assert_eq!(app.mode, AppMode::Operate);
         let result = mode(&mut app, Some("9"));
         assert!(result.is_error);
@@ -2850,10 +2894,12 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
 
         assert!(msg.contains("allow_shell = true"));
         assert!(msg.contains("session only"));
-        assert!(msg.contains("Agent mode"));
+        assert!(msg.contains("Act mode"));
         assert!(msg.contains("approval gating"));
         assert!(msg.contains("next turn"));
-        assert!(msg.contains("YOLO also enables shell and auto-approves"));
+        assert!(
+            msg.contains("Bypass permissions (Shift+Tab) also enables shell and auto-approves")
+        );
     }
 
     #[test]
@@ -2876,7 +2922,7 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
         assert_eq!(
             msg,
             format!(
-                "allow_shell = true (saved to {}). Agent mode will expose shell on the next turn with approval gating. YOLO also enables shell and auto-approves.",
+                "allow_shell = true (saved to {}). Act mode will expose shell on the next turn with approval gating. Bypass permissions (Shift+Tab) also enables shell and auto-approves.",
                 config_path.display()
             )
         );
@@ -3030,13 +3076,24 @@ max_concurrent = 4
         assert!(!result.is_error);
         assert!(msg.contains("Config editability audit"));
         assert!(msg.contains(&format!("Config path: {}", config_path.display())));
-        assert!(msg.contains("approval_policy | never | runtime+persisted"));
+        assert!(msg.contains("effective_permissions | Never | runtime"));
+        assert!(msg.contains("permission_posture | (unset) | TUI settings"));
+        assert!(msg.contains("approval_policy | (unset) | persisted config"));
         assert!(msg.contains("stream_chunk_timeout_secs | 45 | runtime+persisted"));
         assert!(msg.contains("subagents.enabled | false | runtime+persisted"));
         assert!(msg.contains("subagents.max_concurrent | 4 | runtime+persisted"));
         assert!(msg.contains("base_url | https://api.from-config.local/v1 | persisted restart"));
         assert!(msg.contains("instructions | configured | file-only restart"));
         assert!(msg.contains("network | unset | file-only"));
+
+        app.mode = AppMode::Plan;
+        let plan_msg = config_command(&mut app, Some("audit"))
+            .message
+            .expect("Plan audit message");
+        assert!(
+            plan_msg.contains("effective_permissions | Read Only | runtime"),
+            "{plan_msg}"
+        );
     }
 
     #[test]
@@ -3359,6 +3416,7 @@ max_concurrent = 4
             std::process::id()
         ));
         fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
         let config_path = temp_root.join("custom-config.toml");
 
         let mut app = create_test_app();
@@ -3378,8 +3436,19 @@ max_concurrent = 4
         );
         assert!(saved.contains("approval_policy = \"on-request\""));
 
-        let loaded = Config::load(Some(config_path), None).unwrap();
+        let loaded = Config::load(Some(config_path.clone()), None).unwrap();
         assert_eq!(loaded.approval_policy.as_deref(), Some("on-request"));
+
+        let mut restarted = create_test_app_with_config(&loaded);
+        restarted.config_path = Some(config_path.clone());
+        assert!(restarted.approval_policy_locked());
+        assert!(!restarted.approval_policy_requirements_managed());
+        let changed = config_command(&mut restarted, Some("approval_mode auto --save"));
+        assert!(!changed.is_error, "{:?}", changed.message);
+        assert!(matches!(changed.action, Some(AppAction::ModeChanged(_))));
+        assert_eq!(restarted.approval_mode, ApprovalMode::Auto);
+        let reloaded = Config::load(Some(config_path), None).unwrap();
+        assert_eq!(reloaded.approval_policy.as_deref(), Some("auto"));
     }
 
     #[test]

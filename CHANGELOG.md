@@ -7,7 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.68] - 2026-07-10
+
+### Changed
+
+- Make the advertised Android/Termux release target buildable by generating
+  QuickJS bindings against the Android NDK instead of expecting an upstream
+  pre-generated `aarch64-linux-android` binding file, and give Android CLI/TUI
+  HTTP clients a preconfigured rustls root store (Mozilla WebPKI roots) so
+  standalone Termux processes stop panicking inside
+  `rustls-platform-verifier`'s JVM expectations (#4236, #4242).
+- Rebalance the bundled Constitution after the v0.8.67 prompt ablation: keep
+  the procedural policy tail in mode-specific layers, while restoring concise
+  behavioral guidance for momentum, causal investigation, constraint-first
+  decisions, mechanism-backed guarantees, and clean continuity.
+- Wire live catalog cache into provider/model pickers without dropping stale or
+  prior rows after TTL expiry / refresh failure (#4139). Remove the dead
+  `OFFERING_SEEDS` hand table so the bundled Models.dev catalog is the sole
+  seed source; pickers show a compact `stale` / `cache failed` chrome chip when
+  the Models.dev layer is past TTL or last refresh failed.
+- Make `work_update` the sole model-facing To-do / Work progress tool (#4132).
+  `checklist_*` and `todo_*` remain registered as hidden compat aliases for
+  transcript replay; `update_plan` stays Strategy metadata/context/route, not
+  a second checklist. Mode/approval prompts nudge the single surface.
+- Demote the bundled Models.dev snapshot to an offline/stale fallback after
+  live catalog refresh (#4188). ProviderLake precedence is live Models.dev >
+  bundled seed > legacy hardcoded completion names; pickers, inventory, and
+  subagent validation stay catalog-backed, and CodeWhale-only providers keep
+  defaults when Models.dev has no rows.
+
 ### Added
+- Wire xAI device-code OAuth into `codewhale auth xai-device`, the TUI
+  `/auth xai-device` command, and guided provider setup, with comment-preserving
+  auth-mode persistence and loopback exchange coverage (#4257).
+- Add GPT-5.6 Sol, Terra, and Luna to the OpenAI API route, including their
+  1.05M context metadata, 128K output limits, pricing, and `max` reasoning
+  effort. Add Meta Model API as a first-class OpenAI-compatible provider for
+  Muse Spark 1.1 with 1M context, tool/reasoning metadata, provider aliases,
+  and both `META_MODEL_API_KEY` and Meta's `MODEL_API_KEY` credential names.
+- Catalog automation: `scripts/catalog_models_dev.py` refreshes secret-free
+  Models.dev / OpenRouter listings and validates the offline seed snapshot
+  (`snapshot --check`) without ever persisting API keys (#4117).
+- `/model` picker cycles six catalog views with `A` (Configured → Catalog →
+  Recent → Coding → Cheap → Long context) and richer row metadata from the
+  live/bundled catalog (context, max output, tools, reasoning, price/M,
+  freshness). Discoverability views do not auto-apply a surprising route
+  (#4115).
 
 - Workflow runs are now durable: every run appends to a
   `.codewhale/workflow-runs.jsonl` journal and hydrates on startup, so
@@ -20,12 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hotbar sources for MCP tools and skills: MCP tool slots prefill the
   composer (execution stays behind the normal tool-approval flow) and skill
   slots activate through the existing `$skill` alias (#2068, #2069).
-- Mode & permission surface: Tab cycles Plan → Act → Multitask → Operate;
-  Shift+Tab cycles the Agent permission posture (Ask / Auto-Review / Full
-  Access) with a footer permission chip; Ctrl+T cycles reasoning effort and
-  Ctrl+Shift+T opens the live transcript overlay. Multitask raises the
-  default sub-agent fan-out and focuses the Agents sidebar; Operate is a
-  thin Fleet-operator mode wired to `/setup` readiness.
+- Mode & permission surface: Tab cycles Plan → Act → Operate; Shift+Tab
+  cycles the Agent permission posture (Ask / Auto-Review / Full Access) with
+  a footer permission chip; Ctrl+T cycles reasoning effort and Ctrl+Shift+T
+  opens the live transcript overlay. Operate is the orchestration mode
+  (delegate, wait, inspect, dispatch) and raises sub-agent fan-out while
+  focusing the Agents sidebar.
 - Provider lake facade: the provider/model pickers, hotbar, and model
   inventory now enumerate configured providers' models from the bundled
   catalog (with an `A` toggle to browse the full catalog), replacing the
@@ -38,6 +83,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `extensions/vscode/` scaffold remains the read-only Phase 0 viewer (#4035).
 
 ### Fixed
+
+- Sub-agent waiting no longer peek→sleep polls: `agent(action="wait")` joins
+  children, unchanged peeks are throttled (~30s) with an anti-polling nudge,
+  and mode prompts teach the join primitive (#4097). Harvested from PR #4098
+  by [@Mr-Moon121](https://github.com/Mr-Moon121) (Jeffrey Luna).
+- `/provider` picker remembers catalog/configured view and highlighted row
+  across reopen, matching `/model` picker memory.
+- Mode picker roster is exactly Act / Plan / Operate (no Multitask, no
+  numeric `4`/`5` gaps). Legacy `yolo`/`4` remain invisible one-way
+  permission shorthand for Act + Bypass.
 
 - Fleet setup is a role/profile roster editor, not a provider-scoped model
   picker: the Model step lists routes from every configured provider (not
@@ -3001,7 +3056,8 @@ overflow report and `/theme` picker edge-wrapping patch in #1814.
 
 Older releases (v0.8.39 and earlier) are archived in [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md).
 
-[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.67...HEAD
+[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.68...HEAD
+[0.8.68]: https://github.com/Hmbown/CodeWhale/compare/v0.8.67...v0.8.68
 [0.8.67]: https://github.com/Hmbown/CodeWhale/compare/v0.8.66...v0.8.67
 [0.8.66]: https://github.com/Hmbown/CodeWhale/compare/v0.8.65...v0.8.66
 [0.8.65]: https://github.com/Hmbown/CodeWhale/compare/v0.8.64...v0.8.65

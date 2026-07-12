@@ -21,13 +21,13 @@ struct PlanOption {
 
 const PLAN_OPTIONS: [PlanOption; 4] = [
     PlanOption {
-        label: "Accept plan (Agent)",
-        description: "Start implementation in Agent mode with approvals",
+        label: "Accept plan (Act)",
+        description: "Start implementation in Act mode with approvals",
         shortcut: 'a',
     },
     PlanOption {
-        label: "Accept plan (YOLO)",
-        description: "Start implementation in YOLO mode (auto-approve)",
+        label: "Accept plan (Full Access)",
+        description: "Start implementation in Act with Full Access (bypass approvals)",
         shortcut: 'y',
     },
     PlanOption {
@@ -37,7 +37,7 @@ const PLAN_OPTIONS: [PlanOption; 4] = [
     },
     PlanOption {
         label: "Exit Plan mode",
-        description: "Return to Agent mode without implementation",
+        description: "Return to Act mode without implementation",
         shortcut: 'q',
     },
 ];
@@ -544,7 +544,7 @@ fn push_plan_snapshot_lines(
                 StepStatus::InProgress => "\u{25b6}",
                 StepStatus::Completed => "\u{2713}",
             };
-            let step_text = format!("  {status_mark} {}. {}", i + 1, &item.step);
+            let step_text = format!("  {status_mark} {}. {}", i + 1, item.step);
             for line in wrap_text(&step_text, content_width) {
                 lines.push(Line::from(Span::styled(
                     line,
@@ -589,7 +589,7 @@ fn push_todo_snapshot_lines(
             TodoStatus::InProgress => "\u{25b6}",
             TodoStatus::Completed => "\u{2713}",
         };
-        let item_text = format!("  {status_mark} {}. {}", i + 1, &item.content);
+        let item_text = format!("  {status_mark} {}. {}", i + 1, item.content);
         let style = if matches!(item.status, TodoStatus::Completed) {
             Style::default().fg(palette::TEXT_MUTED)
         } else {
@@ -821,8 +821,10 @@ mod tests {
 
         let rendered = render_view(&view, 110, 36);
 
-        assert!(rendered.contains("> [2/y] Accept plan (YOLO)"));
-        assert!(rendered.contains("Start implementation in YOLO mode (auto-approve)"));
+        assert!(rendered.contains("> [2/y] Accept plan (Full Access)"));
+        assert!(
+            rendered.contains("Start implementation in Act with Full Access (bypass approvals)")
+        );
     }
 
     #[test]
@@ -885,7 +887,7 @@ mod tests {
             critical_files: vec!["crates/tui/src/tools/plan.rs".to_string()],
             constraints: vec!["Preserve legacy update_plan payloads".to_string()],
             recommended_approach: Some(
-                "Keep checklist primary and enrich update_plan.".to_string(),
+                "Keep To-do primary and enrich update_plan Strategy metadata.".to_string(),
             ),
             verification_plan: Some("Run focused plan prompt tests.".to_string()),
             risks_and_unknowns: Some("Avoid dropping metadata-only plans.".to_string()),

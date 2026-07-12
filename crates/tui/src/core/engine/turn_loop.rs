@@ -596,6 +596,7 @@ impl Engine {
                 model: self.session.model.clone(),
                 messages: self.messages_with_turn_metadata(),
                 max_tokens: effective_max_output_tokens_for_route(
+                    self.api_provider,
                     &self.session.model,
                     self.active_route_limits,
                 ),
@@ -1354,6 +1355,10 @@ impl Engine {
                                 "Turn ending with {running} sub-agent(s) still running in the background; they'll report when done."
                             )))
                             .await;
+                        // Inject a waiting hint so the model does not poll
+                        // with peek/status/sleep on the next turn (issue #4097).
+                        self.add_session_message(waiting_for_subagents_runtime_message(running))
+                            .await;
                     }
                 }
                 if subagent_completions > 0 {
@@ -1606,7 +1611,7 @@ impl Engine {
                     )
                 {
                     blocked_error = Some(ToolError::permission_denied(format!(
-                        "'{tool_name}' is not available in Plan mode — switch to Agent or YOLO mode to run commands and code."
+                        "'{tool_name}' is not available in Plan mode — switch to Act mode (`/mode act`) to run commands and code."
                     )));
                 }
 
@@ -1765,7 +1770,7 @@ impl Engine {
                     && plan_mode_blocks_write_capable_tool(&tool_name, read_only)
                 {
                     blocked_error = Some(ToolError::permission_denied(format!(
-                        "'{tool_name}' is not available in Plan mode - switch to Agent or YOLO mode to modify files or run write-capable tools."
+                        "'{tool_name}' is not available in Plan mode - switch to Act mode (`/mode act`) to modify files or run write-capable tools."
                     )));
                 }
 
@@ -2504,8 +2509,10 @@ impl Engine {
                             "tool_name": outcome.name.clone(),
                             "success": output.success,
                         }));
-                        let output_for_context = compact_tool_result_for_context(
+                        let output_for_context = compact_tool_result_for_route(
+                            self.api_provider,
                             &self.session.model,
+                            self.active_route_limits,
                             &outcome.name,
                             &output,
                         );
@@ -2743,6 +2750,28 @@ XML unless the user explicitly asks to debug sub-agent internals.\n\n\
 {payload}\n\
 </codewhale:runtime_event>"
     )
+}
+
+fn waiting_for_subagents_runtime_message(running: usize) -> Message {
+    Message {
+        role: "user".to_string(),
+        content: vec![
+            ContentBlock::Text {
+                text: format!(
+                    "<codewhale:runtime_event kind=\"waiting_for_subagents\" visibility=\"internal\">\n\
+This is an internal runtime event, not user input. Your {running} sub-agent(s) \
+are still running. Do NOT poll them with agent(action=\"peek\") or \
+agent(action=\"status\"). Do NOT use sleep or any shell blocking primitive as a \
+waiting strategy. The runtime will deliver <codewhale:subagent.done> sentinels \
+automatically when each child finishes — polling will never make that happen \
+sooner. Stop immediately: emit zero tool calls and end the turn.\n\
+</codewhale:runtime_event>"
+                ),
+                cache_control: None,
+            },
+            runtime_event_turn_metadata_block(UserInputProvenance::SubAgentHandoff),
+        ],
+    }
 }
 
 fn subagent_completion_runtime_message(payload: &str) -> Message {
@@ -3145,6 +3174,10 @@ fn should_emit_thinking_only_status(
     tool_uses_empty && turn_error_is_none && !cancelled && !steers_pending && !holding_for_subagents
 }
 
+/// Sentinel reasoning-effort value meaning "let the auto-reasoning system
+/// decide" (#4158).
+const REASONING_EFFORT_AUTO: &str = "auto";
+
 /// Resolve an `"auto"` reasoning-effort tier to a concrete value.
 ///
 /// When the configured effort is `"auto"`, inspects the last user message
@@ -3156,7 +3189,7 @@ fn resolve_auto_effort(
     provider: crate::config::ApiProvider,
 ) -> Option<String> {
     match reasoning_effort {
-        Some("auto") => {
+        Some(effort) if effort == REASONING_EFFORT_AUTO => {
             // Find the last user message in the conversation.
             let last_msg = messages
                 .iter()

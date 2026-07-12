@@ -29,6 +29,7 @@ mod auto_reasoning;
 mod automation_manager;
 mod child_env;
 mod client;
+mod codex_model_cache;
 mod command_safety;
 mod commands;
 mod compaction;
@@ -46,6 +47,7 @@ mod dependencies;
 mod error_taxonomy;
 mod eval;
 mod execpolicy;
+mod fast_hash;
 mod features;
 mod fleet;
 mod goal_loop;
@@ -65,6 +67,7 @@ mod model_profile;
 mod model_registry;
 mod model_routing;
 mod models;
+mod models_dev_live;
 mod network_policy;
 mod oauth;
 mod palette;
@@ -77,6 +80,7 @@ mod prompt_zones;
 mod prompts;
 mod provider_lake;
 mod purge;
+mod regex_cache;
 mod remote_setup;
 pub mod repl;
 mod repo_law;
@@ -116,6 +120,7 @@ mod worker_profile;
 mod working_set;
 mod workspace_discovery;
 mod workspace_trust;
+mod xai_oauth;
 
 use crate::config::{Config, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS, effective_home_dir};
 use crate::eval::{EvalHarness, EvalHarnessConfig, ScenarioStepKind};
@@ -261,6 +266,8 @@ enum Commands {
     },
     /// Remove the saved API key
     Logout,
+    /// Manage provider authentication flows.
+    Auth(TuiAuthArgs),
     /// List available models from the configured API endpoint
     Models(ModelsArgs),
     /// Generate speech audio with Xiaomi MiMo TTS models
@@ -270,6 +277,9 @@ enum Commands {
     Exec(ExecArgs),
     /// Manage local Agent Fleet runs and workers
     Fleet(FleetArgs),
+    /// Internal model-free Workflow tool dispatcher used by Lane Runtime.
+    #[command(name = "workflow-tool", hide = true)]
+    WorkflowTool(WorkflowToolArgs),
     /// Run a code review over a git diff
     Review(ReviewArgs),
     /// Open the TUI pre-seeded with a GitHub PR's title, body, and diff
@@ -347,6 +357,10 @@ struct ExecArgs {
     /// one (#4093).
     #[arg(long)]
     provider: Option<String>,
+    /// Override reasoning/thinking effort for this run.
+    /// Accepted values: auto, off, low, medium, high, max.
+    #[arg(long = "reasoning-effort", value_name = "EFFORT")]
+    reasoning_effort: Option<String>,
     /// Enable tool-backed agent mode with auto-approvals
     #[arg(long, default_value_t = false)]
     auto: bool,
@@ -388,11 +402,34 @@ struct ExecArgs {
     prompt: Vec<String>,
 }
 
+#[derive(Args, Debug, Clone)]
+struct WorkflowToolArgs {
+    /// Authority provenance stamped by the public `workflow run` command.
+    #[arg(long, value_name = "SOURCE")]
+    approval_source: String,
+    /// Exact Workflow tool input serialized as one JSON object.
+    #[arg(long, value_name = "JSON")]
+    input_json: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ExecOutputFormat {
     Text,
     #[value(name = "stream-json")]
     StreamJson,
+}
+
+#[derive(Args, Debug, Clone)]
+struct TuiAuthArgs {
+    #[command(subcommand)]
+    command: TuiAuthCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum TuiAuthCommand {
+    /// Sign in to xAI/Grok with an SSH-friendly device code.
+    #[command(name = "xai-device")]
+    XaiDevice,
 }
 
 const CODEWHALE_TOOL_SURFACE_ENV: &str = "CODEWHALE_TOOL_SURFACE";
@@ -646,6 +683,31 @@ fn resolve_exec_model(config: &Config, explicit_model: Option<&str>) -> String {
         .map(ToOwned::to_owned)
         .or_else(exec_model_env_override)
         .unwrap_or_else(|| config.default_model())
+}
+
+fn apply_exec_provider_override(config: &mut Config, provider_arg: &str) -> Result<()> {
+    let provider_arg = provider_arg.trim();
+    if provider_arg.is_empty() {
+        return Ok(());
+    }
+    if let Some(provider) = crate::config::ApiProvider::parse(provider_arg) {
+        config.provider = Some(provider.as_str().to_string());
+        return Ok(());
+    }
+    if config
+        .providers
+        .as_ref()
+        .and_then(|providers| providers.custom_provider_config(provider_arg))
+        .is_some()
+    {
+        config.provider = Some(provider_arg.to_string());
+        return Ok(());
+    }
+    bail!(
+        "Unrecognized --provider {provider_arg:?}. Known providers: {} \
+         or a configured [providers.<name>] custom provider",
+        crate::config::ApiProvider::names_hint()
+    );
 }
 
 fn exec_model_env_override() -> Option<String> {
@@ -1241,6 +1303,9 @@ async fn main() -> Result<()> {
             Commands::Init => init_project(),
             Commands::Login { api_key } => run_login(api_key),
             Commands::Logout => run_logout(),
+            Commands::Auth(args) => match args.command {
+                TuiAuthCommand::XaiDevice => run_xai_device_auth(cli.config.as_deref()),
+            },
             Commands::Models(args) => {
                 let config = load_config_from_cli(&cli)?;
                 run_models(&config, args).await
@@ -1278,13 +1343,15 @@ async fn main() -> Result<()> {
                     .map(str::trim)
                     .filter(|p| !p.is_empty())
                 {
-                    let Some(provider) = crate::config::ApiProvider::parse(provider_arg) else {
-                        bail!(
-                            "Unrecognized --provider {provider_arg:?}. Known providers: {}",
-                            crate::config::ApiProvider::names_hint()
-                        );
-                    };
-                    config.provider = Some(provider.as_str().to_string());
+                    apply_exec_provider_override(&mut config, provider_arg)?;
+                }
+                if let Some(reasoning_arg) = args
+                    .reasoning_effort
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    config.reasoning_effort = normalize_cli_reasoning_effort(reasoning_arg)?;
                 }
                 let model = resolve_exec_model(&config, args.model.as_deref());
                 let prompt = join_prompt_parts(&args.prompt);
@@ -1345,6 +1412,7 @@ async fn main() -> Result<()> {
                 let workspace = resolve_workspace(&cli);
                 run_fleet_command(&workspace, &config, args).await
             }
+            Commands::WorkflowTool(args) => run_workflow_tool_command(&cli, args).await,
             Commands::Review(args) => {
                 let config = load_config_from_cli(&cli)?;
                 run_review(&config, args).await
@@ -1653,6 +1721,14 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
                 .as_ref()
                 .map(|call_id| format!("running_tool tool={tool} call_id={call_id}"))
                 .unwrap_or_else(|| format!("running_tool tool={tool}")),
+            FleetWorkerEventPayload::WorkflowEvent {
+                workflow_run_id,
+                event,
+            } => event
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(|kind| format!("workflow_event run_id={workflow_run_id} type={kind}"))
+                .unwrap_or_else(|| format!("workflow_event run_id={workflow_run_id}")),
             FleetWorkerEventPayload::Heartbeat { .. } => "heartbeat".to_string(),
             FleetWorkerEventPayload::Artifact(artifact) => {
                 format!("artifact kind={}", artifact_kind_label(&artifact.kind))
@@ -4743,14 +4819,14 @@ fn doctor_auth_scheme(config: &Config) -> &'static str {
 }
 
 fn doctor_xiaomi_mimo_base_url_uses_token_plan(base_url: &str) -> bool {
-    let normalized = base_url.trim_end_matches('/').to_ascii_lowercase();
+    let normalized = base_url.trim_end_matches('/');
     [
         crate::config::XIAOMI_MIMO_TOKEN_PLAN_CN_BASE_URL,
         crate::config::XIAOMI_MIMO_TOKEN_PLAN_SGP_BASE_URL,
         crate::config::XIAOMI_MIMO_TOKEN_PLAN_AMS_BASE_URL,
     ]
     .iter()
-    .any(|candidate| normalized == candidate.trim_end_matches('/').to_ascii_lowercase())
+    .any(|candidate| normalized.eq_ignore_ascii_case(candidate.trim_end_matches('/')))
 }
 
 fn doctor_api_key_source_label(source: ApiKeySource) -> &'static str {
@@ -4895,15 +4971,19 @@ enum DeepSeekBaseUrlKind {
 }
 
 fn known_deepseek_base_url_kind(base_url: &str) -> Option<DeepSeekBaseUrlKind> {
-    match base_url.trim_end_matches('/').to_ascii_lowercase().as_str() {
-        "https://api.deepseek.com/beta" | "https://api.deepseeki.com/beta" => {
-            Some(DeepSeekBaseUrlKind::Beta)
-        }
-        "https://api.deepseek.com"
-        | "https://api.deepseek.com/v1"
-        | "https://api.deepseeki.com"
-        | "https://api.deepseeki.com/v1" => Some(DeepSeekBaseUrlKind::NonBeta),
-        _ => None,
+    let normalized = base_url.trim_end_matches('/');
+    if normalized.eq_ignore_ascii_case("https://api.deepseek.com/beta")
+        || normalized.eq_ignore_ascii_case("https://api.deepseeki.com/beta")
+    {
+        Some(DeepSeekBaseUrlKind::Beta)
+    } else if normalized.eq_ignore_ascii_case("https://api.deepseek.com")
+        || normalized.eq_ignore_ascii_case("https://api.deepseek.com/v1")
+        || normalized.eq_ignore_ascii_case("https://api.deepseeki.com")
+        || normalized.eq_ignore_ascii_case("https://api.deepseeki.com/v1")
+    {
+        Some(DeepSeekBaseUrlKind::NonBeta)
+    } else {
+        None
     }
 }
 
@@ -5399,6 +5479,17 @@ fn run_login(api_key: Option<String>) -> Result<()> {
 fn run_logout() -> Result<()> {
     config::clear_api_key()?;
     println!("Cleared saved API key.");
+    Ok(())
+}
+
+fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
+    let _credentials = xai_oauth::device_code_login()?;
+    let saved =
+        config::save_provider_auth_mode_for_at(config::ApiProvider::Xai, "oauth", config_path)?;
+    println!(
+        "xAI OAuth is ready; saved [providers.xai] auth_mode = \"oauth\" to {}",
+        saved.display()
+    );
     Ok(())
 }
 
@@ -7121,6 +7212,12 @@ async fn run_interactive(
 
     startup_trace::mark("interactive_config");
 
+    // Seed ProviderLake from the secret-free Models.dev disk cache before any
+    // picker/inventory read, then kick a best-effort background refresh (#4187).
+    // Failures are quiet: bundled catalog rows always remain available.
+    crate::models_dev_live::maybe_load_persisted_cache();
+    crate::models_dev_live::spawn_background_refresh();
+
     // Boot janitors — snapshot prune (7-day default), spillover prune
     // (#422), and managed-session cleanup (v0.8.44) — are best-effort disk
     // hygiene. On a large ~/.codewhale they were the dominant startup cost
@@ -7208,6 +7305,26 @@ fn cli_reasoning_effort_value(
     effort
         .api_value_for_provider(config.api_provider())
         .map(str::to_string)
+}
+
+fn normalize_cli_reasoning_effort(value: &str) -> Result<Option<String>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let normalized = match trimmed.to_ascii_lowercase().as_str() {
+        "inherit" | "parent" | "same" | "current" | "default" | "unset" => return Ok(None),
+        "off" | "disabled" | "none" | "false" => "off",
+        "low" | "minimal" => "low",
+        "medium" | "mid" => "medium",
+        "high" => "high",
+        "auto" | "automatic" => "auto",
+        "max" | "maximum" | "xhigh" | "ultracode" => "max",
+        _ => bail!(
+            "Unrecognized --reasoning-effort {trimmed:?}. Expected: auto, off, low, medium, high, max, or default."
+        ),
+    };
+    Ok(Some(normalized.to_string()))
 }
 
 fn config_for_cli_route(config: &Config, route: &CliAutoRoute) -> Config {
@@ -7441,6 +7558,11 @@ enum ExecStreamEvent {
         output: String,
         status: String,
     },
+    #[serde(rename = "workflow_event")]
+    WorkflowEvent {
+        run_id: String,
+        event: serde_json::Value,
+    },
     #[serde(rename = "session_capture")]
     SessionCapture { content: String },
     #[serde(rename = "metadata")]
@@ -7454,6 +7576,381 @@ enum ExecStreamEvent {
 fn emit_exec_stream_event(event: &ExecStreamEvent) -> Result<()> {
     println!("{}", serde_json::to_string(event)?);
     Ok(())
+}
+
+async fn run_workflow_tool_command(cli: &Cli, args: WorkflowToolArgs) -> Result<()> {
+    match run_workflow_tool_command_inner(cli, args).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = emit_exec_stream_event(&ExecStreamEvent::Error {
+                error: format!("{error:#}"),
+            });
+            exit_workflow_tool_failure();
+        }
+    }
+}
+
+async fn run_workflow_tool_command_inner(cli: &Cli, args: WorkflowToolArgs) -> Result<()> {
+    use crate::tools::spec::ToolSpec;
+
+    if args.approval_source != "explicit-workflow-command" {
+        bail!("workflow-tool requires --approval-source explicit-workflow-command");
+    }
+    let input: serde_json::Value = serde_json::from_str(&args.input_json)
+        .context("--input-json must be a valid Workflow tool input object")?;
+    if !input.is_object() {
+        bail!("--input-json must be a JSON object");
+    }
+    if !input
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|action| action.eq_ignore_ascii_case("run"))
+    {
+        bail!("workflow-tool accepts only action=run");
+    }
+
+    let workspace = resolve_workspace(cli);
+    let mut config = load_config_from_cli(cli)?;
+    merge_user_workspace_config(&mut config, cli.config.clone(), &workspace);
+    if let Ok(env_url) = std::env::var("DEEPSEEK_BASE_URL") {
+        let trimmed = env_url.trim();
+        if !trimmed.is_empty() {
+            config.base_url = Some(trimmed.to_string());
+        }
+    }
+
+    let model = resolve_exec_model(&config, None);
+    let route = resolve_cli_auto_route(
+        &config,
+        &model,
+        "Run a checked-in Workflow through the host runtime",
+    )
+    .await?;
+    let execution_config = config_for_cli_route(&config, &route);
+    let tool_id = format!("workflow_host_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    emit_exec_stream_event(&ExecStreamEvent::ToolUse {
+        name: "workflow".to_string(),
+        id: tool_id.clone(),
+        input: input.clone(),
+    })?;
+
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(1024);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let event_forwarder = tokio::spawn(forward_direct_workflow_events(event_rx, stop_rx));
+    let (tool, context) =
+        match build_direct_workflow_tool(&execution_config, &route, &workspace, event_tx).await {
+            Ok(built) => built,
+            Err(err) => {
+                let _ = stop_tx.send(());
+                let _ = event_forwarder.await;
+                exit_workflow_tool_error(&tool_id, err.to_string());
+            }
+        };
+
+    let result = tool.execute(input, &context).await;
+    drop(tool);
+    let _ = stop_tx.send(());
+    event_forwarder
+        .await
+        .context("workflow event forwarder task failed")??;
+
+    let result = match result {
+        Ok(result) => result,
+        Err(err) => {
+            let error = err.to_string();
+            exit_workflow_tool_error(&tool_id, error);
+        }
+    };
+
+    let workflow_status =
+        direct_workflow_status(&result.content).unwrap_or_else(|| "unknown".to_string());
+    let completed = result.success && workflow_status == "completed";
+    emit_exec_stream_event(&ExecStreamEvent::ToolResult {
+        id: tool_id,
+        output: result.content.clone(),
+        status: if completed { "success" } else { "error" }.to_string(),
+    })?;
+    emit_exec_stream_event(&ExecStreamEvent::Metadata {
+        meta: ExecStreamMeta {
+            // No parent/operator model call occurs on this host-owned path;
+            // child model/provider usage remains attributable in typed task
+            // receipts rather than being misreported as one root model.
+            model: "host-workflow".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            input_analysis: ExecStreamInputAnalysis::default(),
+            visible_final_answer_chars: result.content.chars().count(),
+            session_id: String::new(),
+            resume_command: String::new(),
+            workspace: workspace.display().to_string(),
+            message_count: 0,
+            status: Some(workflow_status.clone()),
+        },
+    })?;
+    if !completed {
+        let error = format!("workflow run ended with terminal status {workflow_status}");
+        emit_exec_stream_event(&ExecStreamEvent::Error {
+            error: error.clone(),
+        })?;
+        exit_workflow_tool_failure();
+    }
+    emit_exec_stream_event(&ExecStreamEvent::Done)?;
+    Ok(())
+}
+
+fn exit_workflow_tool_failure() -> ! {
+    let _ = io::stdout().flush();
+    std::process::exit(1)
+}
+
+fn exit_workflow_tool_error(tool_id: &str, error: String) -> ! {
+    let _ = emit_exec_stream_event(&ExecStreamEvent::ToolResult {
+        id: tool_id.to_string(),
+        output: error.clone(),
+        status: "error".to_string(),
+    });
+    let _ = emit_exec_stream_event(&ExecStreamEvent::Error { error });
+    exit_workflow_tool_failure()
+}
+
+async fn initialize_direct_workflow_mcp_pool(
+    config: &Config,
+    workspace: &Path,
+    network_policy: Option<crate::network_policy::NetworkPolicyDecider>,
+) -> Option<(
+    std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>,
+    Vec<(String, String)>,
+)> {
+    if !config.features().enabled(Feature::Mcp) {
+        return None;
+    }
+    let mut pool =
+        crate::mcp::McpPool::from_config_path_with_workspace(&config.mcp_config_path(), workspace)
+            .unwrap_or_else(|error| {
+                tracing::debug!("No MCP config for direct Workflow runtime: {error:#}");
+                crate::mcp::McpPool::new(crate::mcp::McpConfig::default())
+            });
+    if let Some(policy) = network_policy {
+        pool = pool.with_network_policy(policy);
+    }
+    let failures = pool
+        .connect_all()
+        .await
+        .into_iter()
+        .map(|(server, error)| (server, format!("{error:#}")))
+        .collect();
+    Some((std::sync::Arc::new(tokio::sync::Mutex::new(pool)), failures))
+}
+
+async fn build_direct_workflow_tool(
+    config: &Config,
+    route: &CliAutoRoute,
+    workspace: &Path,
+    event_tx: tokio::sync::mpsc::Sender<crate::core::events::Event>,
+) -> Result<(
+    crate::tools::workflow::WorkflowTool,
+    crate::tools::ToolContext,
+)> {
+    use std::sync::Arc;
+
+    use crate::client::DeepSeekClient;
+    use crate::core::authority::shell_policy_for_mode;
+    use crate::fleet::roster::FleetRoster;
+    use crate::tools::AgentToolSurfaceOptions;
+    use crate::tools::goal::new_shared_goal_state;
+    use crate::tools::subagent::{SubAgentRuntime, new_shared_subagent_manager_with_timeout};
+    use crate::tools::todo::new_shared_todo_list;
+    use crate::tui::app::AppMode;
+
+    let provider = config.api_provider();
+    if !config.subagents_enabled_for_provider(provider) {
+        bail!(
+            "Workflow dispatch requires sub-agents for provider {} ({})",
+            provider.as_str(),
+            config
+                .subagents_disabled_reason()
+                .unwrap_or("provider-specific sub-agent configuration disabled it")
+        );
+    }
+
+    let yolo = config.yolo.unwrap_or(false);
+    let mode = if yolo {
+        AppMode::Yolo
+    } else {
+        AppMode::Operate
+    };
+    let allow_shell = yolo || config.allow_shell();
+    let shell_policy = shell_policy_for_mode(mode, allow_shell);
+    let trusted = crate::workspace_trust::WorkspaceTrust::load_for(workspace);
+    let mut context = crate::tools::ToolContext::with_auto_approve(
+        workspace.to_path_buf(),
+        yolo,
+        config.notes_path(),
+        config.mcp_config_path(),
+        yolo,
+    )
+    .with_features(config.features())
+    .with_skills_config(
+        config.skills_dir(),
+        config.skills_config().scan_codewhale_only(),
+    )
+    .with_shell_policy(shell_policy)
+    .with_trusted_external_paths(trusted.paths().to_vec())
+    .with_elevated_sandbox_policy(workflow_host_sandbox_policy(config, mode, workspace));
+    let network_policy = config.network.clone().map(|network| {
+        crate::network_policy::NetworkPolicyDecider::with_default_audit(network.into_runtime())
+    });
+    if let Some(policy) = network_policy.as_ref() {
+        context = context.with_network_policy(policy.clone());
+    }
+    if config.memory_enabled() {
+        context.memory_path = Some(config.memory_path());
+    }
+    context.search_provider = config.search_provider();
+    context.search_api_key = config
+        .search
+        .as_ref()
+        .and_then(|search| search.api_key.clone());
+    context.search_base_url = config
+        .search
+        .as_ref()
+        .and_then(|search| search.base_url.clone());
+    if let Some(backend) = crate::sandbox::backend::create_backend(config)? {
+        context = context.with_sandbox_backend(Arc::from(backend));
+    }
+
+    let max_subagents = config.max_subagents_for_provider(provider);
+    let manager = new_shared_subagent_manager_with_timeout(
+        workspace.to_path_buf(),
+        max_subagents,
+        config
+            .max_admitted_subagents_for_provider(provider)
+            .max(max_subagents),
+        Duration::from_secs(config.subagent_heartbeat_timeout_secs_for_provider(provider)),
+        config.launch_concurrency_for_provider(provider),
+        config.subagent_token_budget_for_provider(provider),
+    );
+    let roster = Arc::new(FleetRoster::load(&config.fleet_config(), workspace));
+    let mut role_models = roster.model_overrides();
+    role_models.extend(config.subagent_model_overrides());
+
+    let features = config.features();
+    let mut surface = AgentToolSurfaceOptions::new(shell_policy);
+    surface.apply_patch_enabled = features.enabled(Feature::ApplyPatch);
+    surface.web_search_enabled = features.enabled(Feature::WebSearch);
+    surface.memory_tool_enabled = config.memory_enabled() && !config.moraine_fallback();
+    surface.vision_config = features
+        .enabled(Feature::VisionModel)
+        .then(|| config.vision_model_config())
+        .flatten();
+    surface.speech_output_dir = config.speech_output_dir();
+    surface.goal_state = Some(new_shared_goal_state());
+
+    let client = DeepSeekClient::new(config)?;
+    let reasoning_effort = route
+        .reasoning_effort
+        .and_then(|effort| cli_reasoning_effort_value(config, effort));
+    let mcp_pool = if let Some((pool, failures)) =
+        initialize_direct_workflow_mcp_pool(config, workspace, network_policy).await
+    {
+        for (server, error) in failures {
+            tracing::warn!(
+                server = %server,
+                error = %error,
+                "direct Workflow runtime could not connect MCP server"
+            );
+        }
+        Some(pool)
+    } else {
+        None
+    };
+    let runtime = SubAgentRuntime::new(
+        client,
+        route.model.clone(),
+        context.clone(),
+        allow_shell,
+        Some(event_tx),
+        manager.clone(),
+    )
+    .with_role_models(role_models)
+    .with_api_config(config.clone())
+    .with_fleet_roster(roster)
+    .with_auto_model(route.auto_model)
+    .with_reasoning_effort(reasoning_effort, route.auto_model)
+    .with_agent_tool_surface_options(surface)
+    .with_max_spawn_depth(config.subagent_max_spawn_depth_for_provider(provider))
+    .with_step_api_timeout(Duration::from_secs(
+        config.subagent_api_timeout_secs_for_provider(provider),
+    ))
+    .with_speech_output_dir(config.speech_output_dir())
+    .with_mcp_pool(mcp_pool)
+    .with_todos(new_shared_todo_list())
+    .with_parent_mode(mode);
+
+    Ok((
+        crate::tools::workflow::WorkflowTool::new(manager, runtime).with_explicit_cli_approval(),
+        context,
+    ))
+}
+
+fn workflow_host_sandbox_policy(
+    config: &Config,
+    mode: crate::tui::app::AppMode,
+    workspace: &Path,
+) -> crate::sandbox::SandboxPolicy {
+    use crate::sandbox::SandboxPolicy;
+
+    match config.sandbox_mode.as_deref() {
+        Some("read-only") => SandboxPolicy::ReadOnly,
+        Some("workspace-write") => SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![workspace.to_path_buf()],
+            network_access: true,
+            exclude_tmpdir: false,
+            exclude_slash_tmp: false,
+        },
+        Some("danger-full-access") => SandboxPolicy::DangerFullAccess,
+        Some("external-sandbox") => SandboxPolicy::ExternalSandbox {
+            network_access: true,
+        },
+        _ => crate::core::authority::sandbox_policy_for_mode(mode, workspace),
+    }
+}
+
+async fn forward_direct_workflow_events(
+    mut event_rx: tokio::sync::mpsc::Receiver<crate::core::events::Event>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            biased;
+            event = event_rx.recv() => match event {
+                Some(event) => emit_direct_workflow_event(event)?,
+                None => return Ok(()),
+            },
+            _ = &mut stop_rx => {
+                while let Ok(event) = event_rx.try_recv() {
+                    emit_direct_workflow_event(event)?;
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn emit_direct_workflow_event(event: crate::core::events::Event) -> Result<()> {
+    if let crate::core::events::Event::WorkflowUi { run_id, event } = event {
+        emit_exec_stream_event(&ExecStreamEvent::WorkflowEvent { run_id, event })?;
+    }
+    Ok(())
+}
+
+fn direct_workflow_status(content: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()?
+        .get("status")?
+        .as_str()
+        .map(str::to_ascii_lowercase)
 }
 
 fn exec_stream_input_analysis(
@@ -7690,6 +8187,11 @@ async fn run_exec_agent(
     let compaction = CompactionConfig {
         enabled: auto_compact_enabled,
         model: effective_model.clone(),
+        effective_context_window: Some(crate::route_budget::route_context_window_tokens(
+            effective_provider,
+            &effective_model,
+            active_route_limits,
+        )),
         token_threshold: crate::route_budget::compaction_threshold_for_route_at_percent(
             effective_provider,
             &effective_model,
@@ -7743,7 +8245,7 @@ async fn run_exec_agent(
         subagents_enabled: execution_config.subagents_enabled_for_provider(effective_provider),
         features: execution_config.features(),
         auto_review_policy: execution_config.auto_review_policy(),
-        compaction,
+        compaction: compaction.clone(),
         todos: new_shared_todo_list(),
         plan_state: new_shared_plan_state(),
         goal_state: crate::tools::goal::new_shared_goal_state(),
@@ -7852,6 +8354,8 @@ async fn run_exec_agent(
             mode,
             provider: Some(effective_provider),
             model: effective_model.clone(),
+            route_limits: active_route_limits,
+            compaction: Box::new(compaction.clone()),
             goal_objective: None,
             goal_token_budget: None,
             goal_status: crate::tools::goal::GoalStatus::Active,
@@ -8030,6 +8534,11 @@ async fn run_exec_agent(
             Event::AgentSpawned { .. }
             | Event::AgentProgress { .. }
             | Event::AgentComplete { .. } => {}
+            Event::WorkflowUi { run_id, event }
+                if output_format == ExecOutputFormat::StreamJson =>
+            {
+                emit_exec_stream_event(&ExecStreamEvent::WorkflowEvent { run_id, event })?;
+            }
             Event::ApprovalRequired { id, .. } => {
                 if auto_approve {
                     let _ = engine_handle.approve_tool_call(id).await;
@@ -8761,7 +9270,7 @@ mod doctor_setup_state_tests {
     }
 
     #[test]
-    fn doctor_setup_report_json_reports_operate_readiness() {
+    fn doctor_setup_report_json_fails_closed_without_operate_receipts() {
         let _guard = crate::test_support::lock_test_env();
         let tmp = TempDir::new().expect("tempdir");
         let (_home_guard, _codewhale_home) = prepare_env(&tmp);
@@ -8805,7 +9314,7 @@ mod doctor_setup_state_tests {
         let report = doctor_setup_report_json(&Config::default(), &workspace);
 
         assert_eq!(report["first_run_ready"], true);
-        assert_eq!(report["operate_ready"], true);
+        assert_eq!(report["operate_ready"], false);
         assert_eq!(
             report["operate_fleet"]["concurrency"]["plan_limit_probed"],
             false
@@ -8870,6 +9379,21 @@ mod doctor_endpoint_tests {
         assert_eq!(status.status, "disabled");
         assert!(!status.function_strict_sent);
         assert!(status.recommended_base_url.is_none());
+    }
+
+    #[test]
+    fn doctor_known_base_urls_are_ascii_case_insensitive() {
+        assert!(doctor_xiaomi_mimo_base_url_uses_token_plan(
+            "HTTPS://TOKEN-PLAN-CN.XIAOMIMIMO.COM/V1/"
+        ));
+        assert_eq!(
+            known_deepseek_base_url_kind("HTTPS://API.DEEPSEEK.COM/BETA/"),
+            Some(DeepSeekBaseUrlKind::Beta)
+        );
+        assert_eq!(
+            known_deepseek_base_url_kind("HTTPS://API.DEEPSEEK.COM/V1/"),
+            Some(DeepSeekBaseUrlKind::NonBeta)
+        );
     }
 
     #[test]
@@ -9207,6 +9731,149 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn xai_device_auth_subcommand_parses() {
+        let cli = parse_cli(&["codewhale-tui", "auth", "xai-device"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth(TuiAuthArgs {
+                command: TuiAuthCommand::XaiDevice
+            }))
+        ));
+    }
+
+    #[test]
+    fn workflow_tool_internal_subcommand_parses_exact_json() {
+        let cli = parse_cli(&[
+            "codewhale-tui",
+            "workflow-tool",
+            "--approval-source",
+            "explicit-workflow-command",
+            "--input-json",
+            r#"{"action":"run","source_path":"workflows/demo.js"}"#,
+        ]);
+        let Some(Commands::WorkflowTool(args)) = cli.command else {
+            panic!("expected workflow-tool command");
+        };
+        assert!(args.input_json.contains("\"action\":\"run\""));
+    }
+
+    #[tokio::test]
+    async fn direct_workflow_tool_runs_without_an_operator_model_turn() {
+        use crate::tools::spec::ToolSpec;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let config = Config {
+            provider: Some("vllm".to_string()),
+            mcp_config_path: Some(
+                workspace
+                    .path()
+                    .join("missing-mcp.json")
+                    .display()
+                    .to_string(),
+            ),
+            providers: Some(crate::config::ProvidersConfig {
+                vllm: crate::config::ProviderConfig {
+                    base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                    model: Some("offline-test-model".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let route = CliAutoRoute {
+            provider: crate::config::ApiProvider::Vllm,
+            model: "offline-test-model".to_string(),
+            reasoning_effort: None,
+            auto_model: false,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let (tool, context) =
+            build_direct_workflow_tool(&config, &route, workspace.path(), event_tx)
+                .await
+                .expect("build direct workflow runtime");
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "action": "run",
+                    "script": "phase('offline'); return { ok: true };",
+                    "token_budget": 1_000_000
+                }),
+                &context,
+            )
+            .await
+            .expect("model-free workflow run");
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.content).expect("workflow JSON");
+
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["result"]["ok"], true);
+        assert_eq!(payload["child_ids"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            payload["plan_approval"]["decision"],
+            "approved_explicit_cli_command"
+        );
+        assert!(!context.auto_approve);
+        assert!(!context.trust_mode);
+        assert_eq!(
+            context.shell_policy,
+            crate::worker_profile::ShellPolicy::None
+        );
+        assert!(matches!(
+            context.elevated_sandbox_policy,
+            Some(crate::sandbox::SandboxPolicy::WorkspaceWrite { .. })
+        ));
+        let mut event_types = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let crate::core::events::Event::WorkflowUi { event, .. } = event
+                && let Some(kind) = event["type"].as_str()
+            {
+                event_types.push(kind.to_string());
+            }
+        }
+        assert!(event_types.iter().any(|kind| kind == "run_started"));
+        assert!(event_types.iter().any(|kind| kind == "run_completed"));
+    }
+
+    #[tokio::test]
+    async fn direct_workflow_mcp_pool_applies_network_policy_before_connect() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mcp_path = workspace.path().join("mcp.json");
+        std::fs::write(
+            &mcp_path,
+            r#"{
+                "mcpServers": {
+                    "blocked": { "url": "https://blocked.invalid/mcp" }
+                }
+            }"#,
+        )
+        .expect("write MCP config");
+        let config = Config {
+            mcp_config_path: Some(mcp_path.display().to_string()),
+            ..Default::default()
+        };
+        let policy = crate::network_policy::NetworkPolicyDecider::new(
+            crate::network_policy::NetworkPolicy {
+                default: crate::network_policy::DecisionToml::Deny,
+                allow: Vec::new(),
+                deny: Vec::new(),
+                proxy: Vec::new(),
+                audit: false,
+            },
+            None,
+        );
+
+        let (_pool, failures) =
+            initialize_direct_workflow_mcp_pool(&config, workspace.path(), Some(policy))
+                .await
+                .expect("MCP feature enabled");
+        assert_eq!(failures.len(), 1, "failures={failures:?}");
+        assert_eq!(failures[0].0, "blocked");
+        assert!(failures[0].1.contains("blocked by network policy"));
+    }
+
+    #[test]
     fn exec_model_resolution_uses_provider_scoped_default() {
         let _env_lock = crate::test_support::lock_test_env();
         let _codewhale_model = crate::test_support::EnvVarGuard::remove("CODEWHALE_MODEL");
@@ -9413,6 +10080,84 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn exec_provider_override_accepts_configured_custom_provider() {
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "lm-studio".to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+                model: Some("qwen-2.5-7b".to_string()),
+                api_key: Some("lm-studio".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut config = Config {
+            provider: Some("deepseek".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        apply_exec_provider_override(&mut config, "lm-studio")
+            .expect("configured custom provider should be accepted");
+
+        assert_eq!(config.provider.as_deref(), Some("lm-studio"));
+        assert_eq!(config.api_provider(), crate::config::ApiProvider::Custom);
+    }
+
+    #[test]
+    fn exec_provider_override_rejects_unknown_provider() {
+        let mut config = Config {
+            provider: Some("deepseek".to_string()),
+            ..Default::default()
+        };
+
+        let err = apply_exec_provider_override(&mut config, "lm-studio")
+            .expect_err("unconfigured custom provider should fail closed");
+        let message = err.to_string();
+
+        assert!(message.contains("Unrecognized --provider"));
+        assert!(message.contains("[providers.<name>] custom provider"));
+        assert_eq!(config.provider.as_deref(), Some("deepseek"));
+    }
+
+    #[test]
+    fn exec_parses_reasoning_effort_flag_alongside_provider() {
+        let cli = parse_cli(&[
+            "codewhale",
+            "exec",
+            "--provider",
+            "openrouter",
+            "--model",
+            "glm-5.2",
+            "--reasoning-effort",
+            "max",
+            "audit",
+        ]);
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert_eq!(args.provider.as_deref(), Some("openrouter"));
+        assert_eq!(args.model.as_deref(), Some("glm-5.2"));
+        assert_eq!(args.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(args.prompt, vec!["audit"]);
+    }
+
+    #[test]
+    fn cli_reasoning_effort_normalizes_aliases_and_rejects_typos() {
+        assert_eq!(
+            normalize_cli_reasoning_effort("xhigh").unwrap().as_deref(),
+            Some("max")
+        );
+        assert_eq!(normalize_cli_reasoning_effort("default").unwrap(), None);
+        assert!(normalize_cli_reasoning_effort("expensive").is_err());
+    }
+
+    #[test]
     fn exec_accepts_resume_session_flags_for_harnesses() {
         let cli = parse_cli(&[
             "codewhale",
@@ -9589,6 +10334,25 @@ mod terminal_mode_tests {
         assert!(!json.contains('\n'));
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert_eq!(parsed["type"], "tool_result");
+    }
+
+    #[test]
+    fn workflow_receipt_stream_event_is_one_json_line() {
+        let event = ExecStreamEvent::WorkflowEvent {
+            run_id: "workflow_1234".to_string(),
+            event: serde_json::json!({
+                "type": "task_completed",
+                "task_id": "agent_1",
+                "status": "succeeded"
+            }),
+        };
+
+        let json = serde_json::to_string(&event).expect("serializes");
+        assert!(!json.contains('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["type"], "workflow_event");
+        assert_eq!(parsed["run_id"], "workflow_1234");
+        assert_eq!(parsed["event"]["type"], "task_completed");
     }
 
     #[test]

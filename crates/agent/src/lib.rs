@@ -127,6 +127,35 @@ impl Default for ModelRegistry {
                 supports_tools: true,
                 supports_reasoning: true,
             },
+            // OpenAI public API GPT-5.6 family.
+            ModelInfo {
+                id: "gpt-5.6".to_string(),
+                provider: ProviderKind::Openai,
+                aliases: vec!["gpt56".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "gpt-5.6-sol".to_string(),
+                provider: ProviderKind::Openai,
+                aliases: vec!["gpt56-sol".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "gpt-5.6-terra".to_string(),
+                provider: ProviderKind::Openai,
+                aliases: vec!["gpt56-terra".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "gpt-5.6-luna".to_string(),
+                provider: ProviderKind::Openai,
+                aliases: vec!["gpt56-luna".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
             ModelInfo {
                 id: "deepseek-ai/deepseek-v4-flash".to_string(),
                 provider: ProviderKind::Atlascloud,
@@ -872,6 +901,57 @@ impl Default for ModelRegistry {
                 supports_tools: true,
                 supports_reasoning: true,
             },
+            // Meta Model API / Muse Spark.
+            ModelInfo {
+                id: "muse-spark-1.1".to_string(),
+                provider: ProviderKind::Meta,
+                aliases: vec!["muse-spark".to_string(), "muse".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            // xAI / Grok (https://api.x.ai/v1)
+            ModelInfo {
+                id: "grok-4.5".to_string(),
+                provider: ProviderKind::Xai,
+                aliases: vec!["grok".to_string(), "xai-grok-4.5".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "grok-4.3".to_string(),
+                provider: ProviderKind::Xai,
+                aliases: vec!["xai-grok-4.3".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "grok-build".to_string(),
+                provider: ProviderKind::Xai,
+                aliases: vec!["xai-grok-build".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "grok-composer-2.5-fast".to_string(),
+                provider: ProviderKind::Xai,
+                aliases: vec!["xai-grok-composer".to_string()],
+                supports_tools: true,
+                supports_reasoning: false,
+            },
+            ModelInfo {
+                id: "grok-4.20-0309-reasoning".to_string(),
+                provider: ProviderKind::Xai,
+                aliases: vec!["xai-grok-reasoning".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "grok-4.20-0309-non-reasoning".to_string(),
+                provider: ProviderKind::Xai,
+                aliases: vec!["xai-grok-fast".to_string()],
+                supports_tools: true,
+                supports_reasoning: false,
+            },
         ];
         Self::new(models)
     }
@@ -1051,7 +1131,10 @@ pub fn model_family(model_id: &str) -> ModelFamily {
     {
         return ModelFamily::Google;
     }
-    if normalized.contains("llama") || normalized.contains("meta-") || normalized.contains("meta/")
+    if normalized.contains("llama")
+        || normalized.contains("muse-spark")
+        || normalized.contains("meta-")
+        || normalized.contains("meta/")
     {
         return ModelFamily::Meta;
     }
@@ -1479,6 +1562,8 @@ mod tests {
             (ProviderKind::Stepfun, "step-3.7-flash"),
             (ProviderKind::Minimax, "MiniMax-M2.1"),
             (ProviderKind::Openmodel, "deepseek-v4-flash"),
+            (ProviderKind::Meta, "muse-spark-1.1"),
+            (ProviderKind::Xai, "grok-4.5"),
         ] {
             assert!(
                 models
@@ -1487,6 +1572,67 @@ mod tests {
                 "expected {provider:?} model {id} in registry"
             );
         }
+    }
+
+    #[test]
+    fn xai_grok_models_resolve_when_provider_hinted() {
+        let registry = ModelRegistry::default();
+
+        let default = registry.resolve(None, Some(ProviderKind::Xai));
+        assert_eq!(default.resolved.provider, ProviderKind::Xai);
+        assert_eq!(default.resolved.id, "grok-4.5");
+        assert!(default.used_fallback);
+
+        let alias = registry.resolve(Some("grok"), Some(ProviderKind::Xai));
+        assert_eq!(alias.resolved.provider, ProviderKind::Xai);
+        assert_eq!(alias.resolved.id, "grok-4.5");
+        assert!(!alias.used_fallback);
+
+        let fast = registry.resolve(
+            Some("grok-4.20-0309-non-reasoning"),
+            Some(ProviderKind::Xai),
+        );
+        assert_eq!(fast.resolved.provider, ProviderKind::Xai);
+        assert_eq!(fast.resolved.id, "grok-4.20-0309-non-reasoning");
+        assert!(!fast.resolved.supports_reasoning);
+    }
+
+    #[test]
+    fn meta_muse_spark_resolves_when_provider_hinted() {
+        let registry = ModelRegistry::default();
+
+        let default = registry.resolve(None, Some(ProviderKind::Meta));
+        assert_eq!(default.resolved.provider, ProviderKind::Meta);
+        assert_eq!(default.resolved.id, "muse-spark-1.1");
+        assert!(default.used_fallback);
+
+        let alias = registry.resolve(Some("muse-spark"), Some(ProviderKind::Meta));
+        assert_eq!(alias.resolved.provider, ProviderKind::Meta);
+        assert_eq!(alias.resolved.id, "muse-spark-1.1");
+        assert!(!alias.used_fallback);
+        assert_eq!(model_family("muse-spark-1.1"), ModelFamily::Meta);
+    }
+
+    #[test]
+    fn openai_gpt56_family_resolves_when_provider_hinted() {
+        let registry = ModelRegistry::default();
+        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let resolved = registry.resolve(Some(model), Some(ProviderKind::Openai));
+            assert_eq!(resolved.resolved.provider, ProviderKind::Openai, "{model}");
+            assert_eq!(resolved.resolved.id, model, "{model}");
+            assert!(resolved.resolved.supports_tools, "{model}");
+            assert!(resolved.resolved.supports_reasoning, "{model}");
+            assert!(!resolved.used_fallback, "{model}");
+        }
+    }
+
+    #[test]
+    fn grok_ids_stay_in_grok_family() {
+        assert_eq!(model_family("grok-4.5"), ModelFamily::Grok);
+        assert_eq!(
+            model_family("grok-4.20-0309-non-reasoning"),
+            ModelFamily::Grok
+        );
     }
 
     #[test]

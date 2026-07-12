@@ -16,11 +16,12 @@
 # `--provider volcengine`, `--provider openrouter`, `--provider xiaomi-mimo`,
 # `--provider fireworks`, `--provider siliconflow`, `--provider siliconflow-CN`,
 # `/provider arcee`, `/provider moonshot`, `/provider qianfan`, `/provider sglang`, `/provider vllm`,
-# `/provider ollama`, `/provider huggingface`, `/provider stepfun`, `/provider openmodel`) toggle without having to re-enter keys. Top-level
+# `/provider ollama`, `/provider huggingface`, `/provider stepfun`, `/provider openmodel`,
+# `/provider meta`, `/provider xai`) toggle without having to re-enter keys. Top-level
 # `api_key` / `base_url` are
 # still read as DeepSeek defaults when `[providers.deepseek]` is absent
 # (backward compatibility).
-provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana | longcat
+provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana | longcat | meta | xai
 api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty
 base_url = "https://api.deepseek.com/beta"
 # provider = "deepseek-cn"                       # legacy alias (official host is still https://api.deepseek.com)
@@ -102,7 +103,7 @@ check_for_updates = true
 # Optional 1-8 sidebar hotbar bindings. When no [[hotbar]] tables are present,
 # the TUI uses built-in defaults:
 #   1 voice.toggle      2 session.compact   3 mode.plan        4 mode.agent
-#   5 mode.yolo         6 palette.open      7 sidebar.toggle   8 trust.toggle
+#   5 mode.operate      6 palette.open      7 sidebar.toggle   8 trust.toggle
 #
 # Invalid slots are skipped with a warning, duplicate slots use the last entry,
 # and unknown actions are preserved so the UI can show a disabled entry.
@@ -336,6 +337,8 @@ max_subagents = 10 # optional (1-20)
 #   Ollama:    OLLAMA_BASE_URL, OLLAMA_MODEL, optional OLLAMA_API_KEY
 #   Hugging Face: HUGGINGFACE_API_KEY (or HF_TOKEN), HUGGINGFACE_BASE_URL (or HF_BASE_URL),
 #                 HUGGINGFACE_MODEL (or HF_MODEL)
+#   Meta Model API: META_MODEL_API_KEY (or MODEL_API_KEY), META_MODEL_API_BASE_URL
+#                   (or MODEL_API_BASE_URL), META_MODEL_API_MODEL (or MODEL_API_MODEL)
 #
 # Custom DeepSeek-compatible APIs usually do not need a new provider table:
 # set `provider = "deepseek"` and override [providers.deepseek].base_url/model.
@@ -562,6 +565,32 @@ max_subagents = 10 # optional (1-20)
 # api_key = "YOUR_LONGCAT_API_KEY"
 # base_url = "https://api.longcat.chat/openai/v1"
 # model = "LongCat-2.0"
+
+# Meta Model API / Muse Spark (https://developer.meta.com/ai/)
+# OpenAI-compatible Chat Completions route.
+# Provider aliases: meta, meta-ai, meta-model-api, muse, muse-spark
+# Env var aliases: META_MODEL_API_KEY / MODEL_API_KEY,
+# META_MODEL_API_BASE_URL / MODEL_API_BASE_URL,
+# META_MODEL_API_MODEL / MODEL_API_MODEL
+[providers.meta]
+# api_key = "YOUR_META_MODEL_API_KEY"
+# base_url = "https://api.meta.ai/v1"
+# model = "muse-spark-1.1"
+
+# xAI / Grok Provider (https://console.x.ai/)
+# OpenAI-compatible Chat Completions route.
+# Provider aliases: xai, x-ai, x_ai, grok
+# Env var aliases: XAI_API_KEY, XAI_BASE_URL, XAI_MODEL
+#
+# Auth modes:
+#   api_key (default) — console.x.ai pay-per-use key via api_key / XAI_API_KEY / keyring
+#   oauth             — reuse Grok CLI ~/.grok/auth.json (or device-code login).
+#                       SuperGrok / X Premium+ subscription path; may 403 on some tiers.
+[providers.xai]
+# api_key = "YOUR_XAI_API_KEY"
+# auth_mode = "oauth"                      # or "device_code" / "grok_cli"
+# base_url = "https://api.x.ai/v1"
+# model = "grok-4.5"                       # or grok-4.3, grok-build
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Together AI Provider (https://www.together.ai/)
@@ -1107,6 +1136,38 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # echo "[$(date -Iseconds)] $input" >> "$LOGFILE"
 # printf '%s\n' '{"content":"audit wrapper dry run: configure an executor","success":false}'
 # ```
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Workflow automatic launch, approval, isolation, and activity (#4128)
+# ─────────────────────────────────────────────────────────────────────────────────
+# First-class knobs for automatic Workflow orchestration. When the table is
+# omitted entirely, the runtime uses these product defaults. Later launch,
+# approval, and activity-persistence paths all read through this one model.
+# [workflow]
+# # Allow the parent agent to auto-launch Workflow for multi-agent work.
+# # Set false to require an explicit `/workflow` opt-in.
+# automatic = true
+# # Auto-start read-only plans without an approval card when automatic is on.
+# auto_start_read_only = true
+# # Require an approval card before write/shell/network/high-budget launches.
+# require_approval_for_writes = true
+# # Soft cap on children admitted by automatic launch (larger plans ask first).
+# auto_start_child_limit = 16
+# # Hard ceiling on agents in one Workflow run (matches VM lifetime cap).
+# max_children = 1000
+# # Maximum concurrently live agents inside one run (others wait for a slot).
+# max_concurrent = 16
+# # Maximum nested Workflow / child-orchestration depth.
+# max_depth = 2
+# # Default shared token budget for a Workflow run and its children.
+# default_token_budget = 120000
+# # Parallel write children that may share the parent worktree without
+# # isolation. 0 forces worktree isolation for parallel writes.
+# max_parallel_writes_without_worktree = 0
+# # Keep completed Workflow activity visible until the next run / clear.
+# persist_completed_activity = true
+# # Persist completed activity across process restarts via the run journal.
+# persist_completed_across_restarts = true
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Agent Fleet trust, security, and role registry (#3165, #3167)

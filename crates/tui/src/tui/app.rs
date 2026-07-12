@@ -27,13 +27,13 @@ use crate::models::{Message, SystemPrompt, Tool};
 use crate::palette::{self, UiTheme};
 use crate::pricing::{CostCurrency, CostEstimate};
 use crate::resource_telemetry::TokenThroughput;
-use crate::session_manager::SessionContextReference;
+use crate::session_manager::{SessionContextReference, SessionMetadata, SessionWorkState};
 use crate::settings::Settings;
-use crate::tools::plan::{SharedPlanState, new_shared_plan_state};
+use crate::tools::plan::{PlanState, SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::new_shared_shell_manager;
 use crate::tools::spec::RuntimeToolServices;
 use crate::tools::subagent::SubAgentResult;
-use crate::tools::todo::{SharedTodoList, new_shared_todo_list};
+use crate::tools::todo::{SharedTodoList, TodoList, new_shared_todo_list};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::approval::ApprovalMode;
 use crate::tui::clipboard::{ClipboardContent, ClipboardHandler};
@@ -169,7 +169,6 @@ pub enum AppMode {
     /// Legacy compatibility alias; resolves to [`Self::Agent`] + bypass approvals.
     Yolo,
     Plan,
-    Multitask,
     Operate,
 }
 
@@ -364,10 +363,63 @@ pub enum SidebarFocus {
     Hidden,
 }
 
+/// Browsing context captured when the `/model` picker is dismissed (#4109).
+/// Plain data so `App` does not depend on the picker's internal view enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPickerMemory {
+    /// True when the user left the picker in the full-catalog view
+    /// (`A` toggle), false for the configured-only default view.
+    ///
+    /// Kept for backward compatibility with older dismiss events; prefer
+    /// [`Self::view`] when present (#4115).
+    pub catalog_view: bool,
+    /// Named catalog view left open (`configured` / `catalog` / `recent` /
+    /// `coding` / `cheap` / `long_context`). When `None`, [`Self::catalog_view`]
+    /// is the fallback.
+    pub view: Option<String>,
+    /// Model row id highlighted at dismissal, if it was a real row.
+    pub selected_row_id: Option<String>,
+}
+
+/// Browsing context captured when the `/provider` picker is dismissed.
+/// Mirrors [`ModelPickerMemory`] so reopen restores view + highlight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderPickerMemory {
+    /// True when the user left the picker in the full-catalog view
+    /// (`A` toggle), false for the configured-only default view.
+    pub catalog_view: bool,
+    /// Provider id highlighted at dismissal, if it was a real row.
+    pub selected_provider_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentProgressMeta {
     pub parent_run_id: Option<String>,
     pub spawn_depth: u32,
+}
+
+/// Per-turn LSP repair-loop summary for the Turn Inspector (#4107).
+/// Observable state only — no raw diagnostic text or prompt internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspRepairState {
+    pub diagnostics_found: usize,
+    pub files_touched: usize,
+    pub injected: bool,
+    pub repair_attempted: bool,
+    /// "resolved" | "still_failing" | "unknown" | "unavailable"
+    pub latest: &'static str,
+}
+
+impl Default for LspRepairState {
+    fn default() -> Self {
+        Self {
+            diagnostics_found: 0,
+            files_touched: 0,
+            injected: false,
+            repair_attempted: false,
+            latest: "unavailable",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,7 +463,8 @@ impl SidebarFocus {
     pub fn from_setting(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "pinned" | "visible" | "show" | "on" | "work" | "plan" | "todos" => Self::Pinned,
-            "tasks" => Self::Tasks,
+            // Persist/compat key remains "tasks"; user-facing panel is Activity (#4147/#4135).
+            "tasks" | "activity" | "live" | "running" => Self::Tasks,
             "agents" | "subagents" | "sub-agents" => Self::Agents,
             "context" | "session" => Self::Context,
             "hidden" | "hide" | "closed" | "off" | "none" => Self::Hidden,
@@ -917,23 +970,23 @@ const MAX_COMPOSER_DISPLAY_CHARS: usize = 4_000;
 const MAX_DRAFT_HISTORY: usize = 50;
 
 impl AppMode {
-    /// Keyboard cycle order: Plan -> Act -> Multitask -> Operate -> Plan.
+    /// Keyboard cycle order: Plan -> Act -> Operate -> Plan.
     ///
     /// `Auto` remains an internal variant while the real implementation is
     /// redesigned; do not expose it through user-facing mode selection (#3733).
     /// `Yolo` is kept for parse/back-compat only and is not in the Tab cycle.
-    pub const CYCLE: [Self; 4] = [Self::Plan, Self::Agent, Self::Multitask, Self::Operate];
+    pub const CYCLE: [Self; 3] = [Self::Plan, Self::Agent, Self::Operate];
 
-    /// User-facing picker / numeric command order.
-    pub const CHOICES: [Self; 4] = [Self::Agent, Self::Plan, Self::Multitask, Self::Operate];
+    /// User-facing picker / numeric command order: 1 Act / 2 Plan / 3 Operate.
+    pub const CHOICES: [Self; 3] = [Self::Agent, Self::Plan, Self::Operate];
 
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "agent" | "act" | "auto" | "1" => Some(Self::Agent),
             "plan" | "2" => Some(Self::Plan),
-            "multitask" | "multi" | "3" => Some(Self::Multitask),
-            "operate" | "operation" | "ops" | "5" => Some(Self::Operate),
+            "operate" | "operation" | "ops" | "3" => Some(Self::Operate),
+            // Invisible one-way permission shorthand only — never a visible mode.
             "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions" => {
                 Some(Self::Yolo)
             }
@@ -943,7 +996,11 @@ impl AppMode {
 
     #[must_use]
     pub fn from_setting(value: &str) -> Self {
-        Self::parse(value).unwrap_or(Self::Agent)
+        // Unreleased Multitask never shipped; normalize leftover settings to Operate.
+        match value.trim().to_ascii_lowercase().as_str() {
+            "multitask" | "multi" | "5" => Self::Operate,
+            other => Self::parse(other).unwrap_or(Self::Agent),
+        }
     }
 
     #[must_use]
@@ -951,9 +1008,9 @@ impl AppMode {
         match self {
             Self::Agent => "agent",
             Self::Auto => "agent",
-            Self::Yolo => "yolo",
+            // Write current permission vocabulary, not the legacy YOLO label.
+            Self::Yolo => "agent",
             Self::Plan => "plan",
-            Self::Multitask => "multitask",
             Self::Operate => "operate",
         }
     }
@@ -963,9 +1020,8 @@ impl AppMode {
         match self {
             AppMode::Agent => "ACT",
             AppMode::Auto => "ACT",
-            AppMode::Yolo => "YOLO",
+            AppMode::Yolo => "ACT",
             AppMode::Plan => "PLAN",
-            AppMode::Multitask => "MULTITASK",
             AppMode::Operate => "OPERATE",
         }
     }
@@ -975,9 +1031,8 @@ impl AppMode {
         match self {
             AppMode::Agent => "Act",
             AppMode::Auto => "Act",
-            AppMode::Yolo => "YOLO",
+            AppMode::Yolo => "Act",
             AppMode::Plan => "Plan",
-            AppMode::Multitask => "Multitask",
             AppMode::Operate => "Operate",
         }
     }
@@ -985,37 +1040,25 @@ impl AppMode {
     #[must_use]
     pub fn number(self) -> char {
         match self {
-            AppMode::Agent => '1',
+            AppMode::Agent | AppMode::Auto | AppMode::Yolo => '1',
             AppMode::Plan => '2',
-            AppMode::Multitask => '3',
-            AppMode::Auto => '1',
-            AppMode::Yolo => '4',
-            AppMode::Operate => '5',
+            AppMode::Operate => '3',
         }
     }
 
     #[must_use]
     pub fn uses_agent_baseline(self) -> bool {
-        matches!(
-            self,
-            Self::Agent | Self::Auto | Self::Multitask | Self::Operate
-        )
+        matches!(self, Self::Agent | Self::Auto | Self::Operate)
     }
 
-    /// Wave 7 M4/M5: delegation modes get a higher parallel launch floor so
-    /// background fan-out is not throttled to a single slot when config is low.
+    /// Operate gets a higher parallel launch floor so background fan-out is
+    /// not throttled to a single slot when config is low.
     #[must_use]
     pub fn mode_delegation_launch_floor(self) -> usize {
         match self {
-            Self::Multitask | Self::Operate => 4,
+            Self::Operate => 4,
             _ => 1,
         }
-    }
-
-    /// Whether entering this mode should emphasize the Agents sidebar panel.
-    #[must_use]
-    pub fn prefers_agents_sidebar(self) -> bool {
-        matches!(self, Self::Multitask | Self::Operate)
     }
 
     /// Localized short name for the mode picker (user-facing surface only).
@@ -1024,10 +1067,8 @@ impl AppMode {
         tr(
             locale,
             match self {
-                AppMode::Agent | AppMode::Auto => MessageId::AppModeAgent,
-                AppMode::Yolo => MessageId::AppModeYolo,
+                AppMode::Agent | AppMode::Auto | AppMode::Yolo => MessageId::AppModeAgent,
                 AppMode::Plan => MessageId::AppModePlan,
-                AppMode::Multitask => MessageId::AppModeMultitask,
                 AppMode::Operate => MessageId::AppModeOperate,
             },
         )
@@ -1039,10 +1080,8 @@ impl AppMode {
         tr(
             locale,
             match self {
-                AppMode::Agent | AppMode::Auto => MessageId::AppModeAgentHint,
+                AppMode::Agent | AppMode::Auto | AppMode::Yolo => MessageId::AppModeAgentHint,
                 AppMode::Plan => MessageId::AppModePlanHint,
-                AppMode::Yolo => MessageId::AppModeYoloHint,
-                AppMode::Multitask => MessageId::AppModeMultitaskHint,
                 AppMode::Operate => MessageId::AppModeOperateHint,
             },
         )
@@ -1052,12 +1091,13 @@ impl AppMode {
     /// Description shown in help or onboarding text.
     pub fn description(self) -> &'static str {
         match self {
-            AppMode::Agent | AppMode::Auto => "Act mode - autonomous task execution with tools",
-            AppMode::Yolo => "YOLO mode - full tool access without approvals (deprecated)",
-            AppMode::Plan => "Plan mode - design before implementing",
-            AppMode::Multitask => "Multitask mode - light delegation; operator stays responsive",
+            AppMode::Agent | AppMode::Auto => {
+                "Act mode - direct work in the current session with tools"
+            }
+            AppMode::Yolo => "Act mode with Full Access (legacy YOLO permission shorthand)",
+            AppMode::Plan => "Plan mode - research and design before implementing",
             AppMode::Operate => {
-                "Operate mode - Fleet operator conductor; workers execute, you monitor"
+                "Operate mode - manage Fleet, subagents, and workflow lanes (spawn, wait, verify, hand off)"
             }
         }
     }
@@ -1306,6 +1346,8 @@ pub struct ViewportState {
     /// time so mouse hit-testing can keep scroll events over the sidebar from
     /// leaking into the transcript viewport.
     pub last_sidebar_area: Option<Rect>,
+    /// WorkflowPanel rect above the composer (#4121), for mouse toggle/cancel.
+    pub last_workflow_panel_area: Option<Rect>,
     pub last_transcript_top: usize,
     pub last_transcript_visible: usize,
     pub last_transcript_total: usize,
@@ -1335,6 +1377,7 @@ impl Default for ViewportState {
             last_transcript_area: None,
             last_composer_area: None,
             last_sidebar_area: None,
+            last_workflow_panel_area: None,
             last_transcript_top: 0,
             last_transcript_visible: 0,
             last_transcript_total: 0,
@@ -1442,8 +1485,18 @@ pub struct SidebarHoverState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarRowAction {
     Command(String),
-    ToggleAgentDetails { agent_id: String },
-    CancelAgent { agent_id: String },
+    ToggleAgentDetails {
+        agent_id: String,
+    },
+    /// Drill into the child's transcript card (action tree, status, summary)
+    /// in the detail pager — registered on the expanded dossier rows (#2889
+    /// slice, dogfood A3).
+    OpenAgentDetail {
+        agent_id: String,
+    },
+    CancelAgent {
+        agent_id: String,
+    },
 }
 
 impl SidebarRowAction {
@@ -1451,7 +1504,9 @@ impl SidebarRowAction {
     pub fn as_command(&self) -> Option<&str> {
         match self {
             Self::Command(command) => Some(command.as_str()),
-            Self::ToggleAgentDetails { .. } | Self::CancelAgent { .. } => None,
+            Self::ToggleAgentDetails { .. }
+            | Self::OpenAgentDetail { .. }
+            | Self::CancelAgent { .. } => None,
         }
     }
 
@@ -1460,7 +1515,7 @@ impl SidebarRowAction {
         match self {
             Self::Command(command) => command.contains(" cancel "),
             Self::CancelAgent { .. } => true,
-            Self::ToggleAgentDetails { .. } => false,
+            Self::ToggleAgentDetails { .. } | Self::OpenAgentDetail { .. } => false,
         }
     }
 }
@@ -1766,6 +1821,12 @@ pub struct App {
     /// Last successfully rendered Work panel summary. Transient mutex misses
     /// should not wipe completed checklist/strategy state from the sidebar.
     pub(crate) cached_work_summary: Option<SidebarWorkSummary>,
+    /// Browsing context from the last dismissed `/model` picker, so reopening
+    /// restores the view mode and highlighted row instead of resetting to the
+    /// top (#4109 picker memory). Session-scoped, never persisted.
+    pub model_picker_memory: Option<ModelPickerMemory>,
+    /// Browsing context from the last dismissed `/provider` picker.
+    pub provider_picker_memory: Option<ProviderPickerMemory>,
     /// Last known mouse position for tooltip placement.
     pub last_mouse_pos: Option<(u16, u16)>,
     /// Whether the user is currently dragging the sidebar resize handle.
@@ -1843,6 +1904,10 @@ pub struct App {
     /// Last time a sub-agent progress event triggered a redraw.
     /// Used to throttle redraws under high sub-agent concurrency (#3033).
     pub last_agent_progress_redraw: Option<Instant>,
+    /// Last time a workflow `budget_updated` event was allowed to request a
+    /// repaint. High-signal workflow events (task/run lifecycle) always paint;
+    /// budget-only chatter is paced under fan-out (#4095 residual).
+    pub last_workflow_budget_redraw: Option<Instant>,
     pub ui_theme: UiTheme,
     /// Active named theme. Drives the cell-level color remap in
     /// `tui::color_compat::ColorCompatBackend` so community presets
@@ -1869,6 +1934,12 @@ pub struct App {
     /// restore to (#3386). Refreshed from the live fields whenever the user
     /// leaves Agent mode; see [`base_policy_for_mode`] and `set_mode`.
     mode_prefs: ModeSessionPrefs,
+    /// True when config/requirements supplied an approval policy. In that
+    /// case the TUI-only Shift+Tab preference must not loosen it.
+    approval_policy_locked: bool,
+    /// True only when an organization requirements file owns approval policy.
+    /// Unlike a user-owned config key, this source cannot be edited in-app.
+    approval_policy_requirements_managed: bool,
     // Clipboard handler
     pub clipboard: ClipboardHandler,
     // Tool approval session allowlist
@@ -1890,6 +1961,13 @@ pub struct App {
     pub backtrack: crate::tui::backtrack::BacktrackState,
     /// Current session ID for auto-save updates
     pub current_session_id: Option<String>,
+    /// Last non-contended Work snapshot captured in this App. The outer
+    /// option distinguishes "never captured" from a captured empty state.
+    pub(crate) last_known_work_state: Option<Option<SessionWorkState>>,
+    /// Metadata for the active session, cached in memory so automatic
+    /// checkpoints never synchronously reload and parse a growing JSON file on
+    /// the UI thread.
+    pub(crate) current_session_metadata: Option<SessionMetadata>,
     /// Metadata-only registry of large tool outputs produced in this session.
     pub session_artifacts: Vec<ArtifactRecord>,
     /// Trust mode - allow access outside workspace
@@ -2057,6 +2135,9 @@ pub struct App {
                 // the model draft (which is always `provider: None`) omitted or
                 // changed it. `None` for an `inherit` pick.
                 Option<(String, String)>,
+                // The reasoning tier selected when the operator pressed `m`
+                // (#4137). `None` means inherit.
+                Option<String>,
                 Result<Box<crate::fleet::profile::FleetProfileDraft>, String>,
             )>,
         >,
@@ -2102,6 +2183,10 @@ pub struct App {
     /// Active decision card (v0.8.43 truth-surface). When set, keyboard input
     /// is routed through the card navigation instead of the composer.
     pub decision_card: Option<crate::tui::widgets::decision_card::DecisionCard>,
+    /// Unified Workflow activity surface (#4121). Lives above the composer so
+    /// phase/row progress does not flood the chat transcript. Preserved after
+    /// completion until the next `RunStarted` replaces it.
+    pub workflow_panel: Option<crate::tui::widgets::workflow_panel::WorkflowPanel>,
     /// Wall-clock time when this TUI session started. Used by the Work
     /// sidebar projection to hide completed durable tasks that finished
     /// before the current session (bug #1913).
@@ -2173,6 +2258,8 @@ pub struct App {
     /// Whether LSP diagnostics are currently enabled. Mirrors the config file
     /// `[lsp].enabled` setting. Toggled at runtime via `/lsp on|off`.
     pub lsp_enabled: bool,
+    /// Current-turn LSP repair-loop summary for Ctrl-O Turn Inspector (#4107).
+    pub lsp_repair: LspRepairState,
     /// Derived title for the current session shown in the composer border.
     /// Updated when `EngineEvent::SessionUpdated` fires or a saved session is loaded.
     pub session_title: Option<String>,
@@ -2586,10 +2673,22 @@ impl App {
         // documented, while an explicit `allow_shell = false` still hides it.
         // Trust is never part of the Agent baseline (it is YOLO-only authority).
         // Approval mirrors the configured policy.
-        let configured_approval_mode = config
+        let explicit_approval_mode = config
             .approval_policy
             .as_deref()
-            .and_then(ApprovalMode::from_config_value)
+            .and_then(ApprovalMode::from_config_value);
+        let approval_policy_locked = config.approval_policy_is_managed();
+        let approval_policy_requirements_managed = config.approval_policy_is_requirements_managed();
+        let saved_permission_posture = if approval_policy_locked {
+            None
+        } else {
+            settings
+                .permission_posture
+                .as_deref()
+                .and_then(ApprovalMode::from_config_value)
+        };
+        let configured_approval_mode = explicit_approval_mode
+            .or(saved_permission_posture)
             .unwrap_or_default();
         let mode_prefs = ModeSessionPrefs {
             agent_allow_shell: if yolo_compat || matches!(initial_mode, AppMode::Yolo) {
@@ -2757,6 +2856,8 @@ impl App {
             sidebar_hover: SidebarHoverState::default(),
             sidebar_hover_tooltip: None,
             cached_work_summary: None,
+            model_picker_memory: None,
+            provider_picker_memory: None,
             last_mouse_pos: None,
             sidebar_resizing: false,
             sidebar_resize_anchor_x: 0,
@@ -2791,6 +2892,7 @@ impl App {
             agent_counter: 0,
             agent_label_map: HashMap::new(),
             last_agent_progress_redraw: None,
+            last_workflow_budget_redraw: None,
             ui_theme,
             theme_id,
             onboarding,
@@ -2805,22 +2907,22 @@ impl App {
             yolo_compat_notified: false,
             keybinding_migration_notified: false,
             mode_prefs,
+            approval_policy_locked,
+            approval_policy_requirements_managed,
             clipboard: ClipboardHandler::new(),
             approval_session_approved: HashSet::new(),
             approval_session_denied: HashSet::new(),
             approval_mode: if yolo_compat || matches!(initial_mode, AppMode::Yolo) {
                 ApprovalMode::Bypass
             } else {
-                config
-                    .approval_policy
-                    .as_deref()
-                    .and_then(ApprovalMode::from_config_value)
-                    .unwrap_or_default()
+                configured_approval_mode
             },
             view_stack: ViewStack::new(),
             pending_user_input_prompt: None,
             backtrack: crate::tui::backtrack::BacktrackState::new(),
             current_session_id: None,
+            last_known_work_state: None,
+            current_session_metadata: None,
             session_artifacts: Vec::new(),
             trust_mode: yolo_compat || initial_mode == AppMode::Yolo,
             translation_enabled: false,
@@ -2895,6 +2997,7 @@ impl App {
             workspace_context_refreshed_at: None,
             task_panel: Vec::new(),
             decision_card: None,
+            workflow_panel: None,
             session_started_at: chrono::Utc::now(),
             needs_redraw: true,
             force_next_full_repaint: false,
@@ -2916,6 +3019,7 @@ impl App {
             collapsed_cell_map: Vec::new(),
             edit_in_progress: false,
             lsp_enabled: config.lsp.as_ref().and_then(|l| l.enabled).unwrap_or(true),
+            lsp_repair: LspRepairState::default(),
             composer_arrows_scroll: config
                 .tui
                 .as_ref()
@@ -3001,6 +3105,12 @@ impl App {
     /// still in progress.
     pub fn maybe_show_feature_intro(&mut self) {
         if self.onboarding != OnboardingState::None {
+            return;
+        }
+        // Never claim "setup is ready" when auth is still missing — e.g.
+        // `--skip-onboarding` with no API key (#3985). Leave the flag unset so
+        // the tip can appear after the user finishes provider setup.
+        if self.onboarding_needs_api_key {
             return;
         }
         let mut settings = Settings::load().unwrap_or_default();
@@ -3106,10 +3216,6 @@ impl App {
             self.plan_tool_used_in_turn = false;
         }
 
-        if mode.prefers_agents_sidebar() {
-            self.set_sidebar_focus(SidebarFocus::Agents);
-        }
-
         // Execute mode change hooks
         let context = HookContext::new()
             .with_mode(mode.label())
@@ -3179,7 +3285,7 @@ impl App {
         }
     }
 
-    /// Cycle through modes: Plan → Act → Multitask → Operate → Plan.
+    /// Cycle through modes: Plan → Act → Operate → Plan.
     pub fn cycle_mode(&mut self) {
         if self.reject_setting_change_while_busy("Mode") {
             return;
@@ -3216,7 +3322,56 @@ impl App {
         if self.reject_setting_change_while_busy("Permissions") {
             return false;
         }
+        if self.mode == AppMode::Plan {
+            self.push_status_toast(
+                "Plan is Read Only; switch to Act or Operate to change permissions".to_string(),
+                StatusToastLevel::Info,
+                Some(5_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+        if self.approval_policy_locked() {
+            self.push_status_toast(
+                "Permissions are controlled by config or managed requirements".to_string(),
+                StatusToastLevel::Warning,
+                Some(6_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
         let next = self.mode_prefs.agent_approval_mode.cycle_permission_next();
+        let persisted = match next {
+            ApprovalMode::Suggest => "ask",
+            ApprovalMode::Auto => "auto-review",
+            ApprovalMode::Bypass => "full-access",
+            ApprovalMode::Never => "never",
+        };
+        let persistence_result = (|| -> anyhow::Result<()> {
+            let mut settings = Settings::load()?;
+            settings.permission_posture = Some(persisted.to_string());
+            settings.save()
+        })();
+        if let Err(err) = persistence_result {
+            self.push_status_toast(
+                format!("Permissions were not changed: could not save TUI posture ({err})"),
+                StatusToastLevel::Warning,
+                Some(8_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+        self.set_agent_approval_posture(next);
+        self.needs_redraw = true;
+        // Footer permission chip is canonical — no status toast for the new
+        // value, only the one-shot rebinding notice.
+        self.notify_keybinding_migration_once();
+        true
+    }
+
+    /// Update the durable Act/Operate baseline and project it onto the live
+    /// runtime when the current mode uses that baseline. Plan remains read-only.
+    pub fn set_agent_approval_posture(&mut self, next: ApprovalMode) {
         self.mode_prefs.agent_approval_mode = next;
         if self.mode.uses_agent_baseline() {
             let policy = base_policy_for_mode(self.mode, &self.mode_prefs);
@@ -3225,11 +3380,35 @@ impl App {
             self.approval_mode = policy.approval_mode;
             self.yolo = matches!(policy.approval_mode, ApprovalMode::Bypass);
         }
-        self.needs_redraw = true;
-        // Footer permission chip is canonical — no status toast for the new
-        // value, only the one-shot rebinding notice.
-        self.notify_keybinding_migration_once();
-        true
+    }
+
+    #[must_use]
+    pub fn approval_policy_locked(&self) -> bool {
+        self.approval_policy_locked
+    }
+
+    #[must_use]
+    pub fn approval_policy_requirements_managed(&self) -> bool {
+        self.approval_policy_requirements_managed
+    }
+
+    /// Session transitions must never detach live runtime producers. Late
+    /// engine, compaction, purge, or background-task events could otherwise
+    /// contaminate the replacement session after clear/load/new.
+    #[must_use]
+    pub fn session_transition_blocked(&self) -> bool {
+        self.is_loading
+            || self.runtime_turn_status.as_deref() == Some("in_progress")
+            || self.is_compacting
+            || self.is_purging
+            || self
+                .task_panel
+                .iter()
+                .any(|task| matches!(task.status.as_str(), "queued" | "running"))
+    }
+
+    pub fn mark_approval_policy_locked(&mut self) {
+        self.approval_policy_locked = true;
     }
 
     /// Execute hooks for a specific event with the given context
@@ -4012,6 +4191,81 @@ impl App {
             active.mark_in_progress_as_interrupted();
         }
         self.flush_active_cell();
+        // #4121: interrupt finalizes running workflow children as cancelled
+        // and preserves the completed panel until the next run starts.
+        if let Some(panel) = self.workflow_panel.as_mut() {
+            panel.finalize_interrupt();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Apply a workflow panel event, creating the panel on first `RunStarted`.
+    ///
+    /// Returns whether this event should request an immediate repaint.
+    /// Budget-only updates always mutate panel state but leave repaint to the
+    /// caller so high-frequency fan-out budget ticks can be paced (#4095).
+    pub fn apply_workflow_panel_event(
+        &mut self,
+        event: crate::tui::widgets::workflow_panel::WorkflowPanelEvent,
+    ) -> bool {
+        use crate::tui::widgets::workflow_panel::{WorkflowPanel, WorkflowPanelEvent};
+        let budget_only = matches!(event, WorkflowPanelEvent::BudgetUpdated { .. });
+        match (&mut self.workflow_panel, &event) {
+            (
+                None,
+                WorkflowPanelEvent::RunStarted {
+                    run_id,
+                    workflow_goal,
+                    workflow_id,
+                    token_budget,
+                    at_ms,
+                    ..
+                },
+            ) => {
+                let label = workflow_goal
+                    .clone()
+                    .or_else(|| workflow_id.clone())
+                    .unwrap_or_else(|| "workflow".to_string());
+                let mut panel = WorkflowPanel::new(run_id.clone(), label, *at_ms);
+                panel.budget_total = *token_budget;
+                panel.budget_remaining = *token_budget;
+                self.workflow_panel = Some(panel);
+            }
+            (None, _) => {
+                // No panel yet and event is not a start — seed a shell panel
+                // so late events still surface rather than being dropped.
+                let mut panel = WorkflowPanel::new("workflow", "workflow", 0);
+                panel.apply_event(event);
+                self.workflow_panel = Some(panel);
+            }
+            (Some(panel), _) => {
+                panel.apply_event(event);
+            }
+        }
+        if !budget_only {
+            self.needs_redraw = true;
+        }
+        !budget_only
+    }
+
+    /// Toggle the workflow panel expand/collapse state. Returns true when a
+    /// panel was present and toggled.
+    pub fn toggle_workflow_panel(&mut self) -> bool {
+        let Some(panel) = self.workflow_panel.as_mut() else {
+            return false;
+        };
+        let _ = panel.toggle_expanded();
+        self.needs_redraw = true;
+        true
+    }
+
+    /// Request cancel from the workflow panel. Returns the run id when the
+    /// host should dispatch `workflow` action=cancel.
+    pub fn request_workflow_panel_cancel(&mut self) -> Option<String> {
+        let panel = self.workflow_panel.as_mut()?;
+        let run_id = panel.request_cancel()?;
+        self.needs_redraw = true;
+        Some(run_id)
     }
 
     pub fn push_status_toast(
@@ -5844,21 +6098,87 @@ impl App {
         None
     }
 
-    pub fn clear_todos(&mut self) -> bool {
-        // Clear the todo list (the sidebar checklist). Retry with try_lock
-        // so /clear always resets todos even when the engine briefly holds
-        // the mutex during tool execution.
-        let todos_cleared = if let Some(mut todos) = Self::retry_lock(&self.todos, 100) {
-            todos.clear();
-            true
-        } else {
-            false
+    /// Capture the durable Work state without ever converting lock contention
+    /// into an empty snapshot.
+    pub fn work_state_snapshot(&self) -> Result<Option<SessionWorkState>, String> {
+        let todos = Self::retry_lock(&self.todos, 100)
+            .ok_or_else(|| "To-do state is busy; try saving again".to_string())?;
+        let plan = Self::retry_lock(&self.plan_state, 100)
+            .ok_or_else(|| "Plan state is busy; try saving again".to_string())?;
+        let state = SessionWorkState {
+            todos: todos.snapshot(),
+            plan: plan.snapshot(),
         };
-        // Also clear the plan state — /clear means a full reset.
-        if let Some(mut plan) = Self::retry_lock(&self.plan_state, 100) {
-            *plan = crate::tools::plan::PlanState::default();
-        }
-        todos_cleared
+        Ok((!state.is_empty()).then_some(state))
+    }
+
+    /// Non-blocking snapshot for the render/event loop. Automatic persistence
+    /// must skip a contended first save instead of pausing the UI or writing a
+    /// false empty state.
+    pub fn try_work_state_snapshot(&mut self) -> Result<Option<SessionWorkState>, String> {
+        let todos = self
+            .todos
+            .try_lock()
+            .map_err(|_| "To-do state is busy".to_string())?;
+        let plan = self
+            .plan_state
+            .try_lock()
+            .map_err(|_| "Plan state is busy".to_string())?;
+        let state = SessionWorkState {
+            todos: todos.snapshot(),
+            plan: plan.snapshot(),
+        };
+        let state = (!state.is_empty()).then_some(state);
+        drop(plan);
+        drop(todos);
+        self.last_known_work_state = Some(state.clone());
+        Ok(state)
+    }
+
+    /// Atomically replace the live Work state from a saved session.
+    pub fn restore_work_state(&mut self, state: Option<&SessionWorkState>) -> Result<(), String> {
+        let (restored_todos, restored_plan) = match state {
+            Some(state) => (
+                TodoList::from_snapshot(&state.todos)?,
+                PlanState::from_snapshot(&state.plan),
+            ),
+            None => (TodoList::new(), PlanState::default()),
+        };
+        let normalized_state = SessionWorkState {
+            todos: restored_todos.snapshot(),
+            plan: restored_plan.snapshot(),
+        };
+
+        let mut todos = Self::retry_lock(&self.todos, 100)
+            .ok_or_else(|| "To-do state is busy; session was not restored".to_string())?;
+        let mut plan = Self::retry_lock(&self.plan_state, 100)
+            .ok_or_else(|| "Plan state is busy; session was not restored".to_string())?;
+        *todos = restored_todos;
+        *plan = restored_plan;
+        drop(plan);
+        drop(todos);
+        self.cached_work_summary = None;
+        self.last_known_work_state =
+            Some((!normalized_state.is_empty()).then_some(normalized_state));
+        Ok(())
+    }
+
+    pub fn clear_todos(&mut self) -> bool {
+        // Acquire both stores before mutating either one. `/clear` must never
+        // report success after clearing only half of the Work surface.
+        let Some(mut todos) = Self::retry_lock(&self.todos, 100) else {
+            return false;
+        };
+        let Some(mut plan) = Self::retry_lock(&self.plan_state, 100) else {
+            return false;
+        };
+        todos.clear();
+        *plan = PlanState::default();
+        drop(plan);
+        drop(todos);
+        self.cached_work_summary = None;
+        self.last_known_work_state = Some(None);
+        true
     }
 
     pub fn update_model_compaction_budget(&mut self) {
@@ -5972,6 +6292,11 @@ impl App {
             enabled: self.auto_compact,
             token_threshold: self.compact_threshold,
             model: self.effective_model_for_budget().to_string(),
+            effective_context_window: Some(crate::route_budget::route_context_window_tokens(
+                self.api_provider,
+                self.effective_model_for_budget(),
+                self.active_route_limits,
+            )),
             ..Default::default()
         }
     }
@@ -6140,7 +6465,9 @@ pub enum AppAction {
     OpenProviderSetup {
         provider: Option<ApiProvider>,
     },
-    /// Open the `/mode` picker modal for Agent / Plan / YOLO.
+    /// Run the xAI/Grok device-code flow with the TUI temporarily suspended.
+    StartXaiDeviceLogin,
+    /// Open the `/mode` picker modal for Act / Plan / Operate.
     OpenModePicker,
     /// Refresh the engine prompt after the UI operating mode changes.
     ModeChanged(AppMode),
@@ -6152,7 +6479,7 @@ pub enum AppAction {
     OpenThemePicker,
     /// Open the `/fleet` roster — the saved-party view of the agent team.
     OpenFleetRoster,
-    /// Open the `/fleet` setup and loadout planner.
+    /// Open the `/fleet` profile authoring wizard.
     OpenFleetSetup,
     /// Open the `/hotbar` setup wizard.
     OpenHotbarSetup,
@@ -6189,6 +6516,8 @@ pub enum AppAction {
     },
     ListSubAgents,
     FetchModels,
+    /// Force a Models.dev live-catalog refresh into ProviderLake (#4187).
+    RefreshModelsDevCatalog,
     CacheWarmup,
     /// Switch the active LLM backend (DeepSeek vs NVIDIA NIM) without
     /// restarting the process. The runtime rebuilds its API client from

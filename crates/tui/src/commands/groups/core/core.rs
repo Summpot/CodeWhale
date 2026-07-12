@@ -50,14 +50,21 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
 
 /// Clear conversation history
 pub fn clear(app: &mut App) -> CommandResult {
-    let todos_cleared = reset_conversation_state(app);
+    if app.session_transition_blocked() {
+        return CommandResult::error(
+            tr(app.ui_locale, MessageId::ClearConversationBusy).to_string(),
+        );
+    }
+    if !reset_conversation_state(app) {
+        return CommandResult::error(
+            tr(app.ui_locale, MessageId::ClearConversationBusy).to_string(),
+        );
+    }
     app.current_session_id = None;
+    app.current_session_metadata = None;
+    app.session_title = None;
     let locale = app.ui_locale;
-    let message = if todos_cleared {
-        tr(locale, MessageId::ClearConversation).to_string()
-    } else {
-        tr(locale, MessageId::ClearConversationBusy).to_string()
-    };
+    let message = tr(locale, MessageId::ClearConversation).to_string();
     CommandResult::with_message_and_action(
         message,
         AppAction::SyncSession {
@@ -73,6 +80,12 @@ pub fn clear(app: &mut App) -> CommandResult {
 
 /// Reset the active conversation without choosing the next session id.
 pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
+    // Work state is the only contended portion. Acquire and clear it first so
+    // `/clear` and `/new` are all-or-nothing rather than losing conversation
+    // state while leaving an old To-do attached to the next session.
+    if !app.clear_todos() {
+        return false;
+    }
     app.clear_history();
     app.mark_history_updated();
     app.api_messages.clear();
@@ -90,7 +103,6 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.session.subagent_cost_event_seqs.clear();
     app.session.displayed_cost_high_water = 0.0;
     app.session.displayed_cost_high_water_cny = 0.0;
-    let todos_cleared = app.clear_todos();
     app.tool_log.clear();
     app.tool_cells.clear();
     app.tool_details_by_cell.clear();
@@ -109,7 +121,7 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.session.last_warmup_key = None;
     app.session.last_tool_catalog = None;
     app.session.last_base_url = None;
-    todos_cleared
+    true
 }
 
 /// Exit the application
@@ -122,6 +134,11 @@ pub fn exit() -> CommandResult {
 /// way to flip both knobs without memorising the docs.
 pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
     if let Some(name) = model_name {
+        // Manual Models.dev catalog refresh (#4187). Dispatched async so the
+        // TUI event loop is not blocked; failure keeps prior/bundled rows.
+        if name.trim().eq_ignore_ascii_case("refresh") {
+            return CommandResult::action(AppAction::RefreshModelsDevCatalog);
+        }
         if name.trim().eq_ignore_ascii_case("auto") {
             let old_model = app.model_display_label();
             let model_changed = !app.auto_model || app.model != "auto";
@@ -607,21 +624,13 @@ pub fn home_dashboard(app: &mut App) -> CommandResult {
             let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeAgentModeYoloTip));
         }
         AppMode::Yolo => {
+            // Compatibility residual: YOLO is invisible Act + Full Access.
             let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeYoloModeTip));
             let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeYoloModeCaution));
         }
-        AppMode::Multitask => {
-            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeAgentModeTip));
-            let _ = writeln!(
-                stats,
-                "  Multitask: light delegation — session model is operator; background workers"
-            );
-        }
         AppMode::Operate => {
-            let _ = writeln!(
-                stats,
-                "  Operate: Fleet operator — /model route; decompose into workflow/Fleet; monitor"
-            );
+            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeOperateModeTip));
+            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeOperateModeFleetTip));
         }
         AppMode::Plan => {
             let _ = writeln!(stats, "{}", tr(locale, MessageId::HomePlanModeTip));
@@ -756,7 +765,7 @@ mod tests {
         let result = help(&mut app, Some("config"));
         let msg = result.message.expect("help topic should return message");
         assert!(msg.contains("config"));
-        assert!(msg.contains("Open interactive configuration editor"));
+        assert!(msg.contains("Inspect and change settings"));
         assert!(msg.contains("Usage: /config"));
     }
 
@@ -838,6 +847,55 @@ mod tests {
         assert!(app.session_artifacts.is_empty());
         assert!(app.current_session_id.is_none());
         assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
+    }
+
+    #[test]
+    fn clear_is_all_or_nothing_when_work_state_is_busy() {
+        let mut app = create_test_app();
+        app.history.push(HistoryCell::User {
+            content: "keep me".to_string(),
+        });
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![],
+        });
+        app.current_session_id = Some("current-session".to_string());
+        let plan_state = app.plan_state.clone();
+        let _held = plan_state.try_lock().expect("hold plan lock");
+
+        let result = clear(&mut app);
+
+        assert!(result.is_error);
+        assert!(result.action.is_none());
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.api_messages.len(), 1);
+        assert_eq!(app.current_session_id.as_deref(), Some("current-session"));
+        assert!(result.message.as_deref().is_some_and(|message| {
+            message.contains("Nothing cleared") && message.contains("busy")
+        }));
+    }
+
+    #[test]
+    fn clear_rejects_an_active_turn_without_mutating_session_state() {
+        let mut app = create_test_app();
+        app.history.push(HistoryCell::User {
+            content: "keep active turn".to_string(),
+        });
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![],
+        });
+        app.current_session_id = Some("active-session".to_string());
+        app.is_loading = true;
+        app.runtime_turn_status = Some("in_progress".to_string());
+
+        let result = clear(&mut app);
+
+        assert!(result.is_error);
+        assert!(result.action.is_none());
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.api_messages.len(), 1);
+        assert_eq!(app.current_session_id.as_deref(), Some("active-session"));
     }
 
     #[test]
@@ -1282,6 +1340,17 @@ mod tests {
     }
 
     #[test]
+    fn model_refresh_dispatches_models_dev_catalog_action() {
+        let mut app = create_test_app();
+        let result = model(&mut app, Some("refresh"));
+        assert!(result.message.is_none());
+        assert!(matches!(
+            result.action,
+            Some(AppAction::RefreshModelsDevCatalog)
+        ));
+    }
+
+    #[test]
     fn test_subagents_pushes_view_and_sets_status() {
         let mut app = create_test_app();
         let result = subagents(&mut app);
@@ -1383,7 +1452,6 @@ mod tests {
             AppMode::Auto,
             AppMode::Yolo,
             AppMode::Plan,
-            AppMode::Multitask,
             AppMode::Operate,
         ];
         for mode in modes {
@@ -1403,7 +1471,7 @@ mod tests {
             .message
             .expect("home dashboard should return message");
         assert!(msg.contains("/links      - Dashboard & API links"));
-        assert!(msg.contains("/config      - Open interactive configuration editor"));
+        assert!(msg.contains("/config      - Inspect and change settings"));
         assert!(
             !msg.lines()
                 .any(|line| line.trim_start().starts_with("/set "))

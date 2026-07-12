@@ -207,6 +207,50 @@ fn move_composer_cursor_by_wrapped_rows(app: &mut App, inner: Rect, rows: isize)
     app.needs_redraw = true;
 }
 
+/// Click the WorkflowPanel header to toggle expand/collapse, or the trailing
+/// cancel affordance while a run is active (#4121).
+fn handle_workflow_panel_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return false;
+    }
+    let Some(area) = app.viewport.last_workflow_panel_area else {
+        return false;
+    };
+    if !mouse_hits_rect(mouse, Some(area)) {
+        return false;
+    }
+    if app.workflow_panel.is_none() {
+        return false;
+    }
+
+    if let Some(panel) = app.workflow_panel.as_mut() {
+        panel.keyboard_focus = true;
+    }
+
+    // Rightmost ~14 columns of the header row act as the cancel control.
+    let on_header_row = mouse.row == area.y;
+    let cancel_zone_start = area.x.saturating_add(area.width.saturating_sub(14));
+    let in_cancel_zone = on_header_row && mouse.column >= cancel_zone_start;
+    let running = app
+        .workflow_panel
+        .as_ref()
+        .is_some_and(|panel| panel.lifecycle.is_running());
+
+    if in_cancel_zone
+        && running
+        && let Some(run_id) = app.request_workflow_panel_cancel()
+    {
+        app.status_message = Some(format!(
+            "Cancelling workflow {run_id}… (dispatch via /workflow cancel {run_id})"
+        ));
+        return true;
+    }
+
+    // Any other click on the panel toggles expand/collapse.
+    app.toggle_workflow_panel();
+    true
+}
+
 /// Handle mouse events within the composer area.
 /// Returns true if the event was consumed.
 pub(crate) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
@@ -283,6 +327,12 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
     // Sidebar resize handle — check before composer so it doesn't compete
     // with text selection / scrolling.
     if handle_sidebar_resize_mouse(app, mouse) {
+        return Vec::new();
+    }
+
+    // WorkflowPanel toggle / cancel (#4121) before composer so the strip
+    // above the input remains clickable.
+    if handle_workflow_panel_mouse(app, mouse) {
         return Vec::new();
     }
 
@@ -410,6 +460,31 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
                             app.status_message = Some("Agent details collapsed".to_string());
                         } else {
                             app.status_message = Some("Agent details expanded".to_string());
+                        }
+                        app.needs_redraw = true;
+                        return Vec::new();
+                    }
+                    SidebarRowAction::OpenAgentDetail { agent_id } => {
+                        // #2889 slice / dogfood A3: drill from the expanded
+                        // dossier into the child's transcript card (action
+                        // tree, status, summary) in the detail pager.
+                        let cell_index = app.history.iter().position(|cell| {
+                            matches!(
+                                cell,
+                                HistoryCell::SubAgent(
+                                    crate::tui::history::SubAgentCell::Delegate(card)
+                                ) if card.agent_id == agent_id
+                            )
+                        });
+                        match cell_index {
+                            Some(cell_index) => {
+                                open_details_pager_for_cell(app, cell_index);
+                            }
+                            None => {
+                                app.status_message = Some(format!(
+                                    "No transcript card for {agent_id} yet — use handle_read agent:{agent_id}/full_transcript"
+                                ));
+                            }
                         }
                         app.needs_redraw = true;
                         return Vec::new();
@@ -892,15 +967,17 @@ pub(crate) fn handle_context_menu_action(app: &mut App, action: ContextMenuActio
             }
         }
         ContextMenuAction::OpenCommandPalette => {
-            app.view_stack
-                .push(CommandPaletteView::new(build_command_palette_entries(
+            app.view_stack.push(CommandPaletteView::new_for_locale(
+                app.ui_locale,
+                build_command_palette_entries(
                     app.ui_locale,
                     &app.skills_dir,
                     app.skills_scan_codewhale_only,
                     &app.workspace,
                     &app.mcp_config_path,
                     app.mcp_snapshot.as_ref(),
-                )));
+                ),
+            ));
         }
         ContextMenuAction::OpenContextInspector => {
             open_context_inspector(app);

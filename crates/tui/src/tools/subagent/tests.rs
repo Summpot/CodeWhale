@@ -1178,7 +1178,10 @@ fn test_apply_spawn_profile_unknown_lists_available_members() {
         parse_spawn_request(&json!({"prompt": "x", "profile": "warlock"})).expect("parse");
     let err = apply_spawn_profile(&mut request, &roster).expect_err("unknown profile should fail");
     let message = err.to_string();
-    assert!(message.contains("Unknown profile 'warlock'"), "{message}");
+    assert!(
+        message.contains("Unknown fleet role/profile 'warlock'"),
+        "{message}"
+    );
     for member in [
         "manager",
         "scout",
@@ -1239,11 +1242,14 @@ fn test_apply_spawn_profile_scout_yields_explore_type_and_faster_route() {
         .expect("scout should resolve")
         .expect("member resolved");
     assert_eq!(request.agent_type, SubAgentType::Explore);
+    let selected = resolve_spawn_model_selection(&stub_runtime(), &request, Some(&member))
+        .expect("scout model selection");
     assert_eq!(
-        spawn_model_route(&request, Some(&member)),
+        selected.model_route,
         ModelRoute::Faster,
         "scout's fast loadout routes to the faster sibling"
     );
+    assert_eq!(selected.source, SpawnRouteSource::AgentProfileLoadout);
 }
 
 #[test]
@@ -1257,65 +1263,87 @@ fn test_apply_spawn_profile_synthesizer_yields_plan_type() {
 }
 
 #[test]
-fn test_spawn_model_route_profile_precedence() {
+fn spawn_model_selection_has_stable_four_tier_precedence_and_source() {
+    let mut runtime = stub_runtime();
+    runtime.model = "deepseek-v4-flash".to_string();
+    runtime
+        .role_models
+        .insert("reviewer".to_string(), "deepseek-v4-flash".to_string());
+
     let mut profile = custom_fleet_profile("reviewer");
     profile.model = Some("deepseek-v4-pro".to_string());
-    profile.loadout = codewhale_config::FleetLoadout::Fast;
     let roster = fleet_roster_with("auditor", profile);
-    let member = roster.get("auditor").expect("member").clone();
+    let member = roster.get("auditor").expect("auditor profile");
 
-    // Member model pin beats loadout.
-    let request =
-        parse_spawn_request(&json!({"prompt": "x", "profile": "auditor"})).expect("parse");
-    assert_eq!(
-        spawn_model_route(&request, Some(&member)),
-        ModelRoute::Fixed("deepseek-v4-pro".to_string())
-    );
-
-    // Explicit model_strength beats the member model pin.
     let request = parse_spawn_request(&json!({
         "prompt": "x",
-        "profile": "auditor",
-        "model_strength": "same"
-    }))
-    .expect("parse");
-    assert_eq!(
-        spawn_model_route(&request, Some(&member)),
-        ModelRoute::Inherit
-    );
-
-    // Explicit model beats the member model pin: the requested route steps
-    // aside and the configured-model path fixes the explicit id.
-    let request = parse_spawn_request(&json!({
-        "prompt": "x",
-        "profile": "auditor",
+        "role": "review",
         "model": "deepseek-v4-flash"
     }))
-    .expect("parse");
-    let requested_route = spawn_model_route(&request, Some(&member));
+    .expect("task model request");
+    let selected = resolve_spawn_model_selection(&runtime, &request, Some(member))
+        .expect("task model selection");
     assert_eq!(
-        assignment_model_route(Some("deepseek-v4-flash"), requested_route),
+        selected,
+        SpawnModelSelection {
+            model_route: ModelRoute::Fixed("deepseek-v4-flash".to_string()),
+            source: SpawnRouteSource::TaskModel,
+        }
+    );
+
+    let request = parse_spawn_request(&json!({
+        "prompt": "x",
+        "role": "review",
+        "model_strength": "faster"
+    }))
+    .expect("task strength request");
+    let selected = resolve_spawn_model_selection(&runtime, &request, Some(member))
+        .expect("task strength selection");
+    assert_eq!(selected.model_route, ModelRoute::Faster);
+    assert_eq!(selected.source, SpawnRouteSource::TaskModelStrength);
+
+    let request =
+        parse_spawn_request(&json!({"prompt": "x", "role": "review"})).expect("profile request");
+    let selected =
+        resolve_spawn_model_selection(&runtime, &request, Some(member)).expect("profile selection");
+    assert_eq!(
+        selected.model_route,
+        ModelRoute::Fixed("deepseek-v4-pro".to_string()),
+        "saved AgentProfile model must beat the configured role default"
+    );
+    assert_eq!(selected.source, SpawnRouteSource::AgentProfileModel);
+
+    let mut strong_profile = custom_fleet_profile("reviewer");
+    strong_profile.loadout = codewhale_config::FleetLoadout::Custom("strong".to_string());
+    let strong_roster = fleet_roster_with("architect", strong_profile);
+    let selected =
+        resolve_spawn_model_selection(&runtime, &request, strong_roster.get("architect"))
+            .expect("custom profile selection");
+    assert_eq!(selected.model_route, ModelRoute::Inherit);
+    assert_eq!(selected.source, SpawnRouteSource::RunModel);
+
+    let mut fast_profile = custom_fleet_profile("reviewer");
+    fast_profile.loadout = codewhale_config::FleetLoadout::Fast;
+    let fast_roster = fleet_roster_with("fast-reviewer", fast_profile);
+    let selected =
+        resolve_spawn_model_selection(&runtime, &request, fast_roster.get("fast-reviewer"))
+            .expect("fast profile selection");
+    assert_eq!(selected.model_route, ModelRoute::Faster);
+    assert_eq!(selected.source, SpawnRouteSource::AgentProfileLoadout);
+
+    let selected =
+        resolve_spawn_model_selection(&runtime, &request, None).expect("role default selection");
+    assert_eq!(
+        selected.model_route,
         ModelRoute::Fixed("deepseek-v4-flash".to_string())
     );
+    assert_eq!(selected.source, SpawnRouteSource::RoleDefault);
 
-    // Without a model pin, the loadout decides: fast -> Faster, other
-    // loadouts inherit rather than auto-downgrade to the cheap sibling.
-    let mut fast = custom_fleet_profile("scout");
-    fast.loadout = codewhale_config::FleetLoadout::Fast;
-    let roster = fleet_roster_with("recon", fast);
-    let request = parse_spawn_request(&json!({"prompt": "x", "profile": "recon"})).expect("parse");
-    assert_eq!(
-        spawn_model_route(&request, roster.get("recon")),
-        ModelRoute::Faster
-    );
-
-    let mut strong = custom_fleet_profile("builder");
-    strong.loadout = codewhale_config::FleetLoadout::Custom("strong".to_string());
-    let roster = fleet_roster_with("architect", strong);
-    assert_eq!(
-        spawn_model_route(&request, roster.get("architect")),
-        ModelRoute::Inherit
-    );
+    runtime.role_models.clear();
+    let selected =
+        resolve_spawn_model_selection(&runtime, &request, None).expect("run model selection");
+    assert_eq!(selected.model_route, ModelRoute::Inherit);
+    assert_eq!(selected.source, SpawnRouteSource::RunModel);
 }
 
 #[test]
@@ -1619,10 +1647,43 @@ fn test_parse_spawn_request_rejects_text_and_items_together() {
 fn test_parse_spawn_request_rejects_invalid_role() {
     let input = json!({
         "prompt": "do work",
-        "role": "unknown_role"
+        "role": "unknown role"
     });
     let err = parse_spawn_request(&input).expect_err("invalid role should fail");
-    assert!(err.to_string().contains("Invalid role alias"));
+    assert!(
+        err.to_string()
+            .contains("role must be a bare roster member id"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_parse_spawn_request_accepts_fleet_role_token_for_runtime_resolution() {
+    let input = json!({
+        "prompt": "do work",
+        "role": "release_lead"
+    });
+    let parsed = parse_spawn_request(&input).expect("fleet role token should parse");
+    assert_eq!(parsed.agent_type, SubAgentType::General);
+    assert!(!parsed.agent_type_explicit);
+    assert_eq!(parsed.assignment.role.as_deref(), Some("release_lead"));
+    assert_eq!(parsed.profile.as_deref(), Some("release_lead"));
+
+    let roster = FleetRoster::built_ins_only();
+    let mut parsed = parsed;
+    let member = apply_spawn_profile(&mut parsed, &roster)
+        .expect("release_lead should resolve")
+        .expect("release_lead should select a roster member");
+    assert_eq!(member.id, "manager");
+    assert_eq!(parsed.profile.as_deref(), Some("manager"));
+
+    let mut scout =
+        parse_spawn_request(&json!({"prompt": "map it", "role": "scout"})).expect("scout");
+    let member = apply_spawn_profile(&mut scout, &roster)
+        .expect("scout should resolve")
+        .expect("scout should select a roster member");
+    assert_eq!(member.id, "scout");
+    assert_eq!(scout.agent_type, SubAgentType::Explore);
 }
 
 #[test]
@@ -1670,7 +1731,7 @@ fn test_parse_spawn_request_accepts_full_role_vocabulary() {
         );
 
         let input = json!({ "prompt": "do work", "role": role });
-        let parsed = parse_spawn_request(&input)
+        let mut parsed = parse_spawn_request(&input)
             .unwrap_or_else(|e| panic!("role {role:?} should parse, got {e}"));
         assert_eq!(parsed.agent_type, expected_type, "type for role {role:?}");
         assert_eq!(
@@ -1678,16 +1739,34 @@ fn test_parse_spawn_request_accepts_full_role_vocabulary() {
             Some(expected_role),
             "canonical role for {role:?}"
         );
+        assert!(
+            parsed.profile.is_none(),
+            "descriptive role alias {role:?} must not become a roster profile"
+        );
+        assert!(
+            apply_spawn_profile(&mut parsed, &FleetRoster::built_ins_only())
+                .unwrap_or_else(|e| panic!("role {role:?} should apply without a profile: {e}"))
+                .is_none(),
+            "descriptive role alias {role:?} should not require roster resolution"
+        );
     }
 }
 
 #[test]
 fn test_invalid_role_error_lists_real_aliases() {
-    // The hint must enumerate the actually-accepted vocabulary (#2649).
+    // Well-formed fleet role tokens parse and then fail clearly at roster
+    // resolution time with both real roster members and type aliases (#4177).
+    let roster = FleetRoster::built_ins_only();
     let input = json!({ "prompt": "do work", "role": "nonsense" });
-    let err = parse_spawn_request(&input)
-        .expect_err("invalid role should fail")
+    let mut request = parse_spawn_request(&input).expect("fleet role token should parse");
+    let err = apply_spawn_profile(&mut request, &roster)
+        .expect_err("unknown fleet role should fail at runtime resolution")
         .to_string();
+    assert!(
+        err.contains("Unknown fleet role/profile 'nonsense'"),
+        "{err}"
+    );
+    assert!(err.contains("scout"), "hint should list scout: {err}");
     assert!(err.contains("reviewer"), "hint should list reviewer: {err}");
     assert!(err.contains("verifier"), "hint should list verifier: {err}");
     assert!(err.contains("custom"), "hint should list custom: {err}");
@@ -3133,9 +3212,10 @@ async fn status_projection_reconciles_stale_running_agent() {
 
     let manager = Arc::new(RwLock::new(inner));
     let context = ToolContext::new(".");
-    let result = inspect_agent_from_input(&json!({"action": "status"}), manager, &context, false)
-        .await
-        .expect("status projection should succeed");
+    let result =
+        inspect_agent_from_input(&json!({"action": "status"}), manager, &context, false, None)
+            .await
+            .expect("status projection should succeed");
     let payload: serde_json::Value =
         serde_json::from_str(&result.content).expect("status payload should be json");
     let agent = payload["agents"]
@@ -4232,6 +4312,47 @@ async fn implementer_delegation_allows_suggest_write_without_parent_auto_approve
 }
 
 #[tokio::test]
+async fn workflow_accept_edits_allows_general_file_write_without_parent_auto_approve() {
+    // Workflow-spawned children accept Suggest-level file edits for write-capable
+    // postures (including general) while shell tools still require parent auto-approve.
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().to_path_buf();
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(workspace.clone());
+    runtime.context.auto_approve = false;
+    runtime.accept_edits = true;
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::General,
+        None,
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+
+    let result = registry
+        .execute(
+            "agent_test",
+            "write_file",
+            json!({"path": "workflow_edit.txt", "content": "from workflow"}),
+        )
+        .await
+        .expect("workflow accept_edits should allow general write");
+    let written =
+        std::fs::read_to_string(workspace.join("workflow_edit.txt")).expect("file should exist");
+    assert_eq!(written, "from workflow");
+    assert!(!result.contains("requires approval"), "{result}");
+
+    let err = registry
+        .execute("agent_test", "exec_shell", json!({"command": "echo hi"}))
+        .await
+        .expect_err("shell must still require parent auto-approve");
+    assert!(
+        err.to_string().contains("requires approval"),
+        "unexpected: {err}"
+    );
+}
+
+#[tokio::test]
 async fn general_delegation_still_blocks_suggest_write_without_parent_auto_approve() {
     let tmp = tempdir().expect("tempdir");
     let workspace = tmp.path().to_path_buf();
@@ -4692,6 +4813,7 @@ fn stub_runtime() -> SubAgentRuntime {
         fleet_roster: std::sync::Arc::new(crate::fleet::roster::FleetRoster::built_ins_only()),
         context,
         allow_shell: true,
+        accept_edits: false,
         agent_tool_surface_options: AgentToolSurfaceOptions::new(ShellPolicy::Full),
         worker_profile: WorkerRuntimeProfile::for_role(SubAgentType::General),
         event_tx: None,
@@ -4790,6 +4912,17 @@ fn stub_client() -> DeepSeekClient {
 /// resolve each provider independently.
 fn cross_provider_config() -> crate::config::Config {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut custom = std::collections::HashMap::new();
+    custom.insert(
+        "lm-studio".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            api_key: Some("lm-studio-key".to_string()),
+            base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+            model: Some("qwen-2.5-7b".to_string()),
+            ..Default::default()
+        },
+    );
     let providers = crate::config::ProvidersConfig {
         deepseek: crate::config::ProviderConfig {
             api_key: Some("session-key".to_string()),
@@ -4801,6 +4934,7 @@ fn cross_provider_config() -> crate::config::Config {
             base_url: Some("https://pinned-provider.example.com/v1".to_string()),
             ..Default::default()
         },
+        custom,
         ..crate::config::ProvidersConfig::default()
     };
     crate::config::Config {
@@ -4870,6 +5004,30 @@ fn spawn_child_client_targets_profile_pinned_provider() {
             .contains("session-provider.example.com"),
         "child must NOT reuse the session provider's endpoint (the #4093 misroute)"
     );
+}
+
+#[test]
+fn spawn_child_client_targets_custom_profile_provider() {
+    // #3965: LM Studio and other user-named OpenAI-compatible providers live in
+    // `[providers.<name>]` tables. A profile pin must preserve that name so the
+    // child client resolves the custom table instead of rejecting it or
+    // silently inheriting the DeepSeek session client.
+    let runtime = cross_provider_runtime();
+    assert_eq!(
+        runtime.client.api_provider(),
+        crate::config::ApiProvider::Deepseek,
+        "precondition: session is on DeepSeek"
+    );
+
+    let member = member_pinning_provider("lm-studio", "qwen-2.5-7b");
+    let child_client = child_client_for_member(&runtime, Some(&member))
+        .expect("custom provider client builds from the named provider table");
+
+    assert_eq!(
+        child_client.api_provider(),
+        crate::config::ApiProvider::Custom
+    );
+    assert_eq!(child_client.base_url(), "http://127.0.0.1:1234/v1");
 }
 
 #[test]
@@ -6422,6 +6580,88 @@ async fn worker_is_not_stranded_by_transient_global_rate_limit_window() {
     );
 }
 
+/// #4217: terminal worker records must age out of the persisted ledger so
+/// long-lived sessions do not rewrite multi-MB `subagents.v1.json` forever.
+#[test]
+fn cleanup_evicts_stale_terminal_worker_records_and_keeps_live_ones() {
+    let tmp = tempdir().expect("tempdir");
+    let state_path = tmp.path().join("subagents.v1.json");
+    let mut manager =
+        SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path.clone());
+
+    manager.register_worker(make_worker_spec("agent_old_done", tmp.path().to_path_buf()));
+    manager.register_worker(make_worker_spec(
+        "agent_recent_done",
+        tmp.path().to_path_buf(),
+    ));
+    manager.register_worker(make_worker_spec(
+        "agent_still_running",
+        tmp.path().to_path_buf(),
+    ));
+
+    let mut old_done = make_snapshot(SubAgentStatus::Completed);
+    old_done.agent_id = "agent_old_done".to_string();
+    old_done.name = "agent_old_done".to_string();
+    manager.complete_worker_from_result("agent_old_done", &old_done);
+
+    let mut recent_done = make_snapshot(SubAgentStatus::Failed("boom".to_string()));
+    recent_done.agent_id = "agent_recent_done".to_string();
+    recent_done.name = "agent_recent_done".to_string();
+    manager.complete_worker_from_result("agent_recent_done", &recent_done);
+
+    manager.record_worker_event(
+        "agent_still_running",
+        AgentWorkerStatus::Running,
+        Some("working".to_string()),
+        Some(1),
+        None,
+    );
+
+    let now_ms = epoch_millis_now();
+    let two_hours_ago = now_ms.saturating_sub(2 * 60 * 60 * 1000);
+    {
+        let old = manager
+            .worker_records
+            .get_mut("agent_old_done")
+            .expect("old terminal worker");
+        old.completed_at_ms = Some(two_hours_ago);
+        old.updated_at_ms = two_hours_ago;
+    }
+
+    // One-hour retention matches COMPLETED_AGENT_RETENTION used by cleanup callers.
+    let auto_cancelled = manager.cleanup(Duration::from_secs(60 * 60));
+    assert_eq!(auto_cancelled, 0);
+
+    assert!(
+        manager.get_worker_record("agent_old_done").is_none(),
+        "terminal worker older than retention must be evicted"
+    );
+    assert!(
+        manager.get_worker_record("agent_recent_done").is_some(),
+        "recent terminal worker must be retained"
+    );
+    let running = manager
+        .get_worker_record("agent_still_running")
+        .expect("running worker");
+    assert_eq!(running.status, AgentWorkerStatus::Running);
+
+    // Persist the pruned ledger and confirm eviction survives reload.
+    manager
+        .persist_state()
+        .expect("persist after cleanup")
+        .join()
+        .expect("persist thread");
+    let mut reloaded =
+        SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path);
+    reloaded.load_state().expect("load pruned state");
+    assert!(
+        reloaded.get_worker_record("agent_old_done").is_none(),
+        "eviction must survive reload of subagents.v1.json"
+    );
+    assert!(reloaded.get_worker_record("agent_recent_done").is_some());
+    assert!(reloaded.get_worker_record("agent_still_running").is_some());
+}
+
 #[test]
 fn cleanup_due_gates_write_locked_cleanup_to_a_bounded_cadence() {
     // #3803: a fresh manager is always due (never cleaned); right after a
@@ -6672,4 +6912,552 @@ fn write_json_atomic_survives_concurrent_writers() {
         .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
         .collect();
     assert!(leftover.is_empty(), "temp files leaked: {leftover:?}");
+}
+
+// === agent(action="wait") + peek throttling (#4097) ===
+
+fn insert_running_agent(inner: &mut SubAgentManager, name: &str) -> String {
+    let current_boot = inner.session_boot_id().to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        name.to_string(),
+        SubAgentType::Explore,
+        "prompt".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        PathBuf::from("."),
+        current_boot,
+    );
+    agent.task_handle = Some(tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }));
+    let agent_id = agent.id.clone();
+    inner.agents.insert(agent_id.clone(), agent);
+    agent_id
+}
+
+#[tokio::test]
+async fn agent_wait_returns_immediately_with_no_children() {
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(PathBuf::from("."), 1)));
+    let context = ToolContext::new(".");
+    let result = wait_for_subagents_from_input(&json!({"action": "wait"}), manager, &context)
+        .await
+        .expect("wait with no children should succeed");
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.content).expect("wait payload should be json");
+    assert_eq!(payload["running"], json!(0));
+    assert!(
+        payload["settled"]
+            .as_array()
+            .expect("settled array")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn agent_wait_wakes_when_child_settles() {
+    let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
+    let agent_id = insert_running_agent(&mut inner, "test_agent_wait_settles");
+    let manager = Arc::new(RwLock::new(inner));
+
+    let flip = manager.clone();
+    let flip_id = agent_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut manager = flip.write().await;
+        if let Some(agent) = manager.agents.get_mut(&flip_id) {
+            agent.status = SubAgentStatus::Completed;
+        }
+    });
+
+    let context = ToolContext::new(".");
+    let started = Instant::now();
+    let result = wait_for_subagents_from_input(
+        &json!({"action": "wait", "timeout_secs": 30}),
+        manager,
+        &context,
+    )
+    .await
+    .expect("wait should succeed");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "wait must wake on settle, not run out the 30s timeout"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.content).expect("wait payload should be json");
+    let settled = payload["settled"].as_array().expect("settled array");
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0]["agent_id"], json!(agent_id));
+    assert_eq!(settled[0]["status"], json!("completed"));
+    assert_eq!(payload["timed_out"], json!(false));
+}
+
+#[tokio::test]
+async fn agent_wait_times_out_and_reports_running_child() {
+    let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
+    let _agent_id = insert_running_agent(&mut inner, "test_agent_wait_timeout");
+    let manager = Arc::new(RwLock::new(inner));
+
+    let context = ToolContext::new(".");
+    let result = wait_for_subagents_from_input(
+        &json!({"action": "wait", "timeout_secs": 1}),
+        manager,
+        &context,
+    )
+    .await
+    .expect("wait timeout should return a snapshot, not an error");
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.content).expect("wait payload should be json");
+    assert_eq!(payload["timed_out"], json!(true));
+    assert_eq!(payload["running"], json!(1));
+    assert!(
+        payload["settled"]
+            .as_array()
+            .expect("settled array")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn agent_wait_rejects_unknown_agent_ref() {
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(PathBuf::from("."), 1)));
+    let context = ToolContext::new(".");
+    let err = wait_for_subagents_from_input(
+        &json!({"action": "wait", "agent_id": "agent_missing"}),
+        manager,
+        &context,
+    )
+    .await
+    .expect_err("unknown agent ref must fail fast instead of blocking");
+    assert!(matches!(err, ToolError::InvalidInput { .. }));
+}
+
+#[tokio::test]
+async fn agent_peek_unchanged_within_window_returns_compact_nudge() {
+    let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
+    let agent_id = insert_running_agent(&mut inner, "test_agent_peek_throttle");
+    let manager = Arc::new(RwLock::new(inner));
+    let memo: Arc<std::sync::Mutex<HashMap<String, PeekMemo>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let context = ToolContext::new(".");
+    let input = json!({"action": "peek", "agent_id": agent_id});
+
+    let first = inspect_agent_from_input(&input, manager.clone(), &context, true, Some(&memo))
+        .await
+        .expect("first peek should succeed");
+    let first_payload: serde_json::Value =
+        serde_json::from_str(&first.content).expect("first peek payload should be json");
+    assert!(
+        first_payload.get("unchanged").is_none(),
+        "first peek must return the full projection"
+    );
+
+    let second = inspect_agent_from_input(&input, manager, &context, true, Some(&memo))
+        .await
+        .expect("second peek should succeed");
+    let second_payload: serde_json::Value =
+        serde_json::from_str(&second.content).expect("second peek payload should be json");
+    assert_eq!(second_payload["unchanged"], json!(true));
+    assert!(
+        second_payload["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("wait"),
+        "nudge should point at agent(action=wait)"
+    );
+}
+
+#[test]
+fn agent_action_parses_wait_aliases() {
+    for alias in ["wait", "join", "await", "block"] {
+        assert_eq!(
+            parse_agent_tool_action(&json!({"action": alias})).expect("alias should parse"),
+            AgentToolAction::Wait,
+        );
+    }
+}
+
+// ===========================================================================
+// #4042 — sub-agent tool restriction inheritance (Phase 1, harvested from
+// PR #4096 by @JayBeest).
+//
+// These tests verify that the parent session's `--disallowed-tools` flows into
+// spawned sub-agents through `SubAgentRuntime` → `SubAgentToolRegistry`. The
+// deny-list is stamped onto `worker_profile.denied_tools` by the engine and
+// cloned through `child_runtime()`/`background_runtime()`, so a registry built
+// from a child runtime enforces it in `is_tool_allowed()`, `tools_for_model()`,
+// and `execute()`.
+//
+// Deny always wins over allow. Wildcards (`prefix*`) and case-insensitive
+// matching mirror the session-side `command_denies_tool()`.
+// ===========================================================================
+
+/// Build a stub runtime with the parent's `disallowed_tools` set on the
+/// `WorkerRuntimeProfile`. The registry reads deny lists from the profile at
+/// construction, and `child_runtime()` clones the profile so the list
+/// propagates across generations.
+fn stub_runtime_with_disallowed(disallowed: Vec<String>) -> SubAgentRuntime {
+    let mut rt = stub_runtime();
+    rt.worker_profile.denied_tools = disallowed;
+    rt
+}
+
+/// Build a `SubAgentToolRegistry` wired with `disallowed_tools`. Passes the
+/// runtime through `SubAgentToolRegistry::new()` so the constructor picks up
+/// `worker_profile.denied_tools`. `allowed_tools` is forwarded directly.
+fn new_registry_with_disallowed(
+    runtime: SubAgentRuntime,
+    allowed_tools: Option<Vec<String>>,
+) -> SubAgentToolRegistry {
+    SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::General,
+        allowed_tools,
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    )
+}
+
+#[test]
+fn test_disallowed_tools_inheritance_denies_tool() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime_with_disallowed(vec!["exec_shell".to_string(), "write_file".to_string()]);
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let registry = new_registry_with_disallowed(runtime, None);
+
+    assert!(
+        !registry.is_tool_allowed("exec_shell"),
+        "exec_shell should be denied"
+    );
+    assert!(
+        !registry.is_tool_allowed("write_file"),
+        "write_file should be denied"
+    );
+    assert!(
+        registry.is_tool_allowed("read_file"),
+        "read_file should still be allowed"
+    );
+    assert!(
+        registry.is_tool_allowed("grep_files"),
+        "unrelated tools should be allowed"
+    );
+
+    let tools = registry.tools_for_model(&SubAgentType::General);
+    let names: HashSet<_> = tools.into_iter().map(|t| t.name).collect();
+    assert!(!names.contains("exec_shell"), "catalog excludes exec_shell");
+    assert!(!names.contains("write_file"), "catalog excludes write_file");
+    assert!(names.contains("read_file"), "catalog includes read_file");
+}
+
+#[test]
+fn test_disallowed_tools_deny_wins_over_allow() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime_with_disallowed(vec!["exec_shell".to_string()]);
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    // exec_shell is in BOTH the allowlist AND the deny list — deny must win.
+    let registry = new_registry_with_disallowed(
+        runtime,
+        Some(vec!["exec_shell".to_string(), "read_file".to_string()]),
+    );
+
+    assert!(
+        !registry.is_tool_allowed("exec_shell"),
+        "deny must win over allow"
+    );
+    assert!(
+        registry.is_tool_allowed("read_file"),
+        "read_file is allowed and not denied"
+    );
+
+    let tools = registry.tools_for_model(&SubAgentType::General);
+    let names: HashSet<_> = tools.into_iter().map(|t| t.name).collect();
+    assert!(
+        !names.contains("exec_shell"),
+        "catalog must exclude denied tool even when allowlisted"
+    );
+    assert!(names.contains("read_file"), "catalog includes allowed tool");
+}
+
+#[test]
+fn test_disallowed_tools_wildcard_matching() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime_with_disallowed(vec!["mcp_*".to_string()]);
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let registry = new_registry_with_disallowed(runtime, None);
+
+    assert!(
+        !registry.is_tool_allowed("mcp_github_list_prs"),
+        "mcp_* wildcard should deny all MCP tools"
+    );
+    assert!(
+        !registry.is_tool_allowed("mcp_database_query"),
+        "mcp_* wildcard denies any server prefix"
+    );
+    assert!(
+        registry.is_tool_allowed("read_file"),
+        "non-MCP tools are unaffected by mcp_* deny"
+    );
+}
+
+#[test]
+fn test_disallowed_tools_case_insensitive_match() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime_with_disallowed(vec!["Exec_Shell".to_string()]);
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let registry = new_registry_with_disallowed(runtime, None);
+
+    assert!(
+        !registry.is_tool_allowed("exec_shell"),
+        "case-insensitive: Exec_Shell denies exec_shell"
+    );
+    assert!(
+        !registry.is_tool_allowed("EXEC_SHELL"),
+        "case-insensitive: Exec_Shell denies EXEC_SHELL"
+    );
+    assert!(
+        registry.is_tool_allowed("read_file"),
+        "unrelated tool unaffected"
+    );
+}
+
+#[test]
+fn test_disallowed_tools_specific_server_wildcard() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime_with_disallowed(vec!["mcp_dangerous_*".to_string()]);
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let registry = new_registry_with_disallowed(runtime, None);
+
+    assert!(
+        !registry.is_tool_allowed("mcp_dangerous_read"),
+        "specific server wildcard denies its tools"
+    );
+    assert!(
+        registry.is_tool_allowed("mcp_safe_query"),
+        "different server prefix is not denied"
+    );
+}
+
+#[test]
+fn test_disallowed_tools_tools_for_model_excludes_denied() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime_with_disallowed(vec![
+        "exec_shell".to_string(),
+        "write_file".to_string(),
+        "apply_patch".to_string(),
+    ]);
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let registry = new_registry_with_disallowed(runtime, None);
+
+    let tools = registry.tools_for_model(&SubAgentType::General);
+    let names: HashSet<_> = tools.into_iter().map(|t| t.name).collect();
+
+    assert!(!names.contains("exec_shell"), "catalog excludes exec_shell");
+    assert!(!names.contains("write_file"), "catalog excludes write_file");
+    assert!(
+        !names.contains("apply_patch"),
+        "catalog excludes apply_patch"
+    );
+    assert!(names.contains("read_file"), "catalog includes read_file");
+    assert!(names.contains("grep_files"), "catalog includes grep_files");
+}
+
+#[tokio::test]
+async fn test_disallowed_tools_execute_rejects_denied_tool() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime_with_disallowed(vec!["exec_shell".to_string()]);
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.allow_shell = true; // remove posture as a confound
+    let registry = new_registry_with_disallowed(runtime, None);
+
+    let result = registry
+        .execute("agent_test", "exec_shell", json!({"command": "echo hi"}))
+        .await;
+    assert!(
+        result.is_err(),
+        "execute must reject a tool denied by disallowed_tools"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("not allowed") || err.contains("denied"),
+        "error should mention denial: {err}"
+    );
+}
+
+// === deny-list propagation through runtime cloning ===
+
+#[test]
+fn test_disallowed_tools_propagates_through_child_runtime() {
+    let runtime = stub_runtime_with_disallowed(vec!["exec_shell".to_string()]);
+    let child = runtime.child_runtime();
+    assert_eq!(
+        child.worker_profile.denied_tools,
+        vec!["exec_shell".to_string()],
+        "child_runtime() must preserve parent's denied_tools"
+    );
+}
+
+#[test]
+fn test_disallowed_tools_propagates_through_background_runtime() {
+    let runtime = stub_runtime_with_disallowed(vec!["write_file".to_string()]);
+    let bg = runtime.background_runtime();
+    assert_eq!(
+        bg.worker_profile.denied_tools,
+        vec!["write_file".to_string()],
+        "background_runtime() must preserve parent's denied_tools"
+    );
+}
+
+#[test]
+fn test_disallowed_tools_across_two_generations() {
+    let tmp = tempdir().expect("tempdir");
+    let mut parent = stub_runtime_with_disallowed(vec!["exec_shell".to_string()]);
+    parent.context = ToolContext::new(tmp.path().to_path_buf());
+    let parent_registry = new_registry_with_disallowed(parent.clone(), None);
+    assert!(!parent_registry.is_tool_allowed("exec_shell"));
+
+    // Child A inherits from parent.
+    let child_a = parent.child_runtime();
+    assert_eq!(
+        child_a.worker_profile.denied_tools,
+        vec!["exec_shell".to_string()]
+    );
+
+    // Child B inherits from child A — same deny list.
+    let mut child_b = child_a.child_runtime();
+    child_b.context = ToolContext::new(tmp.path().to_path_buf());
+    let b_registry = new_registry_with_disallowed(child_b, None);
+    assert!(
+        !b_registry.is_tool_allowed("exec_shell"),
+        "third-generation sub-agent still inherits deny list"
+    );
+    assert!(b_registry.is_tool_allowed("read_file"));
+}
+
+// === spawn-path opt-out simulation ===
+
+#[test]
+fn test_disallowed_tools_opt_out_clears_inherited_denies() {
+    // Simulate the spawn-path merge: parent runtime has denies, child sets
+    // inherit_disallowed_tools = false — the inherited denies are cleared.
+    let tmp = tempdir().expect("tempdir");
+    let runtime =
+        stub_runtime_with_disallowed(vec!["exec_shell".to_string(), "write_file".to_string()]);
+    let mut child_runtime = runtime.child_runtime();
+    child_runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    assert!(
+        !child_runtime.worker_profile.denied_tools.is_empty(),
+        "child starts with parent's denies"
+    );
+
+    // Simulate spawn merge: inherit_disallowed_tools = false, no caller deny.
+    child_runtime.worker_profile.denied_tools.clear();
+
+    let registry = new_registry_with_disallowed(child_runtime, None);
+    assert!(
+        registry.is_tool_allowed("exec_shell"),
+        "exec_shell allowed after opt-out cleared parent denies"
+    );
+    assert!(
+        registry.is_tool_allowed("write_file"),
+        "write_file allowed after opt-out cleared parent denies"
+    );
+    assert!(registry.is_tool_allowed("read_file"));
+}
+
+#[test]
+fn test_disallowed_tools_opt_out_keeps_explicit_caller_deny() {
+    // Opt-out clears inherited denies, but explicit caller disallowed_tools
+    // still apply (the union merge — caller deny always applies).
+    let tmp = tempdir().expect("tempdir");
+    let runtime =
+        stub_runtime_with_disallowed(vec!["exec_shell".to_string(), "write_file".to_string()]);
+    let mut child_runtime = runtime.child_runtime();
+    child_runtime.context = ToolContext::new(tmp.path().to_path_buf());
+
+    // Simulate spawn merge: inherit_disallowed_tools = false, then caller adds
+    // ["write_file"].
+    child_runtime.worker_profile.denied_tools.clear();
+    child_runtime
+        .worker_profile
+        .denied_tools
+        .push("write_file".to_string());
+
+    let registry = new_registry_with_disallowed(child_runtime, None);
+    // Parent denied exec_shell, but opt-out cleared it → allowed.
+    assert!(
+        registry.is_tool_allowed("exec_shell"),
+        "exec_shell allowed (parent deny cleared by opt-out)"
+    );
+    // Caller explicitly denied write_file → still denied.
+    assert!(
+        !registry.is_tool_allowed("write_file"),
+        "write_file denied by caller's explicit list"
+    );
+    assert!(registry.is_tool_allowed("read_file"));
+}
+
+// === parse_spawn_request disallowed_tools ===
+
+#[test]
+fn test_parse_spawn_request_reads_disallowed_tools() {
+    let input = json!({
+        "prompt": "do something",
+        "disallowed_tools": ["exec_shell", "write_file"]
+    });
+    let req = parse_spawn_request(&input).expect("parse");
+    assert_eq!(
+        req.disallowed_tools,
+        Some(vec!["exec_shell".to_string(), "write_file".to_string()])
+    );
+}
+
+#[test]
+fn test_parse_spawn_request_disallowed_tools_dedupes_and_trims() {
+    let input = json!({
+        "prompt": "do something",
+        "disallowed_tools": [" exec_shell ", "exec_shell", "", "  ", "write_file"]
+    });
+    let req = parse_spawn_request(&input).expect("parse");
+    assert_eq!(
+        req.disallowed_tools,
+        Some(vec!["exec_shell".to_string(), "write_file".to_string()]),
+        "blanks and duplicates are dropped"
+    );
+}
+
+#[test]
+fn test_parse_spawn_request_disallowed_tools_defaults_to_none() {
+    let input = json!({"prompt": "do something"});
+    let req = parse_spawn_request(&input).expect("parse");
+    assert!(
+        req.disallowed_tools.is_none(),
+        "disallowed_tools should be None when not provided"
+    );
+}
+
+#[test]
+fn test_parse_spawn_request_inherit_disallowed_tools_defaults_true() {
+    let input = json!({"prompt": "do something"});
+    let req = parse_spawn_request(&input).expect("parse");
+    assert!(
+        req.inherit_disallowed_tools,
+        "inherit_disallowed_tools should default to true"
+    );
+}
+
+#[test]
+fn test_parse_spawn_request_inherit_disallowed_tools_explicit_false() {
+    let input = json!({
+        "prompt": "do something",
+        "inherit_disallowed_tools": false
+    });
+    let req = parse_spawn_request(&input).expect("parse");
+    assert!(
+        !req.inherit_disallowed_tools,
+        "inherit_disallowed_tools should parse an explicit false"
+    );
 }

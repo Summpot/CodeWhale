@@ -23,6 +23,8 @@ open an issue — that's how the project grows.
 [简体中文 README](README.zh-CN.md) · [日本語 README](README.ja-JP.md) · [Tiếng Việt README](README.vi.md) · [한국어 README](README.ko-KR.md) · [codewhale.net](https://codewhale.net/) · [Install guide](docs/INSTALL.md) · [Provider registry](docs/PROVIDERS.md) · [Changelog](CHANGELOG.md)
 
 [![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
+[![Security audit](https://github.com/Hmbown/CodeWhale/actions/workflows/security-audit.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/security-audit.yml)
+[![cargo-deny](https://github.com/Hmbown/CodeWhale/actions/workflows/cargo-deny.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/cargo-deny.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
 [![DeepWiki project index](https://img.shields.io/badge/DeepWiki-project-blue)](https://deepwiki.com/Hmbown/CodeWhale)
@@ -33,7 +35,7 @@ open an issue — that's how the project grows.
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.67
+codewhale --version   # 0.8.68
 ```
 
 The npm wrapper (Node 18+) downloads SHA-256-verified binaries from GitHub
@@ -62,8 +64,8 @@ nix run github:Hmbown/CodeWhale
 scoop install codewhale        # or the NSIS installer from GitHub Releases
 
 # CNB mirror for users who cannot reliably reach GitHub
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.67 codewhale-cli --locked --force
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.67 codewhale-tui --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.68 codewhale-cli --locked --force
+cargo install --git https://cnb.cool/codewhale.net/codewhale --tag v0.8.68 codewhale-tui --locked --force
 
 # Legacy Homebrew compatibility while the formula is renamed
 brew tap Hmbown/deepseek-tui
@@ -72,9 +74,10 @@ brew install deepseek-tui
 
 Prebuilt archives for Linux x64/arm64, macOS x64/arm64, and Windows x64 are
 attached to [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases).
+Android / Termux is a separate Android arm64 target, not the Linux arm64 asset.
 Linux riscv64 prebuilts are temporarily paused while upstream QuickJS bindings
-catch up. Checksums, China mirrors, Windows specifics, and troubleshooting live in
-[docs/INSTALL.md](docs/INSTALL.md).
+catch up. Checksums, Termux notes, China mirrors, Windows specifics, and
+troubleshooting live in [docs/INSTALL.md](docs/INSTALL.md).
 
 **Upgrading from the legacy `deepseek-tui` package?** Your config, sessions,
 skills, and MCP settings are preserved. See [docs/REBRAND.md](docs/REBRAND.md),
@@ -190,13 +193,30 @@ setup view. Loadouts express model intent as a class — `strong`, `balanced`, o
 is the same headless runtime that backs in-session sub-agents; Fleet is the
 durable layer on top. See [docs/FLEET.md](docs/FLEET.md).
 
+### Workflow
+
+Workflow is the resumable, inspectable layer for larger jobs. It plans a goal
+into bounded steps, can fan those steps out through Fleet workers, and records
+progress and verification in `.codewhale/workflow-runs.jsonl`:
+
+```bash
+codewhale workflow run my-workflow.js --fleet <fleet-name> --runtime tmux --verify
+codewhale lane status <lane-id>
+codewhale lane logs <lane-id>
+```
+
+Workflow is an overlay, not another permission mode: Plan / Act / Operate and
+the Ask / Auto-Review / Full Access posture stay orthogonal to orchestration.
+
 ## Safety
 
 CodeWhale edits files and runs commands, so the safety posture is part of the
 product, not an afterthought.
 
-- **Three modes.** Plan (read-only investigation), Agent (executes, asks per
-  action), and YOLO (auto-approve). Switch with `Tab` or `/mode`.
+- **Three modes.** Plan (read-only investigation), Act (multi-step execution),
+  and Operate (Fleet/Workflow orchestration). Switch with `Tab` or `/mode`.
+  `Shift+Tab` independently cycles Ask, Auto-Review, and Full Access approval
+  posture; legacy YOLO remains a compatibility alias for Act + Full Access.
 - **Approval-gated tools.** A `.codewhale/hooks.toml` hook system can allow,
   deny, or ask before any tool call, and the exec policy decides whether a
   command runs, needs approval, or is forbidden outright.
@@ -287,12 +307,12 @@ The README is the short version. The rest is in docs and on
 
 - [User guide](docs/GUIDE.md) · [Install guide](docs/INSTALL.md) ·
   [Configuration](docs/CONFIGURATION.md) · [Provider registry](docs/PROVIDERS.md)
-- [Modes](docs/MODES.md) — Agent, Plan, and YOLO.
+- [Modes](docs/MODES.md) — Plan, Act, Operate, and orthogonal approval posture.
 - [Fleet](docs/FLEET.md) · [Sub-agents](docs/SUBAGENTS.md) — roles, lifecycle,
   output contract, and recovery behavior.
 - [Architecture](docs/ARCHITECTURE.md) — crate layout, runtime flow, tool system,
   extension points, and security model.
-- [Workflow authoring](docs/WORKFLOW_AUTHORING.md) · [MCP](docs/MCP.md) ·
+- [Automatic Workflows](docs/AUTOMATIC_WORKFLOWS.md) · [Workflow authoring](docs/WORKFLOW_AUTHORING.md) · [MCP](docs/MCP.md) ·
   [Runtime API](docs/RUNTIME_API.md) · [Model Lab](docs/MODEL_LAB.md)
 - [Keybindings](docs/KEYBINDINGS.md) · [Sandbox & approvals](docs/SANDBOX.md)
   · [Accessibility](docs/ACCESSIBILITY.md) · [Docker](docs/DOCKER.md)
