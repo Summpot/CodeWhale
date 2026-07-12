@@ -75,6 +75,7 @@ codewhale-state = { path = "./crates/state" }
 codewhale-tools = { path = "./crates/tools" }
 codewhale-mcp = { path = "./crates/mcp" }
 codewhale-hooks = { path = "./crates/hooks" }
+codewhale-release = { path = "./crates/release" }
 codewhale-core = { path = "./crates/core" }
 
 [profile.release]
